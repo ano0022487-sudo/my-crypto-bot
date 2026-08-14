@@ -90,9 +90,13 @@ async function placeEventContractOrder(side, targetInstId) {
 // ==================== 6. SNR + RSI 分析核心 ====================
 async function checkSNRAndTrade() {
     try {
-        console.log(`[${new Date().toLocaleTimeString()}] 掃描行情與事件合約中...`);
+        // 🟢 正確寫法：抓取 BTC-USDT 的永續合約 (SWAP)
+const eventInstUrl = `${CONFIG.OKX_BASE_URL}/api/v5/public/instruments?instType=SWAP&instId=BTC-USDT-SWAP`;
+const eventRes = await axios.get(eventInstUrl);
+const activeEvents = eventRes.data.data;
 
-        const klineUrl = `${CONFIG.OKX_BASE_URL}/api/v5/market/candles?instId=${CONFIG.BASE_SYMBOL}&bar=${CONFIG.TIMEFRAME}&limit=100`;
+if (!activeEvents || activeEvents.length === 0) return;
+const targetInstId = 'BTC-USDT-SWAP'; // 直接鎖定永續合約代碼
         const res = await axios.get(klineUrl);
         const rawData = res.data.data;
         if (!rawData || rawData.length < 50) return;
