@@ -8,23 +8,20 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ==========================================
-// 💡 已直接寫死：Telegram 與 OKX 帳號設定
-// ==========================================
-const TELEGRAM_BOT_TOKEN = '你的BotToken';
-const TELEGRAM_CHAT_ID = '你的ChatID';
-
-const API_KEY = '你的OKX_API_KEY';
-const SECRET_KEY = '你的OKX_SECRET_KEY';
-const PASSPHRASE = '你的OKX_PASSPHRASE';
-const BASE_URL = 'https://www.okx.com';
+// 清理並防呆 Token，避免因為隱藏字元導致報錯
+const rawToken = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_BOT_TOKEN = rawToken.trim().replace(/['"]+/g, '');
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-const CHECK_INTERVAL = 60000;
-const ORDER_SIZE = '1'; // 建議先調小合約張數降低風險
+const API_KEY = process.env.OK_ACCESS_KEY;
+const SECRET_KEY = process.env.OK_ACCESS_SECRET;
+const PASSPHRASE = process.env.OKX_PASSPHRASE;
+const BASE_URL = 'https://www.okx.com';
 
-// 永續合約 (SWAP) 設定
+const CHECK_INTERVAL = 60000;
+const ORDER_SIZE = '1';
+
 const ASSETS = [
     {
         targetSpot: 'BTC-USDT',
@@ -118,9 +115,9 @@ async function placeEventOrder(asset, symbol, side, reason, entryPrice, stopLoss
                 highestPrice: entryPrice
             };
 
-            if (TELEGRAM_CHAT_ID) {
-                bot.sendMessage(TELEGRAM_CHAT_ID, 
-                    `🚀 【多幣種開倉通知 (15m)】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
+            if (process.env.TELEGRAM_CHAT_ID) {
+                bot.sendMessage(process.env.TELEGRAM_CHAT_ID, 
+                    `🚀 【15m 開倉通知】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
                 ).catch(() => {});
             }
         } else {
@@ -161,9 +158,9 @@ async function closePosition(asset, reason, currentPrice) {
 
         const resData = response.data;
         if (resData.code === '0') {
-            if (TELEGRAM_CHAT_ID) {
-                bot.sendMessage(TELEGRAM_CHAT_ID, 
-                    `🛡 【多幣種平倉通知 (15m)】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
+            if (process.env.TELEGRAM_CHAT_ID) {
+                bot.sendMessage(process.env.TELEGRAM_CHAT_ID, 
+                    `🛡 【15m 平倉通知】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
                 ).catch(() => {});
             }
         } else {
@@ -178,7 +175,6 @@ async function closePosition(asset, reason, currentPrice) {
 
 async function checkAssetStrategy(asset) {
     try {
-        // 已改為 15 分鐘線 (bar=15m)
         const res = await axiosWithRetry({
             method: 'GET',
             url: `${BASE_URL}/api/v5/market/candles?instId=${asset.targetSpot}&bar=15m&limit=30`
