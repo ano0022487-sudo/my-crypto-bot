@@ -7,8 +7,8 @@ http.createServer((req, res) => res.end('OK')).listen(PORT, () => {
   console.log(`Port ${PORT} 已監聽！`);
 });
 
-// 2. 你的 Telegram 機器人
-const token = 'YOUR_TELEGRAM_BOT_TOKEN'; // 8839544439:AAG0wvZ0QeRWHbZovwCOPNHaRVipTeh6vpM
+// 2. 你的 Telegram 機器人（從環境變數讀取 Token）
+const token = process.env.TELEGRAM_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
 
 console.log('Telegram 機器人已順利啟動！');
