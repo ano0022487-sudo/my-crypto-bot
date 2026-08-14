@@ -125,5 +125,5 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, '2U 高勝率事件合約機器人已連線運作中');
 });
 
-setInterval(checkHighWinRateStrategy, 15 * 60 * 1000);
+setInterval(checkHighWinRateStrategy, 5 * 60 * 1000);
 checkHighWinRateStrategy();
