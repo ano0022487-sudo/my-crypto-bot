@@ -7,12 +7,19 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
-const API_KEY = process.env.OK_ACCESS_KEY;
-const SECRET_KEY = process.env.OK_ACCESS_SECRET;
-const PASSPHRASE = process.env.OKX_PASSPHRASE;
+// ==========================================
+// 💡 已直接寫死：Telegram 與 OKX 帳號設定
+// ==========================================
+const TELEGRAM_BOT_TOKEN = '你的BotToken';
+const TELEGRAM_CHAT_ID = '你的ChatID';
+
+const API_KEY = '你的OKX_API_KEY';
+const SECRET_KEY = '你的OKX_SECRET_KEY';
+const PASSPHRASE = '你的OKX_PASSPHRASE';
 const BASE_URL = 'https://www.okx.com';
+
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 const CHECK_INTERVAL = 60000;
 const ORDER_SIZE = '2';
@@ -111,8 +118,8 @@ async function placeEventOrder(asset, symbol, side, reason, entryPrice, stopLoss
                 highestPrice: entryPrice
             };
 
-            if (process.env.TELEGRAM_CHAT_ID) {
-                bot.sendMessage(process.env.TELEGRAM_CHAT_ID, 
+            if (TELEGRAM_CHAT_ID) {
+                bot.sendMessage(TELEGRAM_CHAT_ID, 
                     `🚀 【多幣種開倉通知】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
                 ).catch(() => {});
             }
@@ -154,8 +161,8 @@ async function closePosition(asset, reason, currentPrice) {
 
         const resData = response.data;
         if (resData.code === '0') {
-            if (process.env.TELEGRAM_CHAT_ID) {
-                bot.sendMessage(process.env.TELEGRAM_CHAT_ID, 
+            if (TELEGRAM_CHAT_ID) {
+                bot.sendMessage(TELEGRAM_CHAT_ID, 
                     `🛡 【多幣種平倉通知】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
                 ).catch(() => {});
             }
