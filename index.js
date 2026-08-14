@@ -14,22 +14,24 @@ const SECRET_KEY = process.env.OKX_SECRET_KEY;
 const PASSPHRASE = process.env.OKX_PASSPHRASE;
 const BASE_URL = 'https://www.okx.com';
 
-const TARGET_SPOT = 'BTC-USDT';
-const EVENT_SYMBOL_CALL = 'BTC-USDT-260814-60000-C';
-const EVENT_SYMBOL_PUT  = 'BTC-USDT-260814-60000-P';
 const CHECK_INTERVAL = 60000;
 const ORDER_SIZE = '2';
 
-// 追蹤當前持倉狀態、移動停損與目標價
-let currentPosition = {
-    active: false,
-    symbol: null,
-    side: null,
-    entryPrice: 0,
-    stopLossPrice: 0,
-    takeProfitPrice: 0,
-    highestPrice: 0 // 用於追蹤移動停損的最高現價
-};
+// 定義雙幣種監控清單與對應合約
+const ASSETS = [
+    {
+        targetSpot: 'BTC-USDT',
+        callSymbol: 'BTC-USDT-260814-60000-C',
+        putSymbol: 'BTC-USDT-260814-60000-P',
+        position: { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 }
+    },
+    {
+        targetSpot: 'ETH-USDT',
+        callSymbol: 'ETH-USDT-260814-3000-C',
+        putSymbol: 'ETH-USDT-260814-3000-P',
+        position: { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 }
+    }
+];
 
 function generateSignature(timestamp, method, requestPath, body = '') {
     const message = timestamp + method + requestPath + body;
@@ -54,20 +56,18 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
-// 帶重試機制的 API 請求包裝函式
 async function axiosWithRetry(config, retries = 3, delay = 2000) {
     for (let i = 0; i < retries; i++) {
         try {
             return await axios(config);
         } catch (error) {
             if (i === retries - 1) throw error;
-            console.warn(`API 請求失敗，進行第 ${i + 1} 次重試... 錯誤: ${error.message}`);
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
 }
 
-async function placeEventOrder(symbol, side, reason, entryPrice, stopLoss, takeProfit) {
+async function placeEventOrder(asset, symbol, side, reason, entryPrice, stopLoss, takeProfit) {
     try {
         const requestPath = '/api/v5/trade/order';
         const timestamp = new Date().toISOString();
@@ -98,7 +98,7 @@ async function placeEventOrder(symbol, side, reason, entryPrice, stopLoss, takeP
         if (resData.code === '0') {
             const orderId = resData.data[0].ordId;
             
-            currentPosition = {
+            asset.position = {
                 active: true,
                 symbol: symbol,
                 side: side,
@@ -109,7 +109,7 @@ async function placeEventOrder(symbol, side, reason, entryPrice, stopLoss, takeP
             };
 
             bot.sendMessage(process.env.TELEGRAM_CHAT_ID || '', 
-                `🚀 【終極版開倉通知】\n條件：${reason}\n標的：${symbol}\n進場價：${entryPrice}\n初始止損：${stopLoss}\n目標止盈：${takeProfit}\n訂單編號：${orderId}`
+                `🚀 【多幣種開倉通知】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
             ).catch(() => {});
         }
     } catch (error) {
@@ -117,14 +117,14 @@ async function placeEventOrder(symbol, side, reason, entryPrice, stopLoss, takeP
     }
 }
 
-async function closePosition(reason, currentPrice) {
+async function closePosition(asset, reason, currentPrice) {
     try {
         const requestPath = '/api/v5/trade/order';
         const timestamp = new Date().toISOString();
-        const closeSide = currentPosition.side === 'buy' ? 'sell' : 'buy';
+        const closeSide = asset.position.side === 'buy' ? 'sell' : 'buy';
 
         const bodyData = JSON.stringify({
-            instId: currentPosition.symbol,
+            instId: asset.position.symbol,
             tdMode: 'cross',
             side: closeSide,
             ordType: 'market',
@@ -148,21 +148,21 @@ async function closePosition(reason, currentPrice) {
         const resData = response.data;
         if (resData.code === '0') {
             bot.sendMessage(process.env.TELEGRAM_CHAT_ID || '', 
-                `🛡 【終極版平倉通知】\n原因：${reason}\n標的：${currentPosition.symbol}\n現價：${currentPrice}`
+                `🛡 【多幣種平倉通知】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
             ).catch(() => {});
         }
 
-        currentPosition = { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 };
+        asset.position = { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 };
     } catch (error) {
         console.error('平倉失敗:', error.response ? JSON.stringify(error.response.data) : error.message);
     }
 }
 
-async function checkOptimizedStrategy() {
+async function checkAssetStrategy(asset) {
     try {
         const res = await axiosWithRetry({
             method: 'GET',
-            url: `${BASE_URL}/api/v5/market/candles?instId=${TARGET_SPOT}&bar=1m&limit=30`
+            url: `${BASE_URL}/api/v5/market/candles?instId=${asset.targetSpot}&bar=1m&limit=30`
         });
         const candles = res.data.data;
 
@@ -177,57 +177,56 @@ async function checkOptimizedStrategy() {
         const support = Math.min(...lows.slice(1, 20));
         const rsiValue = calculateRSI(closes, 14);
 
-        console.log(`[終極監控] 現價: ${currentClose} | 阻力: ${resistance} | 支撐: ${support} | RSI: ${rsiValue.toFixed(1)}`);
+        console.log(`[${asset.targetSpot}] 現價: ${currentClose} | 阻力: ${resistance} | 支撐: ${support} | RSI: ${rsiValue.toFixed(1)}`);
 
-        // 持倉中的動態移動停損與停利監控
-        if (currentPosition.active) {
-            if (currentPosition.side === 'buy') {
-                // 更新最高價以實現移動停損
-                if (currentClose > currentPosition.highestPrice) {
-                    currentPosition.highestPrice = currentClose;
-                    // 當獲利擴大時，將止損線往上拉高（鎖住利潤）
-                    const trailingBuffer = (currentClose - currentPosition.entryPrice) * 0.5;
-                    if (currentPosition.entryPrice + trailingBuffer > currentPosition.stopLossPrice) {
-                        currentPosition.stopLossPrice = currentPosition.entryPrice + trailingBuffer;
-                        console.log(`📈 觸發移動停損上調，新止損價: ${currentPosition.stopLossPrice.toFixed(2)}`);
+        if (asset.position.active) {
+            if (asset.position.side === 'buy') {
+                if (currentClose > asset.position.highestPrice) {
+                    asset.position.highestPrice = currentClose;
+                    const trailingBuffer = (currentClose - asset.position.entryPrice) * 0.5;
+                    if (asset.position.entryPrice + trailingBuffer > asset.position.stopLossPrice) {
+                        asset.position.stopLossPrice = asset.position.entryPrice + trailingBuffer;
                     }
                 }
 
-                if (currentClose >= currentPosition.takeProfitPrice) {
-                    await closePosition(`觸及目標止盈價 (${currentPosition.takeProfitPrice})`, currentClose);
-                } else if (currentClose <= currentPosition.stopLossPrice) {
-                    await closePosition(`觸及移動停損/止損價 (${currentPosition.stopLossPrice.toFixed(2)})`, currentClose);
+                if (currentClose >= asset.position.takeProfitPrice) {
+                    await closePosition(asset, `觸及目標止盈價 (${asset.position.takeProfitPrice})`, currentClose);
+                } else if (currentClose <= asset.position.stopLossPrice) {
+                    await closePosition(asset, `觸及移動停損價 (${asset.position.stopLossPrice.toFixed(2)})`, currentClose);
                 }
             }
             return;
         }
 
-        // 開倉條件
         if (currentClose > resistance && rsiValue > 55 && rsiValue < 78) {
             const stopLossPrice = support;
             const risk = currentClose - stopLossPrice;
-            const takeProfitPrice = currentClose + (risk * 2); // 放大至 2 倍報酬比
-            
-            await placeEventOrder(EVENT_SYMBOL_CALL, 'buy', `SNR 突破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
+            const takeProfitPrice = currentClose + (risk * 2);
+            await placeEventOrder(asset, asset.callSymbol, 'buy', `SNR 突破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
         } 
         else if (currentClose < support && rsiValue < 45 && rsiValue > 22) {
             const stopLossPrice = resistance;
             const risk = stopLossPrice - currentClose;
             const takeProfitPrice = currentClose - (risk * 2);
-            
-            await placeEventOrder(EVENT_SYMBOL_PUT, 'buy', `SNR 跌破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
+            await placeEventOrder(asset, asset.putSymbol, 'buy', `SNR 跌破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
         }
     } catch (error) {
-        console.error('策略運算錯誤:', error.message);
+        console.error(`策略運算錯誤 (${asset.targetSpot}):`, error.message);
     }
 }
 
-setInterval(checkOptimizedStrategy, CHECK_INTERVAL);
+async function runAllStrategies() {
+    for (const asset of ASSETS) {
+        await checkAssetStrategy(asset);
+    }
+}
+
+setInterval(runAllStrategies, CHECK_INTERVAL);
 
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, '🚀 終極完整版機器人（含移動停損與防斷線重試）已啟動！');
+    bot.sendMessage(msg.chat.id, '🚀 雙幣種 (BTC + ETH) 智慧機器人已啟動！');
 });
 
-app.get('/', (req, res) => res.status(200).send('Ultimate Bot Active.'));
+app.get('/', (req, res) => res.status(200).send('Multi-Asset Bot Active.'));
 
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
