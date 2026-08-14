@@ -1,63 +1,14 @@
-const express = require('express');
-const crypto = require('crypto');
-const axios = require('axios');
-const TelegramBot = require('node-telegram-bot-api');
-
-const app = express();
-app.use(express.json());
-
-const PORT = process.env.PORT || 3000;
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-
-// OKX API 憑證
-const API_KEY = process.env.OKX_API_KEY;
-const SECRET_KEY = process.env.OKX_SECRET_KEY;
-const PASSPHRASE = process.env.OKX_PASSPHRASE;
-const BASE_URL = 'https://www.okx.com';
-
-// 簽名產生器
-function generateSignature(timestamp, method, requestPath, body = '') {
-    const message = timestamp + method + requestPath + body;
-    return crypto.createHmac('sha256', SECRET_KEY).update(message).digest('base64');
+{
+  "name": "okx-event-bot",
+  "version": "1.0.0",
+  "description": "OKX Trading Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.64.0"
+  }
 }
-
-// 防休眠
-app.get('/', (req, res) => res.status(200).send('Bot active'));
-
-// 下單路由
-app.post('/webhook', async (req, res) => {
-    try {
-        const { symbol, signal, size } = req.body;
-        const requestPath = '/api/v5/trade/order';
-        const timestamp = new Date().toISOString();
-        
-        // 需依據 F12 抓到的實際 Payload 調整結構
-        const bodyData = JSON.stringify({
-            instId: symbol,
-            tdMode: 'cross',
-            side: signal.toLowerCase(),
-            ordType: 'market',
-            sz: size || '1'
-        });
-
-        const signature = generateSignature(timestamp, 'POST', requestPath, bodyData);
-
-        const response = await axios.post(`${BASE_URL}${requestPath}`, bodyData, {
-            headers: {
-                'OK-ACCESS-KEY': API_KEY,
-                'OK-ACCESS-SIGN': signature,
-                'OK-ACCESS-TIMESTAMP': timestamp,
-                'OK-ACCESS-PASSPHRASE': PASSPHRASE,
-                'Content-Type': 'application/json'
-            }
-        });
-
-        console.log('回應數據:', response.data);
-        res.status(200).json(response.data);
-    } catch (error) {
-        console.error('執行失敗:', error.response ? error.response.data : error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
