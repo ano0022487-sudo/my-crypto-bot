@@ -5,7 +5,7 @@ const technicalindicators = require('technicalindicators');
 const express = require('express');
 
 const app = express();
-app.get('/', (req, res) => res.send('OKX 機器人持續運作中'));
+app.get('/', (req, res) => res.send('2U 高勝率事件合約機器人持續運作中'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Web 伺服器已在連接埠 ${PORT} 啟動，防止 Render 休眠`);
@@ -34,7 +34,19 @@ function getSignature(timestamp, method, requestPath, body) {
   return crypto.createHmac('sha256', CONFIG.OKX_SECRET_KEY).update(message).digest('base64');
 }
 
-async function placeOkxOrder(side, instId) {
+async function getEventInstrument() {
+  try {
+    const res = await axios.get(`${CONFIG.OKX_BASE_URL}/api/v5/public/instruments?instType=OPTION&uly=BTC-USDT`);
+    const instruments = res.data.data;
+    if (!instruments || instruments.length === 0) return null;
+    return instruments[0].instId;
+  } catch (err) {
+    console.error('獲取合約代碼失敗', err.message);
+    return null;
+  }
+}
+
+async function placeEventOrder(side, instId) {
   try {
     const method = 'POST';
     const requestPath = '/api/v5/trade/order';
@@ -43,7 +55,7 @@ async function placeOkxOrder(side, instId) {
       tdMode: 'cash',
       side: side,
       ordType: 'market',
-      sz: '2'
+      sz: '2' // 每筆下單固定 2U 規模
     };
     const body = JSON.stringify(bodyObj);
     const timestamp = new Date().toISOString();
@@ -58,13 +70,13 @@ async function placeOkxOrder(side, instId) {
     };
 
     const response = await axios.post(`${CONFIG.OKX_BASE_URL}${requestPath}`, body, { headers });
-    sendLog(`下單成功回應：${JSON.stringify(response.data)}`);
+    sendLog(`高勝率事件合約 2U 下單成功：${JSON.stringify(response.data)}`);
   } catch (err) {
     sendLog(`下單失敗：${err.response?.data?.msg || err.message}`);
   }
 }
 
-async function checkSNRAndTrade() {
+async function checkHighWinRateStrategy() {
   try {
     const targetInstId = 'BTC-USDT-SWAP';
     const klineUrl = `${CONFIG.OKX_BASE_URL}/api/v5/market/candles?instId=${targetInstId}&bar=${CONFIG.TIMEFRAME}&limit=100`;
@@ -82,31 +94,36 @@ async function checkSNRAndTrade() {
     const resistance = Math.max(...highs.slice(-51, -1));
     const support = Math.min(...lows.slice(-51, -1));
 
+    const sma50 = technicalindicators.SMA.calculate({ values: closes, period: 50 });
+    const currentSMA = sma50[sma50.length - 1];
+
     const rsiValues = technicalindicators.RSI.calculate({ values: closes, period: 14 });
     const currentRSI = rsiValues[rsiValues.length - 1];
+
+    const eventInstId = await getEventInstrument();
+    if (!eventInstId) return;
 
     const isAtSupport = currentPrice <= support * 1.002;
     const isAtResistance = currentPrice >= resistance * 0.998;
 
-    if (isAtSupport && currentRSI < 35) {
-      sendLog(`觸發買入 現價 $${currentPrice} 支撐 $${support} RSI ${currentRSI.toFixed(1)} 金額 2U`);
-      await placeOkxOrder('buy', targetInstId);
-    } else if (isAtResistance && currentRSI > 65) {
-      sendLog(`觸發賣出 現價 $${currentPrice} 阻力 $${resistance} RSI ${currentRSI.toFixed(1)} 金額 2U`);
-      await placeOkxOrder('sell', targetInstId);
+    if (currentPrice > currentSMA && isAtSupport && currentRSI < 30) {
+      sendLog(`[2U 高勝率訊號] 多頭回踩支撐 現價 $${currentPrice} RSI ${currentRSI.toFixed(1)}`);
+      await placeEventOrder('buy', eventInstId);
+    } else if (currentPrice < currentSMA && isAtResistance && currentRSI > 70) {
+      sendLog(`[2U 高勝率訊號] 空頭反彈阻力 現價 $${currentPrice} RSI ${currentRSI.toFixed(1)}`);
+      await placeEventOrder('sell', eventInstId);
     } else {
-      console.log(`目前價格 $${currentPrice} 未達進場點位`);
+      console.log(`目前價格 $${currentPrice} 尚未滿足 2U 策略甜蜜點`);
     }
 
   } catch (err) {
-    console.error('執行策略發生異常', err.message);
+    console.error('策略運算異常', err.message);
   }
 }
 
 bot.onText(/\/start/, (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, 'OKX 機器人已連線 策略運作中 15m SNR + RSI (每筆 2U)');
+  bot.sendMessage(msg.chat.id, '2U 高勝率事件合約機器人已連線運作中');
 });
 
-setInterval(checkSNRAndTrade, 15 * 60 * 1000);
-checkSNRAndTrade();
+setInterval(checkHighWinRateStrategy, 15 * 60 * 1000);
+checkHighWinRateStrategy();
