@@ -17,17 +17,18 @@ const BASE_URL = 'https://www.okx.com';
 const CHECK_INTERVAL = 60000;
 const ORDER_SIZE = '2';
 
+// 已修正為 OKX 正確的期權合約代號格式 (幣別改為 -USD 且對應 260815 到期日)
 const ASSETS = [
     {
         targetSpot: 'BTC-USDT',
-        callSymbol: 'BTC-USDT-260814-60000-C',
-        putSymbol: 'BTC-USDT-260814-60000-P',
+        callSymbol: 'BTC-USD-260815-63000-C',
+        putSymbol: 'BTC-USD-260815-63000-P',
         position: { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 }
     },
     {
         targetSpot: 'ETH-USDT',
-        callSymbol: 'ETH-USDT-260814-3000-C',
-        putSymbol: 'ETH-USDT-260814-3000-P',
+        callSymbol: 'ETH-USD-260815-1800-C',
+        putSymbol: 'ETH-USD-260815-1800-P',
         position: { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 }
     }
 ];
