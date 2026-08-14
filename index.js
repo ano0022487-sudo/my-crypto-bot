@@ -2,6 +2,14 @@ const axios = require('axios');
 const crypto = require('crypto');
 const TelegramBot = require('node-telegram-bot-api');
 const technicalindicators = require('technicalindicators');
+const express = require('express');
+
+const app = express();
+app.get('/', (req, res) => res.send('OKX 機器人持續運作中'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Web 伺服器已在連接埠 ${PORT} 啟動，防止 Render 休眠`);
+});
 
 const CONFIG = {
   TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
@@ -16,8 +24,8 @@ const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: true });
 
 function sendLog(text) {
   console.log(text);
-  if (CONFIG.TELEGRAM_TOKEN) {
-    bot.sendMessage(process.env.TELEGRAM_CHAT_ID || '', text).catch(() => {});
+  if (CONFIG.TELEGRAM_TOKEN && process.env.TELEGRAM_CHAT_ID) {
+    bot.sendMessage(process.env.TELEGRAM_CHAT_ID, text).catch(() => {});
   }
 }
 
