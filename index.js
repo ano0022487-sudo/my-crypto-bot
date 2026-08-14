@@ -9,15 +9,14 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
-const API_KEY = process.env.OKX_API_KEY;
-const SECRET_KEY = process.env.OKX_SECRET_KEY;
+const API_KEY = process.env.OK_ACCESS_KEY;
+const SECRET_KEY = process.env.OK_ACCESS_SECRET;
 const PASSPHRASE = process.env.OKX_PASSPHRASE;
 const BASE_URL = 'https://www.okx.com';
 
 const CHECK_INTERVAL = 60000;
 const ORDER_SIZE = '2';
 
-// 定義雙幣種監控清單與對應合約
 const ASSETS = [
     {
         targetSpot: 'BTC-USDT',
@@ -34,6 +33,9 @@ const ASSETS = [
 ];
 
 function generateSignature(timestamp, method, requestPath, body = '') {
+    if (!SECRET_KEY) {
+        throw new Error('OK_ACCESS_SECRET 未設定，無法產生簽章');
+    }
     const message = timestamp + method + requestPath + body;
     return crypto.createHmac('sha256', SECRET_KEY).update(message).digest('base64');
 }
@@ -108,9 +110,13 @@ async function placeEventOrder(asset, symbol, side, reason, entryPrice, stopLoss
                 highestPrice: entryPrice
             };
 
-            bot.sendMessage(process.env.TELEGRAM_CHAT_ID || '', 
-                `🚀 【多幣種開倉通知】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
-            ).catch(() => {});
+            if (process.env.TELEGRAM_CHAT_ID) {
+                bot.sendMessage(process.env.TELEGRAM_CHAT_ID, 
+                    `🚀 【多幣種開倉通知】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
+                ).catch(() => {});
+            }
+        } else {
+            console.error('交易所回傳下單失敗:', JSON.stringify(resData));
         }
     } catch (error) {
         console.error('下單失敗:', error.response ? JSON.stringify(error.response.data) : error.message);
@@ -147,9 +153,13 @@ async function closePosition(asset, reason, currentPrice) {
 
         const resData = response.data;
         if (resData.code === '0') {
-            bot.sendMessage(process.env.TELEGRAM_CHAT_ID || '', 
-                `🛡 【多幣種平倉通知】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
-            ).catch(() => {});
+            if (process.env.TELEGRAM_CHAT_ID) {
+                bot.sendMessage(process.env.TELEGRAM_CHAT_ID, 
+                    `🛡 【多幣種平倉通知】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
+                ).catch(() => {});
+            }
+        } else {
+            console.error('交易所回傳平倉失敗:', JSON.stringify(resData));
         }
 
         asset.position = { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 };
