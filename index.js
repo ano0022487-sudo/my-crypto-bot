@@ -20,14 +20,15 @@ const EVENT_SYMBOL_PUT  = 'BTC-USDT-260814-60000-P';
 const CHECK_INTERVAL = 60000;
 const ORDER_SIZE = '2';
 
-// 追蹤當前持倉狀態、止損價與止盈價
+// 追蹤當前持倉狀態、移動停損與目標價
 let currentPosition = {
     active: false,
     symbol: null,
     side: null,
     entryPrice: 0,
     stopLossPrice: 0,
-    takeProfitPrice: 0
+    takeProfitPrice: 0,
+    highestPrice: 0 // 用於追蹤移動停損的最高現價
 };
 
 function generateSignature(timestamp, method, requestPath, body = '') {
@@ -53,6 +54,19 @@ function calculateRSI(closes, period = 14) {
     return 100 - (100 / (1 + rs));
 }
 
+// 帶重試機制的 API 請求包裝函式
+async function axiosWithRetry(config, retries = 3, delay = 2000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await axios(config);
+        } catch (error) {
+            if (i === retries - 1) throw error;
+            console.warn(`API 請求失敗，進行第 ${i + 1} 次重試... 錯誤: ${error.message}`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+}
+
 async function placeEventOrder(symbol, side, reason, entryPrice, stopLoss, takeProfit) {
     try {
         const requestPath = '/api/v5/trade/order';
@@ -67,7 +81,10 @@ async function placeEventOrder(symbol, side, reason, entryPrice, stopLoss, takeP
         });
 
         const signature = generateSignature(timestamp, 'POST', requestPath, bodyData);
-        const response = await axios.post(`${BASE_URL}${requestPath}`, bodyData, {
+        const response = await axiosWithRetry({
+            method: 'POST',
+            url: `${BASE_URL}${requestPath}`,
+            data: bodyData,
             headers: {
                 'OK-ACCESS-KEY': API_KEY,
                 'OK-ACCESS-SIGN': signature,
@@ -81,18 +98,18 @@ async function placeEventOrder(symbol, side, reason, entryPrice, stopLoss, takeP
         if (resData.code === '0') {
             const orderId = resData.data[0].ordId;
             
-            // 記錄持倉、止損與止盈點
             currentPosition = {
                 active: true,
                 symbol: symbol,
                 side: side,
                 entryPrice: entryPrice,
                 stopLossPrice: stopLoss,
-                takeProfitPrice: takeProfit
+                takeProfitPrice: takeProfit,
+                highestPrice: entryPrice
             };
 
             bot.sendMessage(process.env.TELEGRAM_CHAT_ID || '', 
-                `🔥 【雙向停利止損開倉】\n條件：${reason}\n標的：${symbol}\n進場價：${entryPrice}\n止盈價：${takeProfit}\n止損價：${stopLoss}\n訂單編號：${orderId}`
+                `🚀 【終極版開倉通知】\n條件：${reason}\n標的：${symbol}\n進場價：${entryPrice}\n初始止損：${stopLoss}\n目標止盈：${takeProfit}\n訂單編號：${orderId}`
             ).catch(() => {});
         }
     } catch (error) {
@@ -115,7 +132,10 @@ async function closePosition(reason, currentPrice) {
         });
 
         const signature = generateSignature(timestamp, 'POST', requestPath, bodyData);
-        const response = await axios.post(`${BASE_URL}${requestPath}`, bodyData, {
+        const response = await axiosWithRetry({
+            method: 'POST',
+            url: `${BASE_URL}${requestPath}`,
+            data: bodyData,
             headers: {
                 'OK-ACCESS-KEY': API_KEY,
                 'OK-ACCESS-SIGN': signature,
@@ -128,11 +148,11 @@ async function closePosition(reason, currentPrice) {
         const resData = response.data;
         if (resData.code === '0') {
             bot.sendMessage(process.env.TELEGRAM_CHAT_ID || '', 
-                `🎯 【平倉通知】\n原因：${reason}\n標的：${currentPosition.symbol}\n現價：${currentPrice}`
+                `🛡 【終極版平倉通知】\n原因：${reason}\n標的：${currentPosition.symbol}\n現價：${currentPrice}`
             ).catch(() => {});
         }
 
-        currentPosition = { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0 };
+        currentPosition = { active: false, symbol: null, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0, highestPrice: 0 };
     } catch (error) {
         console.error('平倉失敗:', error.response ? JSON.stringify(error.response.data) : error.message);
     }
@@ -140,7 +160,10 @@ async function closePosition(reason, currentPrice) {
 
 async function checkOptimizedStrategy() {
     try {
-        const res = await axios.get(`${BASE_URL}/api/v5/market/candles?instId=${TARGET_SPOT}&bar=1m&limit=30`);
+        const res = await axiosWithRetry({
+            method: 'GET',
+            url: `${BASE_URL}/api/v5/market/candles?instId=${TARGET_SPOT}&bar=1m&limit=30`
+        });
         const candles = res.data.data;
 
         if (!candles || candles.length < 30) return;
@@ -154,37 +177,44 @@ async function checkOptimizedStrategy() {
         const support = Math.min(...lows.slice(1, 20));
         const rsiValue = calculateRSI(closes, 14);
 
-        console.log(`[檢查中] 現價: ${currentClose} | 阻力: ${resistance} | 支撐: ${support} | RSI: ${rsiValue.toFixed(1)}`);
+        console.log(`[終極監控] 現價: ${currentClose} | 阻力: ${resistance} | 支撐: ${support} | RSI: ${rsiValue.toFixed(1)}`);
 
-        // 持倉中的止盈與止損監控
+        // 持倉中的動態移動停損與停利監控
         if (currentPosition.active) {
             if (currentPosition.side === 'buy') {
+                // 更新最高價以實現移動停損
+                if (currentClose > currentPosition.highestPrice) {
+                    currentPosition.highestPrice = currentClose;
+                    // 當獲利擴大時，將止損線往上拉高（鎖住利潤）
+                    const trailingBuffer = (currentClose - currentPosition.entryPrice) * 0.5;
+                    if (currentPosition.entryPrice + trailingBuffer > currentPosition.stopLossPrice) {
+                        currentPosition.stopLossPrice = currentPosition.entryPrice + trailingBuffer;
+                        console.log(`📈 觸發移動停損上調，新止損價: ${currentPosition.stopLossPrice.toFixed(2)}`);
+                    }
+                }
+
                 if (currentClose >= currentPosition.takeProfitPrice) {
-                    console.log('▶ 達到止盈價，執行平倉獲利');
-                    await closePosition(`觸及止盈價 (${currentPosition.takeProfitPrice})`, currentClose);
+                    await closePosition(`觸及目標止盈價 (${currentPosition.takeProfitPrice})`, currentClose);
                 } else if (currentClose <= currentPosition.stopLossPrice) {
-                    console.log('▶ 觸及止損價，執行平倉停損');
-                    await closePosition(`觸及止損價 (${currentPosition.stopLossPrice})`, currentClose);
+                    await closePosition(`觸及移動停損/止損價 (${currentPosition.stopLossPrice.toFixed(2)})`, currentClose);
                 }
             }
             return;
         }
 
-        // 開倉條件與目標價設定
+        // 開倉條件
         if (currentClose > resistance && rsiValue > 55 && rsiValue < 78) {
             const stopLossPrice = support;
             const risk = currentClose - stopLossPrice;
-            const takeProfitPrice = currentClose + (risk * 1.5); // 1.5 倍風險報酬比
+            const takeProfitPrice = currentClose + (risk * 2); // 放大至 2 倍報酬比
             
-            console.log('▶ 突破阻力，發動 2U 看漲單');
             await placeEventOrder(EVENT_SYMBOL_CALL, 'buy', `SNR 突破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
         } 
         else if (currentClose < support && rsiValue < 45 && rsiValue > 22) {
             const stopLossPrice = resistance;
             const risk = stopLossPrice - currentClose;
-            const takeProfitPrice = currentClose - (risk * 1.5); // 1.5 倍風險報酬比
+            const takeProfitPrice = currentClose - (risk * 2);
             
-            console.log('▶ 跌破支撐，發動 2U 看跌單');
             await placeEventOrder(EVENT_SYMBOL_PUT, 'buy', `SNR 跌破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
         }
     } catch (error) {
@@ -195,9 +225,9 @@ async function checkOptimizedStrategy() {
 setInterval(checkOptimizedStrategy, CHECK_INTERVAL);
 
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, '具備完整止盈與止損機制的高勝率機器人已啟動！');
+    bot.sendMessage(msg.chat.id, '🚀 終極完整版機器人（含移動停損與防斷線重試）已啟動！');
 });
 
-app.get('/', (req, res) => res.status(200).send('TP/SL Bot Active.'));
+app.get('/', (req, res) => res.status(200).send('Ultimate Bot Active.'));
 
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
