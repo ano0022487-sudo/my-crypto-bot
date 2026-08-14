@@ -22,9 +22,9 @@ const BASE_URL = 'https://www.okx.com';
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 const CHECK_INTERVAL = 60000;
-const ORDER_SIZE = '2';
+const ORDER_SIZE = '1'; // 建議先調小合約張數降低風險
 
-// 已改為永續合約 (SWAP)，支援標準市價單且不需要期權權限
+// 永續合約 (SWAP) 設定
 const ASSETS = [
     {
         targetSpot: 'BTC-USDT',
@@ -120,7 +120,7 @@ async function placeEventOrder(asset, symbol, side, reason, entryPrice, stopLoss
 
             if (TELEGRAM_CHAT_ID) {
                 bot.sendMessage(TELEGRAM_CHAT_ID, 
-                    `🚀 【多幣種開倉通知】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
+                    `🚀 【多幣種開倉通知 (15m)】\n標的：${asset.targetSpot} (${symbol})\n條件：${reason}\n進場價：${entryPrice}\n訂單編號：${orderId}`
                 ).catch(() => {});
             }
         } else {
@@ -163,7 +163,7 @@ async function closePosition(asset, reason, currentPrice) {
         if (resData.code === '0') {
             if (TELEGRAM_CHAT_ID) {
                 bot.sendMessage(TELEGRAM_CHAT_ID, 
-                    `🛡 【多幣種平倉通知】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
+                    `🛡 【多幣種平倉通知 (15m)】\n標的：${asset.targetSpot}\n原因：${reason}\n現價：${currentPrice}`
                 ).catch(() => {});
             }
         } else {
@@ -178,9 +178,10 @@ async function closePosition(asset, reason, currentPrice) {
 
 async function checkAssetStrategy(asset) {
     try {
+        // 已改為 15 分鐘線 (bar=15m)
         const res = await axiosWithRetry({
             method: 'GET',
-            url: `${BASE_URL}/api/v5/market/candles?instId=${asset.targetSpot}&bar=1m&limit=30`
+            url: `${BASE_URL}/api/v5/market/candles?instId=${asset.targetSpot}&bar=15m&limit=30`
         });
         const candles = res.data.data;
 
@@ -195,7 +196,7 @@ async function checkAssetStrategy(asset) {
         const support = Math.min(...lows.slice(1, 20));
         const rsiValue = calculateRSI(closes, 14);
 
-        console.log(`[${asset.targetSpot}] 現價: ${currentClose} | 阻力: ${resistance} | 支撐: ${support} | RSI: ${rsiValue.toFixed(1)}`);
+        console.log(`[15m ${asset.targetSpot}] 現價: ${currentClose} | 阻力: ${resistance} | 支撐: ${support} | RSI: ${rsiValue.toFixed(1)}`);
 
         if (asset.position.active) {
             if (asset.position.side === 'buy') {
@@ -220,13 +221,13 @@ async function checkAssetStrategy(asset) {
             const stopLossPrice = support;
             const risk = currentClose - stopLossPrice;
             const takeProfitPrice = currentClose + (risk * 2);
-            await placeEventOrder(asset, asset.callSymbol, 'buy', `SNR 突破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
+            await placeEventOrder(asset, asset.callSymbol, 'buy', `15m SNR 突破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
         } 
         else if (currentClose < support && rsiValue < 45 && rsiValue > 22) {
             const stopLossPrice = resistance;
             const risk = stopLossPrice - currentClose;
             const takeProfitPrice = currentClose - (risk * 2);
-            await placeEventOrder(asset, asset.putSymbol, 'buy', `SNR 跌破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
+            await placeEventOrder(asset, asset.putSymbol, 'buy', `15m SNR 跌破 + RSI (${rsiValue.toFixed(1)})`, currentClose, stopLossPrice, takeProfitPrice);
         }
     } catch (error) {
         console.error(`策略運算錯誤 (${asset.targetSpot}):`, error.message);
@@ -242,9 +243,9 @@ async function runAllStrategies() {
 setInterval(runAllStrategies, CHECK_INTERVAL);
 
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, '🚀 雙幣種 (BTC + ETH) 智慧機器人已啟動！');
+    bot.sendMessage(msg.chat.id, '🚀 15分鐘雙幣種智慧機器人已啟動！');
 });
 
-app.get('/', (req, res) => res.status(200).send('Multi-Asset Bot Active.'));
+app.get('/', (req, res) => res.status(200).send('15m Multi-Asset Bot Active.'));
 
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
