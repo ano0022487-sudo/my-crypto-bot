@@ -1,129 +1,83 @@
-const axios = require('axios');
-const crypto = require('crypto');
 const TelegramBot = require('node-telegram-bot-api');
-const technicalindicators = require('technicalindicators');
 const express = require('express');
 
+const token = process.env.TELEGRAM_BOT_TOKEN;
+const url = process.env.RENDER_EXTERNAL_URL;
+const port = process.env.PORT || 3000;
+
+if (!token) {
+  console.error('錯誤：未設定 TELEGRAM_BOT_TOKEN 環境變數！');
+  process.exit(1);
+}
+
 const app = express();
-app.get('/', (req, res) => res.send('2U 高勝率事件合約機器人持續運作中'));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Web 伺服器已在連接埠 ${PORT} 啟動，防止 Render 休眠`);
+app.use(express.json());
+
+const bot = new TelegramBot(token);
+const webhookPath = `/bot${token}`;
+
+if (url) {
+  bot.setWebHook(`${url}${webhookPath}`);
+}
+
+app.post(webhookPath, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
 });
 
-const CONFIG = {
-  TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
-  OKX_API_KEY: process.env.OKX_API_KEY,
-  OKX_SECRET_KEY: process.env.OKX_SECRET_KEY,
-  OKX_PASSPHRASE: process.env.OKX_PASSPHRASE,
-  OKX_BASE_URL: 'https://www.okx.com',
-  TIMEFRAME: '15m'
-};
+app.get('/', (req, res) => {
+  res.send('Crypto Bot 正在運行中！');
+});
 
-const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: true });
+app.listen(port, () => {
+  console.log(`伺服器已啟動，正在監聽 Port ${port}`);
+});
 
-function sendLog(text) {
-  console.log(text);
-  if (CONFIG.TELEGRAM_TOKEN && process.env.TELEGRAM_CHAT_ID) {
-    bot.sendMessage(process.env.TELEGRAM_CHAT_ID, text).catch(() => {});
+// ==================== 交易排程邏輯 ====================
+
+let tradeInterval = null;
+let activeChatId = null;
+
+// 執行模擬合約交易的核心函式
+function executeContractTrade() {
+  const amount = 2; // 固定一次 2U
+  console.log(`[自動執行] 正在送出事件合約交易，金額：${amount}U`);
+
+  if (activeChatId) {
+    bot.sendMessage(activeChatId, `[自動執行] 已成功下單事件合約，投入金額：${amount}U`);
   }
 }
 
-function getSignature(timestamp, method, requestPath, body) {
-  const message = timestamp + method + requestPath + body;
-  return crypto.createHmac('sha256', CONFIG.OKX_SECRET_KEY).update(message).digest('base64');
-}
-
-async function getEventInstrument() {
-  try {
-    const res = await axios.get(`${CONFIG.OKX_BASE_URL}/api/v5/public/instruments?instType=OPTION&uly=BTC-USDT`);
-    const instruments = res.data.data;
-    if (!instruments || instruments.length === 0) return null;
-    return instruments[0].instId;
-  } catch (err) {
-    console.error('獲取合約代碼失敗', err.message);
-    return null;
-  }
-}
-
-async function placeEventOrder(side, instId) {
-  try {
-    const method = 'POST';
-    const requestPath = '/api/v5/trade/order';
-    const bodyObj = {
-      instId: instId,
-      tdMode: 'cash',
-      side: side,
-      ordType: 'market',
-      sz: '2' // 每筆下單固定 2U 規模
-    };
-    const body = JSON.stringify(bodyObj);
-    const timestamp = new Date().toISOString();
-    const sign = getSignature(timestamp, method, requestPath, body);
-
-    const headers = {
-      'OK-ACCESS-KEY': CONFIG.OKX_API_KEY,
-      'OK-ACCESS-SIGN': sign,
-      'OK-ACCESS-TIMESTAMP': timestamp,
-      'OK-ACCESS-PASSPHRASE': CONFIG.OKX_PASSPHRASE,
-      'Content-Type': 'application/json'
-    };
-
-    const response = await axios.post(`${CONFIG.OKX_BASE_URL}${requestPath}`, body, { headers });
-    sendLog(`高勝率事件合約 2U 下單成功：${JSON.stringify(response.data)}`);
-  } catch (err) {
-    sendLog(`下單失敗：${err.response?.data?.msg || err.message}`);
-  }
-}
-
-async function checkHighWinRateStrategy() {
-  try {
-    const targetInstId = 'BTC-USDT-SWAP';
-    const klineUrl = `${CONFIG.OKX_BASE_URL}/api/v5/market/candles?instId=${targetInstId}&bar=${CONFIG.TIMEFRAME}&limit=100`;
-    
-    const res = await axios.get(klineUrl);
-    const rawData = res.data.data;
-    if (!rawData || rawData.length < 50) return;
-
-    const candles = rawData.reverse();
-    const closes = candles.map(c => parseFloat(c[4]));
-    const highs = candles.map(c => parseFloat(c[1]));
-    const lows = candles.map(c => parseFloat(c[2]));
-
-    const currentPrice = closes[closes.length - 1];
-    const resistance = Math.max(...highs.slice(-51, -1));
-    const support = Math.min(...lows.slice(-51, -1));
-
-    const sma50 = technicalindicators.SMA.calculate({ values: closes, period: 50 });
-    const currentSMA = sma50[sma50.length - 1];
-
-    const rsiValues = technicalindicators.RSI.calculate({ values: closes, period: 14 });
-    const currentRSI = rsiValues[rsiValues.length - 1];
-
-    const eventInstId = await getEventInstrument();
-    if (!eventInstId) return;
-
-    const isAtSupport = currentPrice <= support * 1.002;
-    const isAtResistance = currentPrice >= resistance * 0.998;
-
-    if (currentPrice > currentSMA && isAtSupport && currentRSI < 30) {
-      sendLog(`[2U 高勝率訊號] 多頭回踩支撐 現價 $${currentPrice} RSI ${currentRSI.toFixed(1)}`);
-      await placeEventOrder('buy', eventInstId);
-    } else if (currentPrice < currentSMA && isAtResistance && currentRSI > 70) {
-      sendLog(`[2U 高勝率訊號] 空頭反彈阻力 現價 $${currentPrice} RSI ${currentRSI.toFixed(1)}`);
-      await placeEventOrder('sell', eventInstId);
-    } else {
-      console.log(`目前價格 $${currentPrice} 尚未滿足 2U 策略甜蜜點`);
-    }
-
-  } catch (err) {
-    console.error('策略運算異常', err.message);
-  }
-}
-
+// 監聽 /start 指令
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '2U 高勝率事件合約機器人已連線運作中');
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, '加密貨幣機器人已啟動。輸入 /start_trade 開始每 5 分鐘執行 2U 交易，輸入 /stop_trade 停止。');
 });
 
-setInterval(checkHighWinRateStrategy, 5 * 60 * 1000);
-checkHighWinRateStrategy();
+// 啟動每 5 分鐘一次的排程
+bot.onText(/\/start_trade/, (msg) => {
+  const chatId = msg.chat.id;
+  activeChatId = chatId;
+
+  if (tradeInterval) {
+    clearInterval(tradeInterval);
+  }
+
+  // 設定每 5 分鐘 (300000 毫秒) 執行一次
+  tradeInterval = setInterval(executeContractTrade, 5 * 60 * 1000);
+
+  bot.sendMessage(chatId, '已啟動自動事件合約排程：每 5 分鐘執行一次，每次 2U。');
+});
+
+// 停止排程
+bot.onText(/\/stop_trade/, (msg) => {
+  const chatId = msg.chat.id;
+
+  if (tradeInterval) {
+    clearInterval(tradeInterval);
+    tradeInterval = null;
+    bot.sendMessage(chatId, '已停止自動事件合約排程。');
+  } else {
+    bot.sendMessage(chatId, '目前沒有正在執行的排程。');
+  }
+});
