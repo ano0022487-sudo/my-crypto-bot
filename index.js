@@ -1,20 +1,19 @@
 const TelegramBot = require('node-telegram-bot-api');
+const http = require('http');
 
-// 讀取在 Render 設定的 TELEGRAM_BOT_TOKEN
-const token = process.env.TELEGRAM_BOT_TOKEN;
+// 1. 創立一個虛設的 HTTP 服務，讓 Render 掃描 Port 成功
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => res.end('OK')).listen(PORT, () => {
+  console.log(`Port ${PORT} 已監聽！`);
+});
 
-if (!token) {
-  console.error("錯誤：找不到 TELEGRAM_BOT_TOKEN 環境變數！");
-  process.exit(1);
-}
-
-// 建立 Telegram Bot
+// 2. 你的 Telegram 機器人
+const token = 'YOUR_TELEGRAM_BOT_TOKEN'; // 8839544439:AAG0wvZ0QeRWHbZovwCOPNHaRVipTeh6vpM
 const bot = new TelegramBot(token, { polling: true });
 
-console.log("Telegram 機器人已順利啟動！");
+console.log('Telegram 機器人已順利啟動！');
 
-// 當收到任何訊息時回應
 bot.on('message', (msg) => {
   const chatId = msg.chat.id;
-  bot.sendMessage(chatId, `你好！我是你的 OKX 交易機器人，已順利連線囉！`);
+  bot.sendMessage(chatId, '你好！我是你的 OKX 交易機器人，已順利連線囉！');
 });
