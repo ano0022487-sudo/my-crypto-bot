@@ -19,7 +19,7 @@ app.use(express.json());
 
 /* ---------- CONFIG (via env) ---------- */
 const PORT = Number(process.env.PORT || 3000);
-const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() !== 'false'; // set false to go live
+const DRY_RUN = (process.env.DRY_RUN || 'false').toLowerCase() !== 'false'; // live trading by default
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/['"]+/g, '');
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const API_KEY = process.env.OK_ACCESS_KEY || '';
