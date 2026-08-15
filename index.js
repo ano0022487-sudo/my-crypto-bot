@@ -1,12 +1,12 @@
 'use strict';
 /*
   Event Contract SNR Bot — OKX (BTC & ETH)
-  - Timeframes: 5m & 15m (act on candle close)
-  - Strategy: SNR pivot breakout + EMA20 trend filter
-  - Each bet: fixed amount in USDT (MARGIN_PER_TRADE, default 2)
-  - Uses OKX event instruments (instId) you provide via env
-  - DRY_RUN default = false (live). Set DRY_RUN=true to force simulate.
-  - Emergency HTTP control: /pause, /resume (protected by CONTROL_TOKEN)
+  已加入：
+   - 啟動時 Telegram getMe / getChat 驗證
+   - 改良 notifyTelegram，輸出完整錯誤 body
+   - TELEGRAM_CHAT_ID 正規化（數字或 @username）
+   - /test-telegram endpoint 測試 sendMessage 與 getChat
+   - 啟動時若 TELEGRAM_CHAT_ID 空白會警告（不會拋錯）
 */
 
 const express = require('express');
@@ -23,8 +23,18 @@ const PORT = Number(process.env.PORT || 3000);
 // DEFAULT: live trading (set DRY_RUN=true to simulate)
 const DRY_RUN = (process.env.DRY_RUN || 'false').toLowerCase() === 'true';
 
-const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/['"]+/g, '');
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_BOT_TOKEN_RAW = (process.env.TELEGRAM_BOT_TOKEN || '');
+const TELEGRAM_CHAT_ID_RAW = (process.env.TELEGRAM_CHAT_ID || '');
+const TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN_RAW.trim().replace(/['"]+/g, '');
+
+// TELEGRAM_CHAT_ID: support numeric id (e.g. -10012345 or 8578655056) or @username
+const TELEGRAM_CHAT_ID = (() => {
+  const v = TELEGRAM_CHAT_ID_RAW.toString().trim();
+  if (!v) return '';
+  if (/^-?\d+$/.test(v)) return Number(v);
+  return v; // keep as string (e.g. @channelname)
+})();
+
 const API_KEY = process.env.OK_ACCESS_KEY || '';
 const SECRET_KEY = process.env.OK_ACCESS_SECRET || '';
 const PASSPHRASE = process.env.OKX_PASSPHRASE || '';
@@ -50,16 +60,39 @@ const SYMBOLS = [
 ];
 
 /* ---------- Telegram ---------- */
-let bot = { sendMessage: async () => {} };
+// dummy bot to avoid null checks
+let bot = { sendMessage: async () => {}, getMe: async () => {}, getChat: async () => {} };
+let telegramEnabled = false;
+
 if (TELEGRAM_BOT_TOKEN) {
-  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+  try {
+    bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+    telegramEnabled = true;
+  } catch (e) {
+    console.error('Failed to init Telegram bot:', e && e.message ? e.message : e);
+    telegramEnabled = false;
+  }
 }
+
 async function notifyTelegram(text) {
   try {
-    if (!TELEGRAM_CHAT_ID) return;
+    if (!telegramEnabled) {
+      console.warn('notifyTelegram skipped: telegram not enabled. Message:', text);
+      return;
+    }
+    if (!TELEGRAM_CHAT_ID && !TELEGRAM_CHAT_ID_RAW) {
+      console.warn('TELEGRAM_CHAT_ID is not set, skipping notify:', text);
+      return;
+    }
     await bot.sendMessage(TELEGRAM_CHAT_ID, text);
   } catch (e) {
-    console.debug('Telegram send failed:', e && e.message ? e.message : e);
+    // node-telegram-bot-api 的錯誤物件通常在 e.response.body 或 e.response
+    const errBody = e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : null;
+    console.error('Telegram send failed:', {
+      message: e && e.message ? e.message : String(e),
+      body: errBody,
+      stack: e && e.stack ? e.stack : undefined
+    });
   }
 }
 
@@ -373,7 +406,7 @@ app.post('/pause', (req, res) => {
   const token = req.header('x-control-token') || req.query.token;
   if (!CONTROL_TOKEN || token !== CONTROL_TOKEN) return res.status(401).json({ ok: false, msg: 'unauthorized' });
   paused = true;
-  notifyTelegram('🤚 Bot 已暫停 (pause)'); 
+  notifyTelegram('🤚 Bot 已暫停 (pause)');
   return res.json({ ok: true, paused });
 });
 app.post('/resume', (req, res) => {
@@ -385,11 +418,64 @@ app.post('/resume', (req, res) => {
 });
 app.get('/health', (req, res) => res.json({ ok: true, DRY_RUN, paused, now: new Date().toISOString(), globalOpenBets }));
 
+/* ---------- Test endpoint for Telegram ---------- */
+/* Usage (GET): /test-telegram?msg=hello
+   Response returns getChat result and sendMessage result (or error body).
+*/
+app.get('/test-telegram', async (req, res) => {
+  if (!telegramEnabled) return res.status(400).json({ ok: false, msg: 'telegram not enabled (no token)' });
+  const msg = req.query.msg || `test @ ${new Date().toISOString()}`;
+  const out = { ok: true, getMe: null, getChat: null, sendMessage: null };
+  try {
+    try {
+      out.getMe = await bot.getMe();
+    } catch (e) {
+      out.getMe = { error: e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : String(e)) };
+    }
+    try {
+      out.getChat = await bot.getChat(TELEGRAM_CHAT_ID);
+    } catch (e) {
+      out.getChat = { error: e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : String(e)) };
+    }
+    try {
+      out.sendMessage = await bot.sendMessage(TELEGRAM_CHAT_ID, msg);
+    } catch (e) {
+      out.sendMessage = { error: e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : String(e)) };
+    }
+    return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e && e.message ? e.message : e });
+  }
+});
+
 /* ---------- Start ---------- */
 app.get('/', (req, res) => res.send(`Event SNR OKX Bot running. DRY_RUN=${DRY_RUN}`));
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, async () => {
   console.log(`Bot listening on ${PORT} — DRY_RUN=${DRY_RUN}`);
-  notifyTelegram(`Bot started. DRY_RUN=${DRY_RUN}`);
+
+  // startup Telegram checks
+  if (telegramEnabled) {
+    try {
+      const info = await bot.getMe();
+      console.log('Telegram getMe ok:', info && (info.username || info.id) ? (info.username || info.id) : info);
+    } catch (e) {
+      console.error('Telegram getMe failed:', e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : e));
+    }
+    if (TELEGRAM_CHAT_ID) {
+      try {
+        const chat = await bot.getChat(TELEGRAM_CHAT_ID);
+        console.log('Telegram getChat ok:', { id: chat.id, type: chat.type, title: chat.title || chat.username || '' });
+      } catch (e) {
+        console.error('Telegram getChat failed (chat may be unreachable):', e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : e));
+      }
+    } else {
+      console.warn('TELEGRAM_CHAT_ID is not set — Telegram notifications disabled');
+    }
+    // notify start (best-effort)
+    await notifyTelegram(`Bot started. DRY_RUN=${DRY_RUN}`);
+  } else {
+    console.warn('Telegram disabled (no TELEGRAM_BOT_TOKEN). Notifications will be skipped.');
+  }
 });
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 process.on('unhandledRejection', r => console.error('Unhandled Rejection', r));
