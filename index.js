@@ -5,7 +5,7 @@
   - Strategy: SNR pivot breakout + EMA20 trend filter
   - Each bet: fixed amount in USDT (MARGIN_PER_TRADE, default 2)
   - Uses OKX event instruments (instId) you provide via env
-  - DRY_RUN=false to send live orders (must set env). Default: DRY_RUN=true for safety.
+  - DRY_RUN default = false (live). Set DRY_RUN=true to force simulate.
   - Emergency HTTP control: /pause, /resume (protected by CONTROL_TOKEN)
 */
 
@@ -19,7 +19,10 @@ app.use(express.json());
 
 /* ---------- CONFIG (via env) ---------- */
 const PORT = Number(process.env.PORT || 3000);
-const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() !== 'false'; // set false to go live
+
+// DEFAULT: live trading (set DRY_RUN=true to simulate)
+const DRY_RUN = (process.env.DRY_RUN || 'false').toLowerCase() === 'true';
+
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/['"]+/g, '');
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const API_KEY = process.env.OK_ACCESS_KEY || '';
@@ -28,7 +31,7 @@ const PASSPHRASE = process.env.OKX_PASSPHRASE || '';
 const BASE_URL = process.env.OKX_BASE_URL || 'https://www.okx.com';
 
 const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15 * 1000); // poll interval
-const MARGIN_PER_TRADE = Number(process.env.MARGIN_PER_TRADE || 2); // 2 U per bet
+const MARGIN_PER_TRADE = Number(process.env.MARGIN_PER_TRADE || 2); // default 2 U per bet
 const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001); // 0.1% buffer
 const EMA_PERIOD = Number(process.env.EMA_PERIOD || 20);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 4);
@@ -163,8 +166,16 @@ async function submitEventOrderOKX({ instId, direction, amountU }) {
 
     const side = direction === 'UP' ? 'buy' : 'sell';
 
-    if (DRY_RUN || !API_KEY || !SECRET_KEY || !PASSPHRASE) {
-      return { success: true, id: 'SIM-' + Date.now(), details: { instId, side, sz: szFloat, price: last, meta } };
+    // simulation only when DRY_RUN is true
+    if (DRY_RUN) {
+      const sim = { success: true, id: 'SIM-' + Date.now(), details: { instId, side, sz: szFloat, price: last, meta } };
+      await notifyTelegram(`(SIM) 下單模擬: inst=${instId} side=${side} sz=${szFloat} price=${last}`);
+      return sim;
+    }
+
+    // Live: require API credentials
+    if (!API_KEY || !SECRET_KEY || !PASSPHRASE) {
+      return { success: false, error: 'Missing API credentials for live trading' };
     }
 
     const requestPath = '/api/v5/trade/order';
@@ -192,7 +203,7 @@ async function submitEventOrderOKX({ instId, direction, amountU }) {
 
     const ord = Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
     const ordId = ord ? (ord.ordId || ord.clOrdId || null) : null;
-    const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 6, 1000) : null;
+    const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 12, 2000) : null;
 
     return { success: true, id: ordId || ('OKX-SIM-' + Date.now()), details: { resp: resp.data, orderInfo } };
 
@@ -247,6 +258,12 @@ async function evaluateForTimeframe(sym, timeframe, candles15, candles5) {
       return;
     }
 
+    // block live attempt if credentials missing
+    if (!DRY_RUN && (!API_KEY || !SECRET_KEY || !PASSPHRASE)) {
+      await notifyTelegram(`⚠️ 實盤模式但缺少 API credentials，已停止該次下單。`);
+      return;
+    }
+
     const { pivotHighs, pivotLows } = findPivots(candles15, 3);
     const resistance = pickLevelFromPivots(pivotHighs, 0.006);
     const support = pickLevelFromPivots(pivotLows, 0.006);
@@ -278,16 +295,31 @@ async function evaluateForTimeframe(sym, timeframe, candles15, candles5) {
     }
 
     const bet = { instId, direction, amountU: MARGIN_PER_TRADE };
-    const resp = await submitEventOrderOKX(bet);
 
-    if (resp && resp.success) {
-      state[sym.base].lastBet[key] = nowTs;
-      globalOpenBets++;
-      await notifyTelegram(`✅ 下單 ${DRY_RUN ? '(SIM)' : '(LIVE)'}\n標的: ${sym.label}\n時框: ${timeframe}\n方向: ${direction}\n金額(U): ${MARGIN_PER_TRADE}\ninstId: ${instId}\norderId: ${resp.id}\ndetails: ${JSON.stringify(resp.details)}`);
-      // optional: you may poll later and decrement globalOpenBets when order resolves
-      setTimeout(async () => { globalOpenBets = Math.max(0, globalOpenBets - 1); }, 5 * 60 * 1000); // safe decrement fallback
-    } else {
-      await notifyTelegram(`❌ 下單失敗 ${sym.label} ${timeframe} ${direction}\nerror: ${JSON.stringify(resp)}`);
+    // reserve slot
+    globalOpenBets++;
+    try {
+      const resp = await submitEventOrderOKX(bet);
+      if (resp && resp.success) {
+        state[sym.base].lastBet[key] = nowTs;
+        await notifyTelegram(`✅ 下單 ${DRY_RUN ? '(SIM)' : '(LIVE)'}\n標的: ${sym.label}\n時框: ${timeframe}\n方向: ${direction}\n金額(U): ${MARGIN_PER_TRADE}\ninstId: ${instId}\norderId: ${resp.id || 'N/A'}`);
+        // if orderInfo already present use it, otherwise poll
+        let final = (resp.details && resp.details.orderInfo) ? resp.details.orderInfo : null;
+        if (!final && resp.id && !DRY_RUN) {
+          final = await pollOKXOrderStatus(instId, resp.id, 12, 2000);
+        }
+        if (final) {
+          await notifyTelegram(`訂單狀態: ordId=${resp.id} state=${final.state} filled=${final.fillSz || final.accFillSz || 0}`);
+        } else {
+          await notifyTelegram(`訂單查詢未在時限內回來: ordId=${resp.id}`);
+        }
+      } else {
+        await notifyTelegram(`❌ 下單失敗 ${sym.label} ${timeframe} ${direction}\nerror: ${JSON.stringify(resp)}`);
+      }
+    } catch (e) {
+      await notifyTelegram(`❌ 下單過程發生例外: ${e && e.message ? e.message : e}`);
+    } finally {
+      globalOpenBets = Math.max(0, globalOpenBets - 1);
     }
 
   } catch (e) {
