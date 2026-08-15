@@ -28,8 +28,8 @@ const PASSPHRASE = process.env.OKX_PASSPHRASE || '';
 const BASE_URL = process.env.OKX_BASE_URL || 'https://www.okx.com';
 
 const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15 * 1000); // poll interval
-const LEVERAGE = Number(process.env.LEVERAGE || 3);
-const MARGIN_PER_TRADE = Number(process.env.MARGIN_PER_TRADE || 8); // 8 U margin per trade
+const LEVERAGE = Number(process.env.LEVERAGE || 10);
+const MARGIN_PER_TRADE = Number(process.env.MARGIN_PER_TRADE || 4); // 4 U margin per trade
 const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.01); // 1% risk
 const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.03); // 3% reward (1:3 R:R)
 const POS_MODE = (process.env.POS_MODE || 'net').toLowerCase(); // net or long_short
@@ -67,7 +67,7 @@ let bot = { sendMessage: async () => {} };
 if (TELEGRAM_BOT_TOKEN) {
   bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
   bot.onText(/^\/start(?:\s|$)/, (msg) => {
-    bot.sendMessage(msg.chat.id, `機器人已連線。\n模式：${DRY_RUN ? '模擬交易' : '實盤交易'}\n策略：15m + 4H、3x、每筆 ${MARGIN_PER_TRADE}U、止損 1%／止盈 3%。`)
+    bot.sendMessage(msg.chat.id, `機器人已連線。\n模式：${DRY_RUN ? '模擬交易' : '實盤交易'}\n策略：15m + 4H、${LEVERAGE}x、每筆 ${MARGIN_PER_TRADE}U、止損 1%／止盈 3%。`)
       .catch((e) => console.error('Telegram /start reply failed:', e && e.message ? e.message : e));
   });
 }
