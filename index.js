@@ -65,7 +65,11 @@ const SYMBOLS = [
 /* ---------- Telegram ---------- */
 let bot = { sendMessage: async () => {} };
 if (TELEGRAM_BOT_TOKEN) {
-  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+  bot.onText(/^\/start(?:\s|$)/, (msg) => {
+    bot.sendMessage(msg.chat.id, `機器人已連線。\n模式：${DRY_RUN ? '模擬交易' : '實盤交易'}\n策略：15m + 4H、3x、每筆 ${MARGIN_PER_TRADE}U、止損 1%／止盈 3%。`)
+      .catch((e) => console.error('Telegram /start reply failed:', e && e.message ? e.message : e));
+  });
 }
 async function notifyTelegram(text) {
   try {
