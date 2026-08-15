@@ -1,73 +1,82 @@
 'use strict';
 /*
-  Event-contract SNR Bot — LIVE (実盤)
-  - DRY_RUN is forced to false (LIVE trading).
-  - Single trade amount: 12 USDT (MARGIN_PER_TRADE).
-  - Only BTC and ETH supported (use EVENT_INST_BTC_USDT / EVENT_INST_ETH_USDT env).
-  - Keep original structure: polling Telegram, /test-telegram, /health.
-  IMPORTANT: This will place real orders when API keys and EVENT instIds are present.
+  Event Contract SNR Bot — OKX (BTC & ETH)
+  - Timeframes: 5m & 15m (act on candle close)
+  - Strategy: SNR pivot breakout + EMA20 trend filter
+  - Each bet: fixed amount in USDT (MARGIN_PER_TRADE, default 2)
+  - Uses OKX event instruments (instId) you provide via env
+  - DRY_RUN=false to send live orders (must set env). Default: DRY_RUN=true for safety.
+  - Emergency HTTP control: /pause, /resume (protected by CONTROL_TOKEN)
 */
 
 const express = require('express');
-const crypto = require('crypto');
 const axios = require('axios');
+const crypto = require('crypto');
 const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
 app.use(express.json());
-const PORT = process.env.PORT || 3000;
 
-// FORCE LIVE
-const DRY_RUN = false;
-
-// Telegram config
-const TELEGRAM_BOT_TOKEN_RAW = (process.env.TELEGRAM_BOT_TOKEN || '');
-const TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN_RAW.trim().replace(/['"]+/g, '');
-const TELEGRAM_CHAT_ID_RAW = (process.env.TELEGRAM_CHAT_ID || '');
-const TELEGRAM_CHAT_ID = (() => {
-  const v = TELEGRAM_CHAT_ID_RAW.toString().trim();
-  if (!v) return '';
-  if (/^-?\d+$/.test(v)) return Number(v);
-  return v;
-})();
-
-// OKX API
+/* ---------- CONFIG (via env) ---------- */
+const PORT = Number(process.env.PORT || 3000);
+const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() !== 'false'; // set false to go live
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/['"]+/g, '');
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const API_KEY = process.env.OK_ACCESS_KEY || '';
 const SECRET_KEY = process.env.OK_ACCESS_SECRET || '';
 const PASSPHRASE = process.env.OKX_PASSPHRASE || '';
 const BASE_URL = process.env.OKX_BASE_URL || 'https://www.okx.com';
 
-// Strategy / risk params
-const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15 * 1000);
-const MARGIN_PER_TRADE = 2; // fixed 2 USDT per request (LIVE)
+const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15 * 1000); // poll interval
+const LEVERAGE = Number(process.env.LEVERAGE || 3);
+const MARGIN_PER_TRADE = Number(process.env.MARGIN_PER_TRADE || 8); // 8 U margin per trade
+const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.01); // 1% risk
+const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.03); // 3% reward (1:3 R:R)
+const POS_MODE = (process.env.POS_MODE || 'net').toLowerCase(); // net or long_short
+const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001); // 0.1% buffer
 const EMA_PERIOD = Number(process.env.EMA_PERIOD || 20);
-const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001);
-const LOOKBACK_PIVOT = Number(process.env.LOOKBACK_PIVOT || 3);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 4);
-const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.01);
-const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.03);
+const CONTROL_TOKEN = process.env.CONTROL_TOKEN || ''; // required to protect /pause /resume
 
-// Only BTC and ETH (preserve your position structure)
+/* ---------- Symbols (monitor spot candles for S/R) ---------- */
 const SYMBOLS = [
-  { targetSpot: 'BTC-USDT', swapSymbol: 'BTC-USDT-SWAP', label: 'BTC', position: { active: false, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0 } },
-  { targetSpot: 'ETH-USDT', swapSymbol: 'ETH-USDT-SWAP', label: 'ETH', position: { active: false, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0 } }
+  { base: 'ETH-USDT', label: 'ETH', swap: 'ETH-USDT-SWAP' },
+  { base: 'SOL-USDT', label: 'SOL', swap: 'SOL-USDT-SWAP' },
+  { base: 'XRP-USDT', label: 'XRP', swap: 'XRP-USDT-SWAP' },
+  { base: 'DOGE-USDT', label: 'DOGE', swap: 'DOGE-USDT-SWAP' },
+  { base: 'ADA-USDT', label: 'ADA', swap: 'ADA-USDT-SWAP' },
+  { base: 'AVAX-USDT', label: 'AVAX', swap: 'AVAX-USDT-SWAP' },
+  { base: 'LINK-USDT', label: 'LINK', swap: 'LINK-USDT-SWAP' },
+  { base: 'DOT-USDT', label: 'DOT', swap: 'DOT-USDT-SWAP' },
+  { base: 'LTC-USDT', label: 'LTC', swap: 'LTC-USDT-SWAP' },
+  { base: 'BCH-USDT', label: 'BCH', swap: 'BCH-USDT-SWAP' },
+  { base: 'SUI-USDT', label: 'SUI', swap: 'SUI-USDT-SWAP' },
+  { base: 'APT-USDT', label: 'APT', swap: 'APT-USDT-SWAP' },
+  { base: 'NEAR-USDT', label: 'NEAR', swap: 'NEAR-USDT-SWAP' },
+  { base: 'UNI-USDT', label: 'UNI', swap: 'UNI-USDT-SWAP' },
+  { base: 'ATOM-USDT', label: 'ATOM', swap: 'ATOM-USDT-SWAP' },
+  { base: 'FIL-USDT', label: 'FIL', swap: 'FIL-USDT-SWAP' },
+  { base: 'ETC-USDT', label: 'ETC', swap: 'ETC-USDT-SWAP' },
+  { base: 'ARB-USDT', label: 'ARB', swap: 'ARB-USDT-SWAP' },
+  { base: 'OP-USDT', label: 'OP', swap: 'OP-USDT-SWAP' },
+  { base: 'TRX-USDT', label: 'TRX', swap: 'TRX-USDT-SWAP' }
 ];
 
-// read event inst ids from env
-const EVENT_INST_BTC_USDT = (process.env.EVENT_INST_BTC_USDT || '').trim();
-const EVENT_INST_ETH_USDT = (process.env.EVENT_INST_ETH_USDT || '').trim();
-for (const s of SYMBOLS) {
-  if (s.targetSpot === 'BTC-USDT') s.eventInst = EVENT_INST_BTC_USDT || null;
-  if (s.targetSpot === 'ETH-USDT') s.eventInst = EVENT_INST_ETH_USDT || null;
+/* ---------- Telegram ---------- */
+let bot = { sendMessage: async () => {} };
+if (TELEGRAM_BOT_TOKEN) {
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+}
+async function notifyTelegram(text) {
+  try {
+    if (!TELEGRAM_CHAT_ID) return;
+    await bot.sendMessage(TELEGRAM_CHAT_ID, text);
+  } catch (e) {
+    console.debug('Telegram send failed:', e && e.message ? e.message : e);
+  }
 }
 
 /* ---------- Helpers ---------- */
-function generateSignature(timestamp, method, requestPath, body = '') {
-  if (!SECRET_KEY) throw new Error('API Secret 未設定');
-  const message = timestamp + method.toUpperCase() + requestPath + body;
-  return crypto.createHmac('sha256', SECRET_KEY).update(message).digest('base64');
-}
-
 async function axiosWithRetry(config, retries = 3, delay = 1200) {
   for (let i = 0; i < retries; i++) {
     try { return await axios(config); }
@@ -77,51 +86,29 @@ async function axiosWithRetry(config, retries = 3, delay = 1200) {
     }
   }
 }
-
-/* ---------- Telegram ---------- */
-let bot = { sendMessage: async () => {}, getMe: async () => {}, getChat: async () => {} };
-let telegramEnabled = false;
-if (TELEGRAM_BOT_TOKEN) {
-  try {
-    bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-    telegramEnabled = true;
-  } catch (e) {
-    console.error('Telegram init failed:', e && e.message ? e.message : e);
-    telegramEnabled = false;
-  }
+function generateSignature(timestamp, method, requestPath, body = '') {
+  if (!SECRET_KEY) throw new Error('API Secret 未設定');
+  const message = timestamp + method.toUpperCase() + requestPath + body;
+  return crypto.createHmac('sha256', SECRET_KEY).update(message).digest('base64');
 }
-async function safeSendTelegram(text) {
-  if (!telegramEnabled) {
-    console.warn('Telegram disabled, skip notify:', text);
-    return;
-  }
-  if (!TELEGRAM_CHAT_ID) {
-    console.warn('TELEGRAM_CHAT_ID not set, skip notify:', text);
-    return;
-  }
-  try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, text);
-  } catch (e) {
-    const body = e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : e);
-    console.error('Telegram send failed:', body);
-  }
+function normalizeCandles(candles) {
+  return candles.slice().sort((a, b) => new Date(a[0]) - new Date(b[0]));
 }
-
-/* ---------- Candles / indicators / S/R ---------- */
-function normalizeCandles(candles) { return candles.slice().sort((a,b)=> new Date(a[0]) - new Date(b[0])); }
 function closesFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[4])); }
 function highsFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[2])); }
 function lowsFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[3])); }
 
+/* ---------- Indicators ---------- */
 function ema(values, period) {
   if (!values || values.length < period) return null;
   const k = 2 / (period + 1);
-  let emaPrev = values.slice(0, period).reduce((a,b)=>a+b,0) / period;
+  let emaPrev = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
   for (let i = period; i < values.length; i++) emaPrev = values[i] * k + emaPrev * (1 - k);
   return emaPrev;
 }
 
-function findPivots(candles, lookback = LOOKBACK_PIVOT) {
+/* ---------- S/R pivot detection ---------- */
+function findPivots(candles, lookback = 3) {
   const s = normalizeCandles(candles);
   const highs = highsFrom(s), lows = lowsFrom(s);
   const pivotHighs = [], pivotLows = [];
@@ -139,15 +126,20 @@ function pickLevelFromPivots(pivots, proximity = 0.006) {
     if (found) { found.members.push(p); found.price = (found.price * (found.count || 1) + p.price) / ((found.count || 1) + 1); found.count = (found.count || 1) + 1; }
     else clusters.push({ price: p.price, members: [p], count: 1 });
   }
-  clusters.sort((a,b) => (b.members[b.members.length-1].idx) - (a.members[a.members.length-1].idx));
+  clusters.sort((a, b) => (b.members[b.members.length - 1].idx) - (a.members[a.members.length - 1].idx));
   return clusters[0] ? clusters[0].price : null;
 }
 
-/* ---------- OKX helpers ---------- */
+/* ---------- OKX Public helpers ---------- */
 async function fetchOKXCandles(instId, bar, limit = 80) {
   const url = `${BASE_URL}/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=${bar}&limit=${limit}`;
   const resp = await axiosWithRetry({ method: 'GET', url, timeout: 10000 });
   return resp && resp.data && resp.data.data ? resp.data.data : null;
+}
+async function fetchEventInstruments() {
+  const url = `${BASE_URL}/api/v5/public/instruments?instType=SWAP`;
+  const resp = await axiosWithRetry({ method: 'GET', url, timeout: 12000 });
+  return resp && resp.data && Array.isArray(resp.data.data) ? resp.data.data : [];
 }
 async function fetchTicker(instId) {
   const url = `${BASE_URL}/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`;
@@ -155,7 +147,7 @@ async function fetchTicker(instId) {
   return resp && resp.data && Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
 }
 async function fetchInstrumentMetadata(instId) {
-  const url = `${BASE_URL}/api/v5/public/instruments?instType=EVENT&instId=${encodeURIComponent(instId)}`;
+  const url = `${BASE_URL}/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`;
   try {
     const resp = await axiosWithRetry({ method: 'GET', url, timeout: 8000 });
     if (resp && resp.data && Array.isArray(resp.data.data) && resp.data.data[0]) return resp.data.data[0];
@@ -169,32 +161,57 @@ function roundDownToStep(value, step) {
   return parseFloat(floored.toFixed(precision));
 }
 
-/* ---------- Order submit & poll (EVENT) ---------- */
-async function submitEventOrderOKX({ instId, direction, amountU }) {
+/* ---------- Order submit & poll ---------- */
+async function setLeverage(instId, posSide) {
+  if (DRY_RUN || !API_KEY || !SECRET_KEY || !PASSPHRASE) return;
+  const requestPath = '/api/v5/account/set-leverage';
+  const timestamp = new Date().toISOString();
+  const bodyObj = { instId, lever: LEVERAGE.toString(), mgnMode: 'cross' };
+  if (POS_MODE === 'long_short') bodyObj.posSide = posSide;
+  const body = JSON.stringify(bodyObj);
+  const signature = generateSignature(timestamp, 'POST', requestPath, body);
+  const resp = await axiosWithRetry({
+    method: 'POST', url: `${BASE_URL}${requestPath}`, data: body,
+    headers: { 'OK-ACCESS-KEY': API_KEY, 'OK-ACCESS-SIGN': signature, 'OK-ACCESS-TIMESTAMP': timestamp, 'OK-ACCESS-PASSPHRASE': PASSPHRASE, 'Content-Type': 'application/json' },
+    timeout: 15000
+  });
+  if (!resp || !resp.data || String(resp.data.code) !== '0') throw new Error(`Leverage setup failed: ${JSON.stringify(resp && resp.data)}`);
+}
+
+async function submitSwapOrderOKX({ instId, direction, amountU }) {
   try {
     const ticker = await fetchTicker(instId);
     const last = ticker && (ticker.last || ticker.px) ? parseFloat(ticker.last || ticker.px) : null;
     const meta = await fetchInstrumentMetadata(instId);
     let step = null;
     if (meta) {
-      step = meta.minSz || meta.minSize || meta.sizeIncrement || meta.lot || meta.tickSz || null;
+      step = meta.lotSz || meta.minSz || meta.minSize || meta.sizeIncrement || meta.lot || null;
       if (typeof step === 'string') step = parseFloat(step);
     }
-    let szFloat = 1;
-    if (last && last > 0) szFloat = amountU / last;
+    const ctVal = meta && meta.ctVal ? parseFloat(meta.ctVal) : null;
+    if (!last || last <= 0 || !ctVal || ctVal <= 0) return { success: false, error: 'Missing valid ticker or contract value' };
+    let szFloat = (amountU * LEVERAGE) / (last * ctVal);
     if (step) szFloat = roundDownToStep(szFloat, step);
-    if (!szFloat || szFloat <= 0) szFloat = 1;
+    const minSz = meta && meta.minSz ? parseFloat(meta.minSz) : 0;
+    if (!szFloat || szFloat <= 0 || (minSz && szFloat < minSz)) return { success: false, error: `Order size below minimum: ${szFloat} contracts (min ${minSz || 'unknown'})` };
 
     const side = direction === 'UP' ? 'buy' : 'sell';
+    const posSide = direction === 'UP' ? 'long' : 'short';
+    const takeProfitPrice = direction === 'UP' ? last * (1 + TAKE_PROFIT_PCT) : last * (1 - TAKE_PROFIT_PCT);
+    const stopLossPrice = direction === 'UP' ? last * (1 - STOP_LOSS_PCT) : last * (1 + STOP_LOSS_PCT);
 
-    // Live only (DRY_RUN=false)
-    if (!API_KEY || !SECRET_KEY || !PASSPHRASE) {
-      return { success: false, error: 'Missing API credentials for live trading' };
+    if (DRY_RUN || !API_KEY || !SECRET_KEY || !PASSPHRASE) {
+      return { success: true, id: 'SIM-' + Date.now(), details: { instId, side, sz: szFloat, price: last, takeProfitPrice, stopLossPrice, meta } };
     }
 
+    await setLeverage(instId, posSide);
     const requestPath = '/api/v5/trade/order';
     const timestamp = new Date().toISOString();
-    const bodyObj = { instId, tdMode: 'cash', side, ordType: 'market', sz: szFloat.toString() };
+    const bodyObj = {
+      instId, tdMode: 'cross', side, ordType: 'market', sz: szFloat.toString(),
+      attachAlgoOrds: [{ tpTriggerPx: takeProfitPrice.toString(), tpOrdPx: '-1', slTriggerPx: stopLossPrice.toString(), slOrdPx: '-1', tpTriggerPxType: 'last', slTriggerPxType: 'last' }]
+    };
+    if (POS_MODE === 'long_short') bodyObj.posSide = posSide;
     const body = JSON.stringify(bodyObj);
     const signature = generateSignature(timestamp, 'POST', requestPath, body);
 
@@ -217,14 +234,14 @@ async function submitEventOrderOKX({ instId, direction, amountU }) {
 
     const ord = Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
     const ordId = ord ? (ord.ordId || ord.clOrdId || null) : null;
-    const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 12, 2000) : null;
+    const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 6, 1000) : null;
 
-    return { success: true, id: ordId || ('OKX-' + Date.now()), details: { resp: resp.data, orderInfo } };
+    return { success: true, id: ordId || ('OKX-SIM-' + Date.now()), details: { resp: resp.data, orderInfo } };
+
   } catch (e) {
-    return { success: false, error: e && e.response && e.response.data ? e.response.data : (e && e.message ? e.message : e) };
+    return { success: false, error: e && e.message ? e.message : e };
   }
 }
-
 async function pollOKXOrderStatus(instId, ordId, attempts = 6, delay = 1000) {
   if (!API_KEY || !SECRET_KEY || !PASSPHRASE) return null;
   const requestPath = '/api/v5/trade/order';
@@ -256,157 +273,27 @@ async function pollOKXOrderStatus(instId, ordId, attempts = 6, delay = 1000) {
 
 /* ---------- Strategy state ---------- */
 const state = {};
-for (const s of SYMBOLS) state[s.targetSpot] = { last5Ts: null, last15Ts: null, lastBetTs: null };
+for (const s of SYMBOLS) state[s.base] = { last15CloseTs: null, lastBet: { '15m': null } };
+let paused = false;
 let globalOpenBets = 0;
 
-/* ---------- setLeverage (kept, may be ignored by EVENT) ---------- */
-async function setLeverage(symbol) {
+/* ---------- Core: evaluate and act ---------- */
+async function legacyEvaluateForTimeframe(sym, timeframe, candles15, candles5) {
   try {
-    const requestPath = '/api/v5/account/set-leverage';
-    const timestamp = new Date().toISOString();
-    const bodyData = JSON.stringify({ instId: symbol, lever: '1', mgnMode: 'cross' }); // set 1 (no leverage) for safety
-    const signature = generateSignature(timestamp, 'POST', requestPath, bodyData);
-    await axiosWithRetry({
-      method: 'POST',
-      url: `${BASE_URL}${requestPath}`,
-      data: bodyData,
-      headers: {
-        'OK-ACCESS-KEY': API_KEY,
-        'OK-ACCESS-SIGN': signature,
-        'OK-ACCESS-TIMESTAMP': timestamp,
-        'OK-ACCESS-PASSPHRASE': PASSPHRASE,
-        'Content-Type': 'application/json'
-      }
-    });
-  } catch (e) {
-    // ignore
-  }
-}
-
-/* ---------- openOrder / closeOrder (use eventInst pref) ---------- */
-async function openOrder(item, side, reason, entryPrice) {
-  try {
-    const instToTrade = item.eventInst || item.swapSymbol;
-    await setLeverage(instToTrade);
-    const requestPath = '/api/v5/trade/order';
-    const timestamp = new Date().toISOString();
-
-    const positionValue = MARGIN_PER_TRADE;
-    const sz = (positionValue / entryPrice).toFixed(6);
-
-    const bodyData = JSON.stringify({
-      instId: instToTrade,
-      tdMode: 'cash',
-      side: side,
-      ordType: 'market',
-      sz: sz > 0 ? sz.toString() : '1'
-    });
-
-    const signature = generateSignature(timestamp, 'POST', requestPath, bodyData);
-    const response = await axiosWithRetry({
-      method: 'POST',
-      url: `${BASE_URL}${requestPath}`,
-      data: bodyData,
-      headers: {
-        'OK-ACCESS-KEY': API_KEY,
-        'OK-ACCESS-SIGN': signature,
-        'OK-ACCESS-TIMESTAMP': timestamp,
-        'OK-ACCESS-PASSPHRASE': PASSPHRASE,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const resData = response.data;
-    if (String(resData.code) === '0') {
-      const sl = side === 'buy' ? entryPrice * (1 - STOP_LOSS_PCT) : entryPrice * (1 + STOP_LOSS_PCT);
-      const tp = side === 'buy' ? entryPrice * (1 + TAKE_PROFIT_PCT) : entryPrice * (1 - TAKE_PROFIT_PCT);
-      item.position = { active: true, side: side, entryPrice: entryPrice, stopLossPrice: sl, takeProfitPrice: tp };
-
-      if (TELEGRAM_CHAT_ID) {
-        await safeSendTelegram(
-          `🚀 【事件合約開倉通知】\n標的：${item.targetSpot}\nINST：${instToTrade}\n方向：${side.toUpperCase()}\n原因：${reason}\n進場價：${entryPrice}\n止損價：${sl.toFixed(6)} | 止盈價：${tp.toFixed(6)}`
-        );
-      }
-    } else {
-      console.error('openOrder failed:', resData);
-      await safeSendTelegram(`❌ 下單失敗：${JSON.stringify(resData)}`);
+    if (paused) return;
+    const instId = (timeframe === '5m') ? sym.inst5 : sym.inst15;
+    if (!instId) {
+      await notifyTelegram(`[${sym.label}] ${timeframe} - 沒有對應 event instId，請在 env 設定 ${sym.label}_${timeframe.toUpperCase()}_INST`);
+      return;
     }
-  } catch (error) {
-    console.error('下單失敗:', error && error.message ? error.message : error);
-    await safeSendTelegram(`❌ 下單例外: ${error && error.message ? error.message : error}`);
-  }
-}
 
-async function closeOrder(item, reason, currentPrice) {
-  try {
-    const instToTrade = item.eventInst || item.swapSymbol;
-    const requestPath = '/api/v5/trade/order';
-    const timestamp = new Date().toISOString();
-    const closeSide = item.position.side === 'buy' ? 'sell' : 'buy';
-
-    const bodyData = JSON.stringify({
-      instId: instToTrade,
-      tdMode: 'cash',
-      side: closeSide,
-      ordType: 'market',
-      sz: '1'
-    });
-
-    const signature = generateSignature(timestamp, 'POST', requestPath, bodyData);
-    await axiosWithRetry({
-      method: 'POST',
-      url: `${BASE_URL}${requestPath}`,
-      data: bodyData,
-      headers: {
-        'OK-ACCESS-KEY': API_KEY,
-        'OK-ACCESS-SIGN': signature,
-        'OK-ACCESS-TIMESTAMP': timestamp,
-        'OK-ACCESS-PASSPHRASE': PASSPHRASE,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (TELEGRAM_CHAT_ID) {
-      await safeSendTelegram(
-        `🛡 【事件合約平倉通知】\n標的：${item.targetSpot}\nINST：${instToTrade}\n方向：${item.position.side.toUpperCase()}\n原因：${reason}\n現價：${currentPrice}`
-      );
-    }
-    item.position = { active: false, side: null, entryPrice: 0, stopLossPrice: 0, takeProfitPrice: 0 };
-  } catch (error) {
-    console.error('平倉失敗:', error && error.message ? error.message : error);
-    await safeSendTelegram(`❌ 平倉例外: ${error && error.message ? error.message : error}`);
-  }
-}
-
-/* ---------- Strategy: SNR breakout ---------- */
-async function processItem(item) {
-  try {
-    const [res15m, res5m] = await Promise.all([
-      axiosWithRetry({ method: 'GET', url: `${BASE_URL}/api/v5/market/candles?instId=${item.targetSpot}&bar=15m&limit=80` }),
-      axiosWithRetry({ method: 'GET', url: `${BASE_URL}/api/v5/market/candles?instId=${item.targetSpot}&bar=5m&limit=80` })
-    ]);
-    const candles15m = res15m && res15m.data && res15m.data.data ? res15m.data.data : null;
-    const candles5m = res5m && res5m.data && res5m.data.data ? res5m.data.data : null;
-    if (!candles15m || !candles5m) return;
-    if (candles15m.length < 20 || candles5m.length < 20) return;
-
-    const sorted15 = normalizeCandles(candles15m);
-    const sorted5 = normalizeCandles(candles5m);
-    const latest15 = sorted15[sorted15.length - 1];
-    const latest5 = sorted5[sorted5.length - 1];
-    const ts15 = latest15[0], ts5 = latest5[0];
-    const st = state[item.targetSpot];
-
-    if (st.last5Ts === ts5 && st.last15Ts === ts15) return;
-    st.last5Ts = ts5; st.last15Ts = ts15;
-
-    const { pivotHighs, pivotLows } = findPivots(sorted15, LOOKBACK_PIVOT);
+    const { pivotHighs, pivotLows } = findPivots(candles15, 3);
     const resistance = pickLevelFromPivots(pivotHighs, 0.006);
     const support = pickLevelFromPivots(pivotLows, 0.006);
     if (!resistance || !support) return;
 
-    const closes15 = closesFrom(sorted15);
-    const closes5 = closesFrom(sorted5);
+    const closes15 = closesFrom(candles15);
+    const closes5 = closesFrom(candles5);
     const ema15 = ema(closes15, EMA_PERIOD);
     const ema5 = ema(closes5, EMA_PERIOD);
     if (!ema15 || !ema5) return;
@@ -415,45 +302,115 @@ async function processItem(item) {
     const buffer = BREAKOUT_BUFFER;
 
     let direction = null;
-    if (latest5Close > resistance * (1 + buffer) && latest5Close > ema15 && latest5Close > ema5) direction = 'buy';
-    else if (latest5Close < support * (1 - buffer) && latest5Close < ema15 && latest5Close < ema5) direction = 'sell';
+    if (latest5Close > resistance * (1 + buffer) && latest5Close > ema15 && latest5Close > ema5) direction = 'UP';
+    else if (latest5Close < support * (1 - buffer) && latest5Close < ema15 && latest5Close < ema5) direction = 'DOWN';
+    if (!direction) return;
+
+    const key = timeframe;
+    const lastBetTs = state[sym.base].lastBet[key];
+    const nowTs = Date.now();
+    const timeframeMs = (timeframe === '5m') ? 5 * 60 * 1000 : 15 * 60 * 1000;
+    if (lastBetTs && (nowTs - lastBetTs) < timeframeMs) return;
+
+    if (globalOpenBets >= MAX_CONCURRENT) {
+      await notifyTelegram(`⚠️ 超過最大同時押注 (${MAX_CONCURRENT})，${sym.label} ${timeframe} 信號跳過`);
+      return;
+    }
+
+    const bet = { instId, direction, amountU: MARGIN_PER_TRADE };
+    const resp = await submitSwapOrderOKX(bet);
+
+    if (resp && resp.success) {
+      state[sym.base].lastBet[key] = nowTs;
+      globalOpenBets++;
+      await notifyTelegram(`✅ 下單 ${DRY_RUN ? '(SIM)' : '(LIVE)'}\n標的: ${sym.label}\n時框: ${timeframe}\n方向: ${direction}\n金額(U): ${MARGIN_PER_TRADE}\ninstId: ${instId}\norderId: ${resp.id}\ndetails: ${JSON.stringify(resp.details)}`);
+      // optional: you may poll later and decrement globalOpenBets when order resolves
+      setTimeout(async () => { globalOpenBets = Math.max(0, globalOpenBets - 1); }, 5 * 60 * 1000); // safe decrement fallback
+    } else {
+      await notifyTelegram(`❌ 下單失敗 ${sym.label} ${timeframe} ${direction}\nerror: ${JSON.stringify(resp)}`);
+    }
+
+  } catch (e) {
+    console.error('evaluateForTimeframe error', e && e.message ? e.message : e);
+  }
+}
+
+async function legacyProcessSymbol(sym) {
+  try {
+    const c15 = await fetchOKXCandles(sym.base, '15m', 80);
+    const c5 = await fetchOKXCandles(sym.base, '5m', 80);
+    if (!c15 || !c5) return;
+    const sorted15 = normalizeCandles(c15);
+    const sorted5 = normalizeCandles(c5);
+    const latest15 = sorted15[sorted15.length - 1];
+    const latest5 = sorted5[sorted5.length - 1];
+    const ts15 = latest15[0], ts5 = latest5[0];
+    const st = state[sym.base];
+    if (st.last5CloseTs !== ts5) {
+      st.last5CloseTs = ts5;
+      await evaluateForTimeframe(sym, '5m', sorted15, sorted5);
+    }
+    if (st.last15CloseTs !== ts15) {
+      st.last15CloseTs = ts15;
+      await evaluateForTimeframe(sym, '15m', sorted15, sorted5);
+    }
+  } catch (e) {
+    console.error('processSymbol error', sym.base, e && e.message ? e.message : e);
+  }
+}
+
+/* ---------- Perpetual-swap strategy: 4H context, 15m entry ---------- */
+async function evaluateForTimeframe(sym, candles4h, candles15) {
+  try {
+    if (paused) return;
+    const { pivotHighs, pivotLows } = findPivots(candles4h, 3);
+    const resistance = pickLevelFromPivots(pivotHighs, 0.006);
+    const support = pickLevelFromPivots(pivotLows, 0.006);
+    if (!resistance || !support) return;
+
+    const closes4h = closesFrom(candles4h);
+    const closes15 = closesFrom(candles15);
+    const ema4h = ema(closes4h, EMA_PERIOD);
+    const ema15 = ema(closes15, EMA_PERIOD);
+    if (!ema4h || !ema15) return;
+
+    const latest15Close = closes15[closes15.length - 1];
+    let direction = null;
+    if (latest15Close > resistance * (1 + BREAKOUT_BUFFER) && latest15Close > ema4h && latest15Close > ema15) direction = 'UP';
+    else if (latest15Close < support * (1 - BREAKOUT_BUFFER) && latest15Close < ema4h && latest15Close < ema15) direction = 'DOWN';
     if (!direction) return;
 
     const nowTs = Date.now();
-    if (st.lastBetTs && (nowTs - st.lastBetTs) < 5 * 60 * 1000) return;
+    if (state[sym.base].lastBet['15m'] && nowTs - state[sym.base].lastBet['15m'] < 15 * 60 * 1000) return;
+    if (globalOpenBets >= MAX_CONCURRENT) return;
 
-    if (globalOpenBets >= MAX_CONCURRENT) {
-      await safeSendTelegram(`⚠️ 超過最大同時押注 (${MAX_CONCURRENT})，${item.targetSpot} 信號跳過`);
+    const resp = await submitSwapOrderOKX({ instId: sym.swap, direction, amountU: MARGIN_PER_TRADE });
+    if (!resp || !resp.success) {
+      await notifyTelegram(`Order failed ${sym.label} ${direction}\nerror: ${JSON.stringify(resp)}`);
       return;
     }
 
-    const instToTrade = item.eventInst || item.swapSymbol;
-    if (!instToTrade) {
-      await safeSendTelegram(`⚠️ ${item.targetSpot} 未設定可下單的 instId`);
-      return;
-    }
-
+    state[sym.base].lastBet['15m'] = nowTs;
     globalOpenBets++;
-    try {
-      await safeSendTelegram(`⏳ 偵測到訊號: ${item.label} ${direction.toUpperCase()}，嘗試下單 inst=${instToTrade} amount=${MARGIN_PER_TRADE}U`);
-      const resp = await submitEventOrderOKX({ instId: instToTrade, direction: direction === 'buy' ? 'UP' : 'DOWN', amountU: MARGIN_PER_TRADE });
-      if (resp && resp.success) {
-        st.lastBetTs = nowTs;
-        await safeSendTelegram(`✅ 下單成功 (LIVE)\n標的: ${item.targetSpot}\nINST: ${instToTrade}\n方向: ${direction.toUpperCase()}\n金額(U): ${MARGIN_PER_TRADE}\norderId: ${resp.id || 'N/A'}`);
-        let final = (resp.details && resp.details.orderInfo) ? resp.details.orderInfo : null;
-        if (!final && resp.id) final = await pollOKXOrderStatus(instToTrade, resp.id, 12, 2000);
-        if (final) await safeSendTelegram(`訂單狀態: ordId=${resp.id} state=${final.state} filled=${final.fillSz || final.accFillSz || 0}`);
-        else await safeSendTelegram(`訂單查詢未在時限內回來: ordId=${resp.id}`);
-      } else {
-        await safeSendTelegram(`❌ 下單失敗 ${item.targetSpot} ${direction}\nerror: ${JSON.stringify(resp)}`);
-      }
-    } catch (e) {
-      await safeSendTelegram(`❌ 下單發生例外 ${item.targetSpot}: ${e && e.message ? e.message : e}`);
-    } finally {
-      globalOpenBets = Math.max(0, globalOpenBets - 1);
-    }
-  } catch (err) {
-    console.error(`策略運算錯誤 (${item.targetSpot}):`, err && err.message ? err.message : err);
+    await notifyTelegram(`Order ${DRY_RUN ? '(SIM)' : '(LIVE)'}\nSymbol: ${sym.label}\nTimeframe: 15m + 4H\nDirection: ${direction}\nMargin: ${MARGIN_PER_TRADE}U\nLeverage: ${LEVERAGE}x\nTP/SL: 3% / 1%\ninstId: ${sym.swap}\norderId: ${resp.id}`);
+    setTimeout(() => { globalOpenBets = Math.max(0, globalOpenBets - 1); }, 4 * 60 * 60 * 1000);
+  } catch (e) {
+    console.error('evaluateForTimeframe error', e && e.message ? e.message : e);
+  }
+}
+
+async function processSymbol(sym) {
+  try {
+    const [c4h, c15] = await Promise.all([fetchOKXCandles(sym.base, '4H', 80), fetchOKXCandles(sym.base, '15m', 80)]);
+    if (!c4h || !c15) return;
+    const sorted4h = normalizeCandles(c4h);
+    const sorted15 = normalizeCandles(c15);
+    const ts15 = sorted15[sorted15.length - 1][0];
+    if (state[sym.base].last15CloseTs === ts15) return;
+    state[sym.base].last15CloseTs = ts15;
+    await evaluateForTimeframe(sym, sorted4h, sorted15);
+  } catch (e) {
+    console.error('processSymbol error', sym.base, e && e.message ? e.message : e);
   }
 }
 
@@ -463,9 +420,9 @@ async function runLoop() {
   if (running) return;
   running = true;
   try {
-    for (const item of SYMBOLS) {
-      await processItem(item);
-      await new Promise(r => setTimeout(r, 1500));
+    for (const s of SYMBOLS) {
+      await processSymbol(s);
+      await new Promise(r => setTimeout(r, 700));
     }
   } finally {
     running = false;
@@ -474,60 +431,28 @@ async function runLoop() {
 setInterval(runLoop, CHECK_INTERVAL);
 runLoop();
 
-/* ---------- Telegram handlers ---------- */
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '🚀 事件合約 SNR 機器人（LIVE）已啟動！');
+/* ---------- HTTP control endpoints ---------- */
+app.post('/pause', (req, res) => {
+  const token = req.header('x-control-token') || req.query.token;
+  if (!CONTROL_TOKEN || token !== CONTROL_TOKEN) return res.status(401).json({ ok: false, msg: 'unauthorized' });
+  paused = true;
+  notifyTelegram('🤚 Bot 已暫停 (pause)'); 
+  return res.json({ ok: true, paused });
 });
-
-/* ---------- HTTP endpoints ---------- */
-app.get('/', (req, res) => res.status(200).send('Event SNR Bot (BTC & ETH) — LIVE'));
-app.get('/health', (req, res) => res.json({ ok: true, DRY_RUN, now: new Date().toISOString(), globalOpenBets }));
-app.get('/test-telegram', async (req, res) => {
-  if (!telegramEnabled) return res.status(400).json({ ok: false, msg: 'telegram not enabled' });
-  const msg = req.query.msg || `test @ ${new Date().toISOString()}`;
-  try {
-    const info = await bot.getMe();
-    const chat = TELEGRAM_CHAT_ID ? await bot.getChat(TELEGRAM_CHAT_ID) : null;
-    let send = null;
-    if (TELEGRAM_CHAT_ID) {
-      try { send = await bot.sendMessage(TELEGRAM_CHAT_ID, msg); } catch (e) { send = { error: e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : e && e.message ? e.message : e }; }
-    }
-    return res.json({ ok: true, getMe: info, chat, send });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e && e.message ? e.message : e });
-  }
+app.post('/resume', (req, res) => {
+  const token = req.header('x-control-token') || req.query.token;
+  if (!CONTROL_TOKEN || token !== CONTROL_TOKEN) return res.status(401).json({ ok: false, msg: 'unauthorized' });
+  paused = false;
+  notifyTelegram('▶️ Bot 已恢復 (resume)');
+  return res.json({ ok: true, paused });
 });
+app.get('/health', (req, res) => res.json({ ok: true, DRY_RUN, paused, now: new Date().toISOString(), globalOpenBets }));
 
-/* ---------- Start server & startup checks ---------- */
-app.listen(PORT, async () => {
-  console.log(`Server listening on port ${PORT} — LIVE mode (DRY_RUN=${DRY_RUN})`);
-  if (telegramEnabled) {
-    try {
-      const info = await bot.getMe();
-      console.log('Telegram getMe ok:', info && (info.username || info.id) ? (info.username || info.id) : info);
-    } catch (e) {
-      console.error('Telegram getMe failed:', e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : e));
-    }
-    if (TELEGRAM_CHAT_ID) {
-      try {
-        const chat = await bot.getChat(TELEGRAM_CHAT_ID);
-        console.log('Telegram getChat ok:', { id: chat.id, type: chat.type, title: chat.title || chat.username || '' });
-      } catch (e) {
-        console.error('Telegram getChat failed (chat may be unreachable):', e && e.response && (e.response.body || e.response) ? (e.response.body || e.response) : (e && e.message ? e.message : e));
-      }
-    } else {
-      console.warn('TELEGRAM_CHAT_ID not set — notifications disabled');
-    }
-    await safeSendTelegram(`Bot started (LIVE). Single trade amount: ${MARGIN_PER_TRADE} U`);
-  } else {
-    console.warn('Telegram disabled (no token). Notifications will be skipped.');
-  }
-
-  // log inst ids
-  for (const s of SYMBOLS) {
-    console.log(`Symbol ${s.label} (${s.targetSpot}) -> eventInst used: ${s.eventInst || s.swapSymbol}`);
-  }
+/* ---------- Start ---------- */
+app.get('/', (req, res) => res.send(`Event SNR OKX Bot running. DRY_RUN=${DRY_RUN}`));
+const server = app.listen(PORT, () => {
+  console.log(`Bot listening on ${PORT} — DRY_RUN=${DRY_RUN}`);
+  notifyTelegram(`Bot started. DRY_RUN=${DRY_RUN}`);
 });
-
-process.on('SIGINT', () => process.exit(0));
+process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 process.on('unhandledRejection', r => console.error('Unhandled Rejection', r));
