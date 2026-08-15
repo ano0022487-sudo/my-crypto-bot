@@ -36,6 +36,7 @@ const POS_MODE = (process.env.POS_MODE || 'net').toLowerCase(); // net or long_s
 const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001); // 0.1% buffer
 const EMA_PERIOD = Number(process.env.EMA_PERIOD || 20);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 4);
+const POSITION_SYNC_INTERVAL = Number(process.env.POSITION_SYNC_INTERVAL || 60 * 1000);
 const CONTROL_TOKEN = process.env.CONTROL_TOKEN || ''; // required to protect /pause /resume
 
 /* ---------- Symbols (monitor spot candles for S/R) ---------- */
@@ -95,8 +96,34 @@ function generateSignature(timestamp, method, requestPath, body = '') {
   const message = timestamp + method.toUpperCase() + requestPath + body;
   return crypto.createHmac('sha256', SECRET_KEY).update(message).digest('base64');
 }
+function hasTradingCredentials() {
+  return Boolean(API_KEY && SECRET_KEY && PASSPHRASE);
+}
+async function privateGetOKX(requestPath) {
+  if (!hasTradingCredentials()) throw new Error('OKX trading credentials are missing');
+  const timestamp = new Date().toISOString();
+  const signature = generateSignature(timestamp, 'GET', requestPath);
+  const response = await axiosWithRetry({
+    method: 'GET',
+    url: `${BASE_URL}${requestPath}`,
+    headers: {
+      'OK-ACCESS-KEY': API_KEY,
+      'OK-ACCESS-SIGN': signature,
+      'OK-ACCESS-TIMESTAMP': timestamp,
+      'OK-ACCESS-PASSPHRASE': PASSPHRASE
+    },
+    timeout: 15000
+  });
+  if (!response || !response.data || String(response.data.code) !== '0') {
+    throw new Error(`OKX private request failed: ${JSON.stringify(response && response.data)}`);
+  }
+  return Array.isArray(response.data.data) ? response.data.data : [];
+}
 function normalizeCandles(candles) {
   return candles.slice().sort((a, b) => new Date(a[0]) - new Date(b[0]));
+}
+function confirmedCandles(candles) {
+  return normalizeCandles(candles).filter(c => String(c[8]) === '1');
 }
 function closesFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[4])); }
 function highsFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[2])); }
@@ -167,7 +194,8 @@ function roundDownToStep(value, step) {
 
 /* ---------- Order submit & poll ---------- */
 async function setLeverage(instId, posSide) {
-  if (DRY_RUN || !API_KEY || !SECRET_KEY || !PASSPHRASE) return;
+  if (DRY_RUN) return;
+  if (!hasTradingCredentials()) throw new Error('OKX trading credentials are missing');
   const requestPath = '/api/v5/account/set-leverage';
   const timestamp = new Date().toISOString();
   const bodyObj = { instId, lever: LEVERAGE.toString(), mgnMode: 'cross' };
@@ -204,9 +232,10 @@ async function submitSwapOrderOKX({ instId, direction, amountU }) {
     const takeProfitPrice = direction === 'UP' ? last * (1 + TAKE_PROFIT_PCT) : last * (1 - TAKE_PROFIT_PCT);
     const stopLossPrice = direction === 'UP' ? last * (1 - STOP_LOSS_PCT) : last * (1 + STOP_LOSS_PCT);
 
-    if (DRY_RUN || !API_KEY || !SECRET_KEY || !PASSPHRASE) {
+    if (DRY_RUN) {
       return { success: true, id: 'SIM-' + Date.now(), details: { instId, side, sz: szFloat, price: last, takeProfitPrice, stopLossPrice, meta } };
     }
+    if (!hasTradingCredentials()) return { success: false, error: 'OKX trading credentials are missing' };
 
     await setLeverage(instId, posSide);
     const requestPath = '/api/v5/trade/order';
@@ -280,6 +309,55 @@ const state = {};
 for (const s of SYMBOLS) state[s.base] = { last15CloseTs: null, lastBet: { '15m': null } };
 let paused = false;
 let globalOpenBets = 0;
+const monitoredSwapIds = new Set(SYMBOLS.map(s => s.swap));
+const activeTradesByInstrument = new Map();
+let accountSyncReady = DRY_RUN;
+let lastAccountSyncError = '';
+
+function hasNonZeroPosition(position) {
+  return Number.isFinite(Number(position.pos)) && Math.abs(Number(position.pos)) > 0;
+}
+
+async function syncTradingState(announce = false) {
+  if (DRY_RUN) return true;
+  try {
+    const [positions, pendingOrders] = await Promise.all([
+      privateGetOKX('/api/v5/account/positions?instType=SWAP'),
+      privateGetOKX('/api/v5/trade/orders-pending?instType=SWAP')
+    ]);
+
+    const nextActiveTrades = new Map();
+    for (const position of positions) {
+      if (monitoredSwapIds.has(position.instId) && hasNonZeroPosition(position)) {
+        nextActiveTrades.set(position.instId, { kind: 'position', position });
+      }
+    }
+    for (const order of pendingOrders) {
+      if (monitoredSwapIds.has(order.instId)) {
+        nextActiveTrades.set(order.instId, { kind: 'pending-order', order });
+      }
+    }
+
+    activeTradesByInstrument.clear();
+    for (const [instId, trade] of nextActiveTrades) activeTradesByInstrument.set(instId, trade);
+    globalOpenBets = activeTradesByInstrument.size;
+    accountSyncReady = true;
+    lastAccountSyncError = '';
+
+    if (announce && globalOpenBets > 0) {
+      await notifyTelegram(`已同步 ${globalOpenBets} 個既有持倉／未成交委託；這些標的不會再由機器人開新倉。`);
+    }
+    return true;
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    const shouldNotify = announce || accountSyncReady || message !== lastAccountSyncError;
+    accountSyncReady = false;
+    lastAccountSyncError = message;
+    console.error('Trading state sync failed:', message);
+    if (shouldNotify) await notifyTelegram(`無法同步 OKX 持倉，為避免錯單已停止開新倉：${message}`);
+    return false;
+  }
+}
 
 /* ---------- Core: evaluate and act ---------- */
 async function legacyEvaluateForTimeframe(sym, timeframe, candles15, candles5) {
@@ -386,6 +464,8 @@ async function evaluateForTimeframe(sym, candles4h, candles15) {
 
     const nowTs = Date.now();
     if (state[sym.base].lastBet['15m'] && nowTs - state[sym.base].lastBet['15m'] < 15 * 60 * 1000) return;
+    if (!DRY_RUN && !(await syncTradingState())) return;
+    if (activeTradesByInstrument.has(sym.swap)) return;
     if (globalOpenBets >= MAX_CONCURRENT) return;
 
     const resp = await submitSwapOrderOKX({ instId: sym.swap, direction, amountU: MARGIN_PER_TRADE });
@@ -395,9 +475,15 @@ async function evaluateForTimeframe(sym, candles4h, candles15) {
     }
 
     state[sym.base].lastBet['15m'] = nowTs;
-    globalOpenBets++;
+    activeTradesByInstrument.set(sym.swap, { kind: 'submitted-order', orderId: resp.id });
+    globalOpenBets = activeTradesByInstrument.size;
     await notifyTelegram(`Order ${DRY_RUN ? '(SIM)' : '(LIVE)'}\nSymbol: ${sym.label}\nTimeframe: 15m + 4H\nDirection: ${direction}\nMargin: ${MARGIN_PER_TRADE}U\nLeverage: ${LEVERAGE}x\nTP/SL: 3% / 1%\ninstId: ${sym.swap}\norderId: ${resp.id}`);
-    setTimeout(() => { globalOpenBets = Math.max(0, globalOpenBets - 1); }, 4 * 60 * 60 * 1000);
+    if (DRY_RUN) {
+      setTimeout(() => {
+        activeTradesByInstrument.delete(sym.swap);
+        globalOpenBets = activeTradesByInstrument.size;
+      }, 4 * 60 * 60 * 1000);
+    }
   } catch (e) {
     console.error('evaluateForTimeframe error', e && e.message ? e.message : e);
   }
@@ -407,8 +493,9 @@ async function processSymbol(sym) {
   try {
     const [c4h, c15] = await Promise.all([fetchOKXCandles(sym.base, '4H', 80), fetchOKXCandles(sym.base, '15m', 80)]);
     if (!c4h || !c15) return;
-    const sorted4h = normalizeCandles(c4h);
-    const sorted15 = normalizeCandles(c15);
+    const sorted4h = confirmedCandles(c4h);
+    const sorted15 = confirmedCandles(c15);
+    if (sorted4h.length < EMA_PERIOD + 7 || sorted15.length < EMA_PERIOD + 1) return;
     const ts15 = sorted15[sorted15.length - 1][0];
     if (state[sym.base].last15CloseTs === ts15) return;
     state[sym.base].last15CloseTs = ts15;
@@ -433,7 +520,12 @@ async function runLoop() {
   }
 }
 setInterval(runLoop, CHECK_INTERVAL);
-runLoop();
+if (!DRY_RUN) setInterval(() => { void syncTradingState(); }, POSITION_SYNC_INTERVAL);
+async function bootstrap() {
+  if (!DRY_RUN) await syncTradingState(true);
+  await runLoop();
+}
+void bootstrap();
 
 /* ---------- HTTP control endpoints ---------- */
 app.post('/pause', (req, res) => {
