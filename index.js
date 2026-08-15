@@ -2,7 +2,7 @@
 /*
   Event-contract SNR Bot — LIVE (実盤)
   - DRY_RUN is forced to false (LIVE trading).
-  - Single trade amount: 2 USDT (MARGIN_PER_TRADE).
+  - Single trade amount: 12 USDT (MARGIN_PER_TRADE).
   - Only BTC and ETH supported (use EVENT_INST_BTC_USDT / EVENT_INST_ETH_USDT env).
   - Keep original structure: polling Telegram, /test-telegram, /health.
   IMPORTANT: This will place real orders when API keys and EVENT instIds are present.
