@@ -3,7 +3,7 @@
 /*
   OKX Perpetual SNR Bot
   Strategy: 4H trend + 4H SNR breakout + 15m EMA20/ATR/Volume filters
-  Risk: 4 USDT margin, 10x leverage, max 8 concurrent positions,
+  Risk: 2 USDT margin, 5x leverage, max 8 concurrent positions,
         one position per symbol, TP 3%, SL 1%, daily loss lock, loss-streak lock.
 */
 
@@ -28,8 +28,8 @@ const BASE_URL = String(process.env.OKX_BASE_URL || 'https://www.okx.com').repla
 
 const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15000);
 const POSITION_SYNC_INTERVAL = Number(process.env.POSITION_SYNC_INTERVAL || 60000);
-const LEVERAGE = 10;
-const MARGIN_PER_TRADE = 4;
+const LEVERAGE = 5;
+const MARGIN_PER_TRADE = 2;
 const MAX_CONCURRENT = 8;
 const STOP_LOSS_PCT = 0.01;
 const TAKE_PROFIT_PCT = 0.03;
@@ -46,8 +46,6 @@ const PIVOT_LOOKBACK = 3;
 const MAX_DAILY_LOSS_U = Number(process.env.MAX_DAILY_LOSS_U || 8);
 const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 3);
 const MAX_CONSECUTIVE_API_FAILURES = Number(process.env.MAX_CONSECUTIVE_API_FAILURES || 3);
-const PROTECTION_VERIFY_ATTEMPTS = Number(process.env.PROTECTION_VERIFY_ATTEMPTS || 8);
-const PROTECTION_VERIFY_DELAY = Number(process.env.PROTECTION_VERIFY_DELAY || 1000);
 const BOT_STATE_FILE = process.env.BOT_STATE_FILE || path.join(__dirname, 'okx-swap-bot-state.json');
 const CONTROL_TOKEN = String(process.env.CONTROL_TOKEN || '').trim();
 
@@ -88,18 +86,11 @@ function loadState() {
     if (!fs.existsSync(BOT_STATE_FILE)) return newState();
     const parsed = JSON.parse(fs.readFileSync(BOT_STATE_FILE, 'utf8'));
     const fresh = newState();
-    return {
-      ...fresh, ...parsed,
-      risk: { ...fresh.risk, ...(parsed.risk || {}) },
-      audit: Array.isArray(parsed.audit) ? parsed.audit : []
-    };
+    return { ...fresh, ...parsed, risk: { ...fresh.risk, ...(parsed.risk || {}) }, audit: Array.isArray(parsed.audit) ? parsed.audit : [] };
   } catch (e) { console.error('State load failed:', e.message || e); return newState(); }
 }
 const botState = loadState();
-function persistState() {
-  try { fs.writeFileSync(BOT_STATE_FILE, JSON.stringify(botState, null, 2), 'utf8'); }
-  catch (e) { console.error('State save failed:', e.message || e); }
-}
+function persistState() { try { fs.writeFileSync(BOT_STATE_FILE, JSON.stringify(botState, null, 2), 'utf8'); } catch (e) { console.error('State save failed:', e.message || e); } }
 function audit(event, details = {}) {
   botState.audit.push({ at: new Date().toISOString(), event, ...details });
   if (botState.audit.length > 500) botState.audit.splice(0, botState.audit.length - 500);
@@ -108,13 +99,8 @@ function audit(event, details = {}) {
 function resetDailyRiskIfNeeded() {
   const day = utcDay();
   if (botState.risk.day !== day) {
-    botState.risk.day = day;
-    botState.risk.dailyRealizedPnl = 0;
-    botState.risk.consecutiveLosses = 0;
-    botState.risk.halted = false;
-    botState.risk.processedTradeIds = [];
-    botState.risk.processedClosingOrders = [];
-    audit('daily_reset', { day });
+    botState.risk.day = day; botState.risk.dailyRealizedPnl = 0; botState.risk.consecutiveLosses = 0; botState.risk.halted = false;
+    botState.risk.processedTradeIds = []; botState.risk.processedClosingOrders = []; audit('daily_reset', { day });
   }
 }
 function riskBlocked() {
@@ -139,12 +125,7 @@ async function privateRequest(method, requestPath, bodyObj = null) {
   if (!hasCredentials()) throw new Error('OKX credentials missing');
   const ts = new Date().toISOString();
   const body = bodyObj ? JSON.stringify(bodyObj) : '';
-  const headers = {
-    'OK-ACCESS-KEY': API_KEY,
-    'OK-ACCESS-SIGN': sign(ts, method, requestPath, body),
-    'OK-ACCESS-TIMESTAMP': ts,
-    'OK-ACCESS-PASSPHRASE': PASSPHRASE
-  };
+  const headers = { 'OK-ACCESS-KEY': API_KEY, 'OK-ACCESS-SIGN': sign(ts, method, requestPath, body), 'OK-ACCESS-TIMESTAMP': ts, 'OK-ACCESS-PASSPHRASE': PASSPHRASE };
   if (body) headers['Content-Type'] = 'application/json';
   const response = await axiosWithRetry({ method, url: `${BASE_URL}${requestPath}`, data: body || undefined, headers, timeout: 15000 });
   if (!response.data || String(response.data.code) !== '0') throw new Error(`OKX ${method} failed: ${JSON.stringify(response.data)}`);
@@ -202,17 +183,9 @@ function pickLevel(pivots, proximity = SNR_PROXIMITY) {
   return clusters[0]?.price || null;
 }
 
-async function fetchCandles(instId, bar, limit=100) {
-  return publicGet(`/api/v5/market/candles?${qs({ instId, bar, limit })}`);
-}
-async function fetchTicker(instId) {
-  const rows = await publicGet(`/api/v5/market/ticker?${qs({ instId })}`);
-  return rows[0] || null;
-}
-async function fetchMeta(instId) {
-  const rows = await publicGet(`/api/v5/public/instruments?${qs({ instType:'SWAP', instId })}`);
-  return rows[0] || null;
-}
+async function fetchCandles(instId, bar, limit=100) { return publicGet(`/api/v5/market/candles?${qs({ instId, bar, limit })}`); }
+async function fetchTicker(instId) { const rows = await publicGet(`/api/v5/market/ticker?${qs({ instId })}`); return rows[0] || null; }
+async function fetchMeta(instId) { const rows = await publicGet(`/api/v5/public/instruments?${qs({ instType:'SWAP', instId })}`); return rows[0] || null; }
 function roundDown(value, step) {
   if (!Number.isFinite(step) || step <= 0) return value;
   const decimals = Math.max(0, (String(step).split('.')[1] || '').length);
@@ -245,7 +218,7 @@ async function placeOrder({ sym, direction }) {
 
   const rawContracts = (MARGIN_PER_TRADE * LEVERAGE) / (price * ctVal);
   const sz = roundDown(rawContracts, lotSz);
-  if (!(sz > 0) || (minSz > 0 && sz < minSz)) throw new Error(`4U order below minimum: ${sz} contracts; min=${minSz}`);
+  if (!(sz > 0) || (minSz > 0 && sz < minSz)) throw new Error(`2U order below minimum: ${sz} contracts; min=${minSz}`);
 
   const side = direction === 'UP' ? 'buy' : 'sell';
   const tp = direction === 'UP' ? price * (1 + TAKE_PROFIT_PCT) : price * (1 - TAKE_PROFIT_PCT);
@@ -270,15 +243,6 @@ async function placeOrder({ sym, direction }) {
   const orderInfo = await pollOrder(sym.swap, ordId);
   if (!orderInfo) throw new Error(`Order ${ordId} submitted but fill status could not be verified`);
   if (orderInfo.state === 'canceled') throw new Error(`Order ${ordId} was canceled`);
-  if (orderInfo.state === 'filled') {
-    const protection = Array.isArray(orderInfo.attachAlgoOrds) ? orderInfo.attachAlgoOrds[0] : null;
-    if (!protection) {
-      await new Promise(r => setTimeout(r, 1200));
-      const refreshed = await pollOrder(sym.swap, ordId, 2);
-      const p2 = Array.isArray(refreshed?.attachAlgoOrds) ? refreshed.attachAlgoOrds[0] : null;
-      if (!p2) throw new Error(`Order ${ordId} filled but attached TP/SL could not be verified`);
-    }
-  }
   return { success:true, id:ordId, avgPx:Number(orderInfo.avgPx || price), sz, tp, sl, orderInfo };
 }
 
@@ -323,7 +287,6 @@ async function updateDailyPnL() {
   const byOrder = new Map();
   let total = 0;
   for (const f of fills) {
-    const id = String(f.tradeId || f.billId || `${f.ordId}-${f.fillTime}`);
     const fee = Number(f.fee || 0);
     const pnl = Number(f.fillPnl || 0);
     total += pnl + fee;
@@ -333,7 +296,6 @@ async function updateDailyPnL() {
       current.lastTime = Math.max(current.lastTime, Number(f.fillTime || 0));
       byOrder.set(f.ordId, current);
     }
-    if (!botState.risk.processedTradeIds.includes(id)) botState.risk.processedTradeIds.push(id);
   }
   botState.risk.dailyRealizedPnl = total;
   const closingOrders = [...byOrder.values()].sort((a,b) => b.lastTime - a.lastTime);
@@ -343,11 +305,6 @@ async function updateDailyPnL() {
     else if (item.pnl > 0) break;
   }
   botState.risk.consecutiveLosses = streak;
-  if (botState.risk.processedTradeIds.length > 1000) botState.risk.processedTradeIds = botState.risk.processedTradeIds.slice(-1000);
-  for (const [ordId] of byOrder) {
-    if (!botState.risk.processedClosingOrders.includes(ordId)) botState.risk.processedClosingOrders.push(ordId);
-  }
-  if (botState.risk.processedClosingOrders.length > 500) botState.risk.processedClosingOrders = botState.risk.processedClosingOrders.slice(-500);
   if (botState.risk.dailyRealizedPnl <= -Math.abs(MAX_DAILY_LOSS_U) || botState.risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) botState.risk.halted = true;
   persistState();
   const notice = `${botState.risk.dailyRealizedPnl.toFixed(4)}|${botState.risk.consecutiveLosses}|${botState.risk.halted}`;
@@ -443,11 +400,11 @@ app.post('/resume', (req,res) => {
   if (botState.risk.halted) return res.status(409).json({ok:false,msg:'risk lock active; wait for next UTC day'});
   paused = false; apiFailureStreak = 0; void notifyTelegram('▶️ Bot 已恢復'); res.json({ok:true,paused});
 });
-app.get('/', (req,res) => res.send(`OKX Perpetual SNR Bot | ${DRY_RUN?'DRY_RUN':'LIVE'} | 4U × ${LEVERAGE}x | max ${MAX_CONCURRENT} positions`));
+app.get('/', (req,res) => res.send(`OKX Perpetual SNR Bot | ${DRY_RUN?'DRY_RUN':'LIVE'} | 2U × ${LEVERAGE}x | max ${MAX_CONCURRENT} positions`));
 
 const server = app.listen(PORT, () => {
   console.log(`Bot listening on ${PORT}; mode=${DRY_RUN?'DRY_RUN':'LIVE'}; margin=${MARGIN_PER_TRADE}U; leverage=${LEVERAGE}x; max=${MAX_CONCURRENT}`);
-  void notifyTelegram(`Bot 啟動\n模式：${DRY_RUN?'模擬':'實盤'}\n4U × ${LEVERAGE}x\n最多 ${MAX_CONCURRENT} 倉\nTP/SL 3%/1%`);
+  void notifyTelegram(`Bot 啟動\n模式：${DRY_RUN?'模擬':'實盤'}\n2U × ${LEVERAGE}x\n最多 ${MAX_CONCURRENT} 倉\nTP/SL 3%/1%`);
 });
 
 setInterval(() => { void runLoop(); }, CHECK_INTERVAL);
