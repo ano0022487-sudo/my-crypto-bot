@@ -1,18 +1,12 @@
 'use strict';
+
 /*
-  Event Contract SNR Bot — OKX (BTC & ETH)
-  - Timeframes: 5m & 15m (act on candle close)
-  - Strategy: SNR pivot breakout + EMA20 trend filter
-  - Each bet: fixed amount in USDT (MARGIN_PER_TRADE, default 2)
-  - Uses OKX event instruments (instId) you provide via env
-  - DRY_RUN=false to send live orders (must set env). Default: DRY_RUN=true for safety.
-  - Emergency HTTP control: /pause, /resume (protected by CONTROL_TOKEN)
+  OKX Perpetual SNR Bot
+  Strategy: 4H trend + 4H SNR breakout + 15m EMA20/ATR/Volume filters
+  Risk: 4 USDT margin, 10x leverage, max 8 concurrent positions,
+        one position per symbol, TP 3%, SL 1%, daily loss lock, loss-streak lock.
 */
 
-const express = require('express');
-const axios = require('axios');
-const crypto = require('crypto');
-const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -23,725 +17,443 @@ const TelegramBot = require('node-telegram-bot-api');
 const app = express();
 app.use(express.json());
 
-/* ---------- CONFIG (via env) ---------- */
 const PORT = Number(process.env.PORT || 3000);
-const DRY_RUN = (process.env.DRY_RUN || 'false').toLowerCase() !== 'false'; // live trading by default
-const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/['"]+/g, '');
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const API_KEY = process.env.OK_ACCESS_KEY || '';
-const SECRET_KEY = process.env.OK_ACCESS_SECRET || '';
-const PASSPHRASE = process.env.OKX_PASSPHRASE || '';
-const BASE_URL = process.env.OKX_BASE_URL || 'https://www.okx.com';
+const DRY_RUN = String(process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false';
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/["']+/g, '');
+const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
+const API_KEY = String(process.env.OK_ACCESS_KEY || '').trim();
+const SECRET_KEY = String(process.env.OK_ACCESS_SECRET || '').trim();
+const PASSPHRASE = String(process.env.OKX_PASSPHRASE || '').trim();
+const BASE_URL = String(process.env.OKX_BASE_URL || 'https://www.okx.com').replace(/\/$/, '');
 
-const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15 * 1000); // poll interval
-const LEVERAGE = Number(process.env.LEVERAGE || 10);
-const MARGIN_PER_TRADE = Number(process.env.MARGIN_PER_TRADE || 4); // 4 U margin per trade
-const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.01); // 1% risk
-const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.03); // 3% reward (1:3 R:R)
-const POS_MODE = (process.env.POS_MODE || 'net').toLowerCase(); // net or long_short
-const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001); // 0.1% buffer
-const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001); // 0.1% buffer
-const EMA_PERIOD = Number(process.env.EMA_PERIOD || 20);
-const VOLUME_LOOKBACK = Number(process.env.VOLUME_LOOKBACK || 20);
+const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15000);
+const POSITION_SYNC_INTERVAL = Number(process.env.POSITION_SYNC_INTERVAL || 60000);
+const LEVERAGE = 10;
+const MARGIN_PER_TRADE = 4;
+const MAX_CONCURRENT = 8;
+const STOP_LOSS_PCT = 0.01;
+const TAKE_PROFIT_PCT = 0.03;
+const POS_MODE = String(process.env.POS_MODE || 'net').toLowerCase();
+const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001);
+const EMA_PERIOD = 20;
+const VOLUME_LOOKBACK = 20;
 const MIN_VOLUME_MULTIPLIER = Number(process.env.MIN_VOLUME_MULTIPLIER || 1.2);
-const ATR_PERIOD = Number(process.env.ATR_PERIOD || 14);
-const MIN_ATR_PCT = Number(process.env.MIN_ATR_PCT || 0.0015); // 0.15% of price
-const MAX_ATR_PCT = Number(process.env.MAX_ATR_PCT || 0.02); // 2.00% of price
-const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 4);
-const POSITION_SYNC_INTERVAL = Number(process.env.POSITION_SYNC_INTERVAL || 60 * 1000);
+const ATR_PERIOD = 14;
+const MIN_ATR_PCT = Number(process.env.MIN_ATR_PCT || 0.0015);
+const MAX_ATR_PCT = Number(process.env.MAX_ATR_PCT || 0.02);
+const SNR_PROXIMITY = Number(process.env.SNR_PROXIMITY || 0.006);
+const PIVOT_LOOKBACK = 3;
 const MAX_DAILY_LOSS_U = Number(process.env.MAX_DAILY_LOSS_U || 8);
 const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 3);
 const MAX_CONSECUTIVE_API_FAILURES = Number(process.env.MAX_CONSECUTIVE_API_FAILURES || 3);
-const HEARTBEAT_TIMEOUT = Number(process.env.HEARTBEAT_TIMEOUT || 120 * 1000);
 const PROTECTION_VERIFY_ATTEMPTS = Number(process.env.PROTECTION_VERIFY_ATTEMPTS || 8);
 const PROTECTION_VERIFY_DELAY = Number(process.env.PROTECTION_VERIFY_DELAY || 1000);
 const BOT_STATE_FILE = process.env.BOT_STATE_FILE || path.join(__dirname, 'okx-swap-bot-state.json');
-const CONTROL_TOKEN = process.env.CONTROL_TOKEN || ''; // required to protect /pause /resume
+const CONTROL_TOKEN = String(process.env.CONTROL_TOKEN || '').trim();
 
-/* ---------- Symbols (monitor spot candles for S/R) ---------- */
 const SYMBOLS = [
-  { base: 'ETH-USDT', label: 'ETH', swap: 'ETH-USDT-SWAP' },
-  { base: 'SOL-USDT', label: 'SOL', swap: 'SOL-USDT-SWAP' },
-  { base: 'XRP-USDT', label: 'XRP', swap: 'XRP-USDT-SWAP' },
-  { base: 'DOGE-USDT', label: 'DOGE', swap: 'DOGE-USDT-SWAP' },
-  { base: 'ADA-USDT', label: 'ADA', swap: 'ADA-USDT-SWAP' },
-  { base: 'AVAX-USDT', label: 'AVAX', swap: 'AVAX-USDT-SWAP' },
-  { base: 'LINK-USDT', label: 'LINK', swap: 'LINK-USDT-SWAP' },
-  { base: 'DOT-USDT', label: 'DOT', swap: 'DOT-USDT-SWAP' },
-  { base: 'LTC-USDT', label: 'LTC', swap: 'LTC-USDT-SWAP' },
-  { base: 'BCH-USDT', label: 'BCH', swap: 'BCH-USDT-SWAP' },
-  { base: 'SUI-USDT', label: 'SUI', swap: 'SUI-USDT-SWAP' },
-  { base: 'APT-USDT', label: 'APT', swap: 'APT-USDT-SWAP' },
-  { base: 'NEAR-USDT', label: 'NEAR', swap: 'NEAR-USDT-SWAP' },
-  { base: 'UNI-USDT', label: 'UNI', swap: 'UNI-USDT-SWAP' },
-  { base: 'ATOM-USDT', label: 'ATOM', swap: 'ATOM-USDT-SWAP' },
-  { base: 'FIL-USDT', label: 'FIL', swap: 'FIL-USDT-SWAP' },
-  { base: 'ETC-USDT', label: 'ETC', swap: 'ETC-USDT-SWAP' },
-  { base: 'ARB-USDT', label: 'ARB', swap: 'ARB-USDT-SWAP' },
-  { base: 'OP-USDT', label: 'OP', swap: 'OP-USDT-SWAP' },
-  { base: 'TRX-USDT', label: 'TRX', swap: 'TRX-USDT-SWAP' }
-];
+  ['ETH','ETH-USDT-SWAP'], ['SOL','SOL-USDT-SWAP'], ['XRP','XRP-USDT-SWAP'],
+  ['DOGE','DOGE-USDT-SWAP'], ['ADA','ADA-USDT-SWAP'], ['AVAX','AVAX-USDT-SWAP'],
+  ['LINK','LINK-USDT-SWAP'], ['DOT','DOT-USDT-SWAP'], ['LTC','LTC-USDT-SWAP'],
+  ['BCH','BCH-USDT-SWAP'], ['SUI','SUI-USDT-SWAP'], ['APT','APT-USDT-SWAP'],
+  ['NEAR','NEAR-USDT-SWAP'], ['UNI','UNI-USDT-SWAP'], ['ATOM','ATOM-USDT-SWAP'],
+  ['FIL','FIL-USDT-SWAP'], ['ETC','ETC-USDT-SWAP'], ['ARB','ARB-USDT-SWAP'],
+  ['OP','OP-USDT-SWAP'], ['TRX','TRX-USDT-SWAP']
+].map(([label, swap]) => ({ label, swap, base: swap.replace(/-SWAP$/, '') }));
 
-/* ---------- Telegram ---------- */
 let bot = { sendMessage: async () => {} };
 if (TELEGRAM_BOT_TOKEN) {
   bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-  bot.onText(/^\/start(?:\s|$)/, (msg) => {
-    bot.sendMessage(msg.chat.id, `機器人已連線。\n模式：${DRY_RUN ? '模擬交易' : '實盤交易'}\n策略：15m + 4H、${LEVERAGE}x、每筆 ${MARGIN_PER_TRADE}U、止損 1%／止盈 3%。`)
-      .catch((e) => console.error('Telegram /start reply failed:', e && e.message ? e.message : e));
+  bot.onText(/^\/start(?:\s|$)/, msg => {
+    bot.sendMessage(msg.chat.id,
+      `OKX 永續機器人\n模式：${DRY_RUN ? '模擬' : '實盤'}\n策略：4H SNR + 15m Breakout\n保證金：${MARGIN_PER_TRADE}U\n槓桿：${LEVERAGE}x\n最多：${MAX_CONCURRENT} 倉\nTP/SL：3% / 1%`
+    ).catch(() => {});
   });
 }
 async function notifyTelegram(text) {
-async function notifyTelegram(text) {
-  try {
-    if (!TELEGRAM_CHAT_ID) return;
-    await bot.sendMessage(TELEGRAM_CHAT_ID, text);
-  } catch (e) {
-    console.debug('Telegram send failed:', e && e.message ? e.message : e);
-  }
+  if (!TELEGRAM_CHAT_ID) return;
+  try { await bot.sendMessage(TELEGRAM_CHAT_ID, text); } catch (e) { console.error('Telegram:', e.message || e); }
 }
 
-/* ---------- Helpers ---------- */
-  }
-}
-
-/* ---------- Persistent audit and risk state ---------- */
-function utcDay() {
-  return new Date().toISOString().slice(0, 10);
-}
-function newBotState() {
+function utcDay() { return new Date().toISOString().slice(0, 10); }
+function newState() {
   return {
-    version: 1,
-    risk: { day: utcDay(), startEquity: null, dailyRealizedPnl: 0, consecutiveLosses: 0, halted: false, processedClosures: [] },
+    version: 2,
+    risk: { day: utcDay(), dailyRealizedPnl: 0, consecutiveLosses: 0, halted: false, processedTradeIds: [], processedClosingOrders: [] },
     audit: []
   };
 }
-function loadBotState() {
+function loadState() {
   try {
-    if (!fs.existsSync(BOT_STATE_FILE)) return newBotState();
+    if (!fs.existsSync(BOT_STATE_FILE)) return newState();
     const parsed = JSON.parse(fs.readFileSync(BOT_STATE_FILE, 'utf8'));
-    return { ...newBotState(), ...parsed, risk: { ...newBotState().risk, ...(parsed.risk || {}) }, audit: Array.isArray(parsed.audit) ? parsed.audit : [] };
-  } catch (error) {
-    console.error('Unable to load bot state:', error && error.message ? error.message : error);
-    return newBotState();
-  }
+    const fresh = newState();
+    return {
+      ...fresh, ...parsed,
+      risk: { ...fresh.risk, ...(parsed.risk || {}) },
+      audit: Array.isArray(parsed.audit) ? parsed.audit : []
+    };
+  } catch (e) { console.error('State load failed:', e.message || e); return newState(); }
 }
-const botState = loadBotState();
-function persistBotState() {
-  try {
-    fs.writeFileSync(BOT_STATE_FILE, JSON.stringify(botState, null, 2), 'utf8');
-  } catch (error) {
-    console.error('Unable to persist bot state:', error && error.message ? error.message : error);
-  }
+const botState = loadState();
+function persistState() {
+  try { fs.writeFileSync(BOT_STATE_FILE, JSON.stringify(botState, null, 2), 'utf8'); }
+  catch (e) { console.error('State save failed:', e.message || e); }
 }
-function appendAudit(event, details = {}) {
+function audit(event, details = {}) {
   botState.audit.push({ at: new Date().toISOString(), event, ...details });
   if (botState.audit.length > 500) botState.audit.splice(0, botState.audit.length - 500);
-  persistBotState();
+  persistState();
+}
+function resetDailyRiskIfNeeded() {
+  const day = utcDay();
+  if (botState.risk.day !== day) {
+    botState.risk.day = day;
+    botState.risk.dailyRealizedPnl = 0;
+    botState.risk.consecutiveLosses = 0;
+    botState.risk.halted = false;
+    botState.risk.processedTradeIds = [];
+    botState.risk.processedClosingOrders = [];
+    audit('daily_reset', { day });
+  }
+}
+function riskBlocked() {
+  resetDailyRiskIfNeeded();
+  return botState.risk.halted || botState.risk.dailyRealizedPnl <= -Math.abs(MAX_DAILY_LOSS_U) || botState.risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES;
 }
 
-/* ---------- Helpers ---------- */
-async function axiosWithRetry(config, retries = 3, delay = 1200) {
+async function axiosWithRetry(config, retries = 3, delay = 800) {
+  let last;
   for (let i = 0; i < retries; i++) {
     try { return await axios(config); }
-    catch (err) {
-      if (i === retries - 1) throw err;
-      await new Promise(r => setTimeout(r, delay));
-    }
+    catch (e) { last = e; if (i < retries - 1) await new Promise(r => setTimeout(r, delay * (i + 1))); }
   }
+  throw last;
 }
-function generateSignature(timestamp, method, requestPath, body = '') {
-  if (!SECRET_KEY) throw new Error('API Secret 未設定');
-  const message = timestamp + method.toUpperCase() + requestPath + body;
-  return crypto.createHmac('sha256', SECRET_KEY).update(message).digest('base64');
+function sign(ts, method, requestPath, body = '') {
+  if (!SECRET_KEY) throw new Error('OKX API secret missing');
+  return crypto.createHmac('sha256', SECRET_KEY).update(ts + method.toUpperCase() + requestPath + body).digest('base64');
 }
-function hasTradingCredentials() {
-  return Boolean(API_KEY && SECRET_KEY && PASSPHRASE);
-}
-async function privateGetOKX(requestPath) {
-  if (!hasTradingCredentials()) throw new Error('OKX trading credentials are missing');
-  const timestamp = new Date().toISOString();
-  const signature = generateSignature(timestamp, 'GET', requestPath);
-  const response = await axiosWithRetry({
-    method: 'GET',
-    url: `${BASE_URL}${requestPath}`,
-    headers: {
-      'OK-ACCESS-KEY': API_KEY,
-      'OK-ACCESS-SIGN': signature,
-      'OK-ACCESS-TIMESTAMP': timestamp,
-      'OK-ACCESS-PASSPHRASE': PASSPHRASE
-    },
-    timeout: 15000
-  });
-  if (!response || !response.data || String(response.data.code) !== '0') {
-    throw new Error(`OKX private request failed: ${JSON.stringify(response && response.data)}`);
-  }
+function hasCredentials() { return Boolean(API_KEY && SECRET_KEY && PASSPHRASE); }
+async function privateRequest(method, requestPath, bodyObj = null) {
+  if (!hasCredentials()) throw new Error('OKX credentials missing');
+  const ts = new Date().toISOString();
+  const body = bodyObj ? JSON.stringify(bodyObj) : '';
+  const headers = {
+    'OK-ACCESS-KEY': API_KEY,
+    'OK-ACCESS-SIGN': sign(ts, method, requestPath, body),
+    'OK-ACCESS-TIMESTAMP': ts,
+    'OK-ACCESS-PASSPHRASE': PASSPHRASE
+  };
+  if (body) headers['Content-Type'] = 'application/json';
+  const response = await axiosWithRetry({ method, url: `${BASE_URL}${requestPath}`, data: body || undefined, headers, timeout: 15000 });
+  if (!response.data || String(response.data.code) !== '0') throw new Error(`OKX ${method} failed: ${JSON.stringify(response.data)}`);
   return Array.isArray(response.data.data) ? response.data.data : [];
 }
-async function privatePostOKX(requestPath, bodyObj) {
-  if (!hasTradingCredentials()) throw new Error('OKX trading credentials are missing');
-  const timestamp = new Date().toISOString();
-  const body = JSON.stringify(bodyObj);
-  const signature = generateSignature(timestamp, 'POST', requestPath, body);
-  const response = await axiosWithRetry({
-    method: 'POST',
-    url: `${BASE_URL}${requestPath}`,
-    data: body,
-    headers: {
-      'OK-ACCESS-KEY': API_KEY,
-      'OK-ACCESS-SIGN': signature,
-      'OK-ACCESS-TIMESTAMP': timestamp,
-      'OK-ACCESS-PASSPHRASE': PASSPHRASE,
-      'Content-Type': 'application/json'
-    },
-    timeout: 15000
-  });
-  if (!response || !response.data || String(response.data.code) !== '0') {
-    throw new Error(`OKX private request failed: ${JSON.stringify(response && response.data)}`);
-  }
+async function publicGet(requestPath) {
+  const response = await axiosWithRetry({ method: 'GET', url: `${BASE_URL}${requestPath}`, timeout: 12000 });
+  if (!response.data || String(response.data.code) !== '0') throw new Error(`OKX public request failed: ${JSON.stringify(response.data)}`);
   return Array.isArray(response.data.data) ? response.data.data : [];
 }
-function createClientOrderId(prefix = 'snr') {
-  return `${prefix}${Date.now().toString(36)}${crypto.randomBytes(4).toString('hex')}`.slice(0, 32);
-}
-function normalizeCandles(candles) {
-  return candles.slice().sort((a, b) => new Date(a[0]) - new Date(b[0]));
-}
-function confirmedCandles(candles) {
-  return normalizeCandles(candles).filter(c => String(c[8]) === '1');
-}
-function closesFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[4])); }
-function highsFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[2])); }
-function lowsFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[3])); }
+function qs(params) { return Object.entries(params).filter(([,v]) => v !== undefined && v !== null && v !== '').map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&'); }
 
-/* ---------- Indicators ---------- */
+function normalizeCandles(candles) { return candles.slice().sort((a,b) => Number(a[0]) - Number(b[0])); }
+function confirmedCandles(candles) { return normalizeCandles(candles).filter(c => String(c[8]) === '1'); }
+function closes(c) { return c.map(x => Number(x[4])); }
+function highs(c) { return c.map(x => Number(x[2])); }
+function lows(c) { return c.map(x => Number(x[3])); }
+function quoteVolume(c) { const v = Number(c[7]); return Number.isFinite(v) ? v : Number(c[5]) || 0; }
 function ema(values, period) {
-function ema(values, period) {
-  if (!values || values.length < period) return null;
+  if (!Array.isArray(values) || values.length < period) return null;
   const k = 2 / (period + 1);
-  let emaPrev = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) emaPrev = values[i] * k + emaPrev * (1 - k);
-  return emaPrev;
+  let prev = values.slice(0, period).reduce((a,b) => a + b, 0) / period;
+  for (let i = period; i < values.length; i++) prev = values[i] * k + prev * (1-k);
+  return prev;
 }
-
-/* ---------- S/R pivot detection ---------- */
-function findPivots(candles, lookback = 3) {
-  const s = normalizeCandles(candles);
-  const highs = highsFrom(s), lows = lowsFrom(s);
-  const pivotHighs = [], pivotLows = [];
-  for (let i = lookback; i < s.length - lookback; i++) {
-    if (highs[i] === Math.max(...highs.slice(i - lookback, i + lookback + 1))) pivotHighs.push({ idx: i, price: highs[i] });
-    if (lows[i] === Math.min(...lows.slice(i - lookback, i + lookback + 1))) pivotLows.push({ idx: i, price: lows[i] });
+function atrPct(candles, period) {
+  if (candles.length < period + 1) return null;
+  const tr = [];
+  for (let i = 1; i < candles.length; i++) {
+    const h = Number(candles[i][2]), l = Number(candles[i][3]), pc = Number(candles[i-1][4]);
+    if (![h,l,pc].every(Number.isFinite)) return null;
+    tr.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc)));
   }
-  return { pivotHighs, pivotLows };
+  const latest = Number(candles[candles.length-1][4]);
+  const recent = tr.slice(-period);
+  return latest > 0 ? recent.reduce((a,b) => a+b, 0) / recent.length / latest : null;
 }
-function pickLevelFromPivots(pivots, proximity = 0.006) {
-  if (!pivots || pivots.length === 0) return null;
+function findPivots(candles, lookback = 3) {
+  const h = highs(candles), l = lows(candles), ph = [], pl = [];
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    if (h[i] === Math.max(...h.slice(i-lookback, i+lookback+1))) ph.push({ idx:i, price:h[i] });
+    if (l[i] === Math.min(...l.slice(i-lookback, i+lookback+1))) pl.push({ idx:i, price:l[i] });
+  }
+  return { pivotHighs: ph, pivotLows: pl };
+}
+function pickLevel(pivots, proximity = SNR_PROXIMITY) {
+  if (!pivots.length) return null;
   const clusters = [];
   for (const p of pivots) {
-    const found = clusters.find(c => Math.abs(c.price - p.price) / p.price <= proximity);
-    if (found) { found.members.push(p); found.price = (found.price * (found.count || 1) + p.price) / ((found.count || 1) + 1); found.count = (found.count || 1) + 1; }
-    else clusters.push({ price: p.price, members: [p], count: 1 });
+    const c = clusters.find(x => Math.abs(x.price-p.price)/p.price <= proximity);
+    if (c) { c.members.push(p); c.price = (c.price*(c.members.length-1)+p.price)/c.members.length; }
+    else clusters.push({ price:p.price, members:[p] });
   }
-  clusters.sort((a, b) => (b.members[b.members.length - 1].idx) - (a.members[a.members.length - 1].idx));
-  return clusters[0] ? clusters[0].price : null;
+  clusters.sort((a,b) => b.members[b.members.length-1].idx - a.members[a.members.length-1].idx);
+  return clusters[0]?.price || null;
 }
 
-/* ---------- OKX Public helpers ---------- */
-async function fetchOKXCandles(instId, bar, limit = 80) {
-  const url = `${BASE_URL}/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=${bar}&limit=${limit}`;
-  const resp = await axiosWithRetry({ method: 'GET', url, timeout: 10000 });
-  return resp && resp.data && resp.data.data ? resp.data.data : null;
-}
-async function fetchEventInstruments() {
-  const url = `${BASE_URL}/api/v5/public/instruments?instType=SWAP`;
-  const resp = await axiosWithRetry({ method: 'GET', url, timeout: 12000 });
-  return resp && resp.data && Array.isArray(resp.data.data) ? resp.data.data : [];
+async function fetchCandles(instId, bar, limit=100) {
+  return publicGet(`/api/v5/market/candles?${qs({ instId, bar, limit })}`);
 }
 async function fetchTicker(instId) {
-  const url = `${BASE_URL}/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`;
-  const resp = await axiosWithRetry({ method: 'GET', url, timeout: 8000 });
-  return resp && resp.data && Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
+  const rows = await publicGet(`/api/v5/market/ticker?${qs({ instId })}`);
+  return rows[0] || null;
 }
-async function fetchInstrumentMetadata(instId) {
-  const url = `${BASE_URL}/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`;
-  try {
-    const resp = await axiosWithRetry({ method: 'GET', url, timeout: 8000 });
-    if (resp && resp.data && Array.isArray(resp.data.data) && resp.data.data[0]) return resp.data.data[0];
-  } catch (e) { /* ignore */ }
-  return null;
+async function fetchMeta(instId) {
+  const rows = await publicGet(`/api/v5/public/instruments?${qs({ instType:'SWAP', instId })}`);
+  return rows[0] || null;
 }
-function roundDownToStep(value, step) {
-  if (!step || step <= 0) return value;
-  const precision = Math.max(0, (step.toString().split('.')[1] || '').length);
-  const floored = Math.floor(value / step) * step;
-  return parseFloat(floored.toFixed(precision));
+function roundDown(value, step) {
+  if (!Number.isFinite(step) || step <= 0) return value;
+  const decimals = Math.max(0, (String(step).split('.')[1] || '').length);
+  return Number((Math.floor(value / step) * step).toFixed(decimals));
 }
-
-/* ---------- Order submit & poll ---------- */
-async function setLeverage(instId, posSide) {
+async function setLeverage(instId) {
   if (DRY_RUN) return;
-  if (!hasTradingCredentials()) throw new Error('OKX trading credentials are missing');
-  const requestPath = '/api/v5/account/set-leverage';
-  const timestamp = new Date().toISOString();
-  const bodyObj = { instId, lever: LEVERAGE.toString(), mgnMode: 'cross' };
-  if (POS_MODE === 'long_short') bodyObj.posSide = posSide;
-  const body = JSON.stringify(bodyObj);
-  const signature = generateSignature(timestamp, 'POST', requestPath, body);
-  const resp = await axiosWithRetry({
-    method: 'POST', url: `${BASE_URL}${requestPath}`, data: body,
-    headers: { 'OK-ACCESS-KEY': API_KEY, 'OK-ACCESS-SIGN': signature, 'OK-ACCESS-TIMESTAMP': timestamp, 'OK-ACCESS-PASSPHRASE': PASSPHRASE, 'Content-Type': 'application/json' },
-    timeout: 15000
-  });
-  if (!resp || !resp.data || String(resp.data.code) !== '0') throw new Error(`Leverage setup failed: ${JSON.stringify(resp && resp.data)}`);
+  await privateRequest('POST', '/api/v5/account/set-leverage', { instId, lever:String(LEVERAGE), mgnMode:'cross' });
 }
-function quoteVolumeFrom(candle) {
-  const quoteVolume = parseFloat(candle[7]);
-  if (Number.isFinite(quoteVolume)) return quoteVolume;
-  const currencyVolume = parseFloat(candle[6]);
-  if (Number.isFinite(currencyVolume)) return currencyVolume;
-  return parseFloat(candle[5]) || 0;
-}
-function atrPercent(candles, period) {
-  const sorted = normalizeCandles(candles);
-  if (sorted.length < period + 1) return null;
-  const trueRanges = [];
-  for (let i = 1; i < sorted.length; i++) {
-    const high = parseFloat(sorted[i][2]);
-    const low = parseFloat(sorted[i][3]);
-    const previousClose = parseFloat(sorted[i - 1][4]);
-    if (![high, low, previousClose].every(Number.isFinite)) return null;
-    trueRanges.push(Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose)));
-  }
-  const recentRanges = trueRanges.slice(-period);
-  const latestClose = parseFloat(sorted[sorted.length - 1][4]);
-  if (!latestClose || recentRanges.length < period) return null;
-  return recentRanges.reduce((sum, value) => sum + value, 0) / recentRanges.length / latestClose;
-}
+function clientId(prefix='snr') { return `${prefix}${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`.slice(0,32); }
 
-async function submitSwapOrderOKX({ instId, direction, amountU }) {
-  try {
-    const ticker = await fetchTicker(instId);
-    const last = ticker && (ticker.last || ticker.px) ? parseFloat(ticker.last || ticker.px) : null;
-    const meta = await fetchInstrumentMetadata(instId);
-    let step = null;
-    if (meta) {
-      step = meta.lotSz || meta.minSz || meta.minSize || meta.sizeIncrement || meta.lot || null;
-      if (typeof step === 'string') step = parseFloat(step);
-    }
-    const ctVal = meta && meta.ctVal ? parseFloat(meta.ctVal) : null;
-    if (!last || last <= 0 || !ctVal || ctVal <= 0) return { success: false, error: 'Missing valid ticker or contract value' };
-    let szFloat = (amountU * LEVERAGE) / (last * ctVal);
-    if (step) szFloat = roundDownToStep(szFloat, step);
-    const minSz = meta && meta.minSz ? parseFloat(meta.minSz) : 0;
-    if (!szFloat || szFloat <= 0 || (minSz && szFloat < minSz)) return { success: false, error: `Order size below minimum: ${szFloat} contracts (min ${minSz || 'unknown'})` };
-
-    const side = direction === 'UP' ? 'buy' : 'sell';
-    const posSide = direction === 'UP' ? 'long' : 'short';
-    const takeProfitPrice = direction === 'UP' ? last * (1 + TAKE_PROFIT_PCT) : last * (1 - TAKE_PROFIT_PCT);
-    const stopLossPrice = direction === 'UP' ? last * (1 - STOP_LOSS_PCT) : last * (1 + STOP_LOSS_PCT);
-
-    if (DRY_RUN) {
-      return { success: true, id: 'SIM-' + Date.now(), details: { instId, side, sz: szFloat, price: last, takeProfitPrice, stopLossPrice, meta } };
-    }
-    if (!hasTradingCredentials()) return { success: false, error: 'OKX trading credentials are missing' };
-
-    await setLeverage(instId, posSide);
-    const requestPath = '/api/v5/trade/order';
-    const timestamp = new Date().toISOString();
-    const timestamp = new Date().toISOString();
-    const clOrdId = createClientOrderId();
-    const attachAlgoClOrdId = createClientOrderId('snra');
-    const bodyObj = {
-      instId, tdMode: 'cross', side, ordType: 'market', sz: szFloat.toString(),
-      attachAlgoOrds: [{ tpTriggerPx: takeProfitPrice.toString(), tpOrdPx: '-1', slTriggerPx: stopLossPrice.toString(), slOrdPx: '-1', tpTriggerPxType: 'last', slTriggerPxType: 'last' }]
-      instId, tdMode: 'cross', side, ordType: 'market', sz: szFloat.toString(), clOrdId,
-      attachAlgoOrds: [{ attachAlgoClOrdId, tpTriggerPx: takeProfitPrice.toString(), tpOrdPx: '-1', slTriggerPx: stopLossPrice.toString(), slOrdPx: '-1', tpTriggerPxType: 'last', slTriggerPxType: 'last' }]
-    };
-    if (POS_MODE === 'long_short') bodyObj.posSide = posSide;
-    const body = JSON.stringify(bodyObj);
-    const signature = generateSignature(timestamp, 'POST', requestPath, body);
-
-    const resp = await axiosWithRetry({
-      method: 'POST',
-      url: `${BASE_URL}${requestPath}`,
-      data: body,
-      headers: {
-        'OK-ACCESS-KEY': API_KEY,
-        'OK-ACCESS-SIGN': signature,
-        'OK-ACCESS-TIMESTAMP': timestamp,
-        'OK-ACCESS-PASSPHRASE': PASSPHRASE,
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    });
-
-    if (!resp || !resp.data) return { success: false, error: 'Empty OKX response' };
-    if (String(resp.data.code) !== '0') return { success: false, error: resp.data };
-
-    const ord = Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
-    const ordId = ord ? (ord.ordId || ord.clOrdId || null) : null;
-    const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 6, 1000) : null;
-    const ord = Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
-    const ordId = ord ? (ord.ordId || ord.clOrdId || null) : null;
-    const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 6, 1000) : null;
-    let protection = { ok: false, error: 'OKX did not return an order ID' };
-    if (ordId) {
-      try {
-        protection = await verifyAndAlignProtection({ instId, ordId, direction, initialOrderInfo: orderInfo });
-      } catch (error) {
-        protection = { ok: false, error: error && error.message ? error.message : String(error) };
-      }
-    }
-
-    return { success: true, id: ordId || ('OKX-SIM-' + Date.now()), details: { resp: resp.data, orderInfo, clOrdId, attachAlgoClOrdId, protection } };
-
-    return { success: true, id: ordId || ('OKX-SIM-' + Date.now()), details: { resp: resp.data, orderInfo } };
-
-  } catch (e) {
-    return { success: false, error: e && e.message ? e.message : e };
-  }
-}
-async function pollOKXOrderStatus(instId, ordId, attempts = 6, delay = 1000) {
-async function pollOKXOrderStatus(instId, ordId, attempts = 6, delay = 1000) {
-  if (!API_KEY || !SECRET_KEY || !PASSPHRASE) return null;
-  const requestPath = '/api/v5/trade/order';
-  const qs = `?instId=${encodeURIComponent(instId)}&ordId=${encodeURIComponent(ordId)}`;
-  for (let i = 0; i < attempts; i++) {
-    const timestamp = new Date().toISOString();
+async function pollOrder(instId, ordId, attempts=8) {
+  for (let i=0;i<attempts;i++) {
     try {
-      const sig = generateSignature(timestamp, 'GET', requestPath + qs, '');
-      const resp = await axiosWithRetry({
-        method: 'GET',
-        url: `${BASE_URL}${requestPath}${qs}`,
-        headers: {
-          'OK-ACCESS-KEY': API_KEY,
-          'OK-ACCESS-SIGN': sig,
-          'OK-ACCESS-TIMESTAMP': timestamp,
-          'OK-ACCESS-PASSPHRASE': PASSPHRASE
-        },
-        timeout: 8000
-      });
-      if (resp && resp.data && String(resp.data.code) === '0' && Array.isArray(resp.data.data) && resp.data.data[0]) {
-        const info = resp.data.data[0];
-        if (info.state && (info.state === 'filled' || info.state === 'canceled' || info.state === 'live')) return info;
-      }
-    } catch (e) { /* ignore */ }
-    await new Promise(r => setTimeout(r, delay));
+      const rows = await privateRequest('GET', `/api/v5/trade/order?${qs({ instId, ordId })}`);
+      if (rows[0]) return rows[0];
+    } catch (_) {}
+    await new Promise(r => setTimeout(r, 700));
   }
   return null;
 }
+async function placeOrder({ sym, direction }) {
+  const ticker = await fetchTicker(sym.swap);
+  const meta = await fetchMeta(sym.swap);
+  const price = Number(ticker?.last);
+  const ctVal = Number(meta?.ctVal);
+  const lotSz = Number(meta?.lotSz);
+  const minSz = Number(meta?.minSz);
+  if (!(price > 0) || !(ctVal > 0) || !(lotSz > 0)) throw new Error(`Invalid instrument metadata for ${sym.swap}`);
 
-/* ---------- Strategy state ---------- */
-  return null;
-}
-async function getOrderInfo(instId, ordId) {
-  const orders = await privateGetOKX(`/api/v5/trade/order?instId=${encodeURIComponent(instId)}&ordId=${encodeURIComponent(ordId)}`);
-  return orders[0] || null;
-}
-function protectionPrices(direction, averagePrice) {
-  return {
-    takeProfitPrice: direction === 'UP' ? averagePrice * (1 + TAKE_PROFIT_PCT) : averagePrice * (1 - TAKE_PROFIT_PCT),
-    stopLossPrice: direction === 'UP' ? averagePrice * (1 - STOP_LOSS_PCT) : averagePrice * (1 + STOP_LOSS_PCT)
+  const rawContracts = (MARGIN_PER_TRADE * LEVERAGE) / (price * ctVal);
+  const sz = roundDown(rawContracts, lotSz);
+  if (!(sz > 0) || (minSz > 0 && sz < minSz)) throw new Error(`4U order below minimum: ${sz} contracts; min=${minSz}`);
+
+  const side = direction === 'UP' ? 'buy' : 'sell';
+  const tp = direction === 'UP' ? price * (1 + TAKE_PROFIT_PCT) : price * (1 - TAKE_PROFIT_PCT);
+  const sl = direction === 'UP' ? price * (1 - STOP_LOSS_PCT) : price * (1 + STOP_LOSS_PCT);
+
+  if (DRY_RUN) return { success:true, id:`SIM-${Date.now()}`, avgPx:price, sz, tp, sl, meta };
+  if (!hasCredentials()) throw new Error('Live mode requires OKX API credentials');
+
+  await setLeverage(sym.swap);
+  const body = {
+    instId:sym.swap, tdMode:'cross', side, ordType:'market', sz:String(sz), clOrdId:clientId(),
+    attachAlgoOrds:[{
+      attachAlgoClOrdId:clientId('alg'),
+      tpTriggerPx:String(tp), tpOrdPx:'-1', tpTriggerPxType:'mark',
+      slTriggerPx:String(sl), slOrdPx:'-1', slTriggerPxType:'mark'
+    }]
   };
-}
-function priceMatches(actual, expected) {
-  const actualNumber = parseFloat(actual);
-  if (!Number.isFinite(actualNumber) || !Number.isFinite(expected) || expected <= 0) return false;
-  return Math.abs(actualNumber - expected) / expected <= 0.0001;
-}
-async function amendAttachedProtection(instId, attachAlgoId, averagePrice, direction) {
-  const { takeProfitPrice, stopLossPrice } = protectionPrices(direction, averagePrice);
-  await privatePostOKX('/api/v5/trade/amend-algos', {
-    instId,
-    algoId: attachAlgoId,
-    reqId: createClientOrderId('snrr'),
-    newTpTriggerPx: takeProfitPrice.toString(),
-    newTpOrdPx: '-1',
-    newTpTriggerPxType: 'last',
-    newSlTriggerPx: stopLossPrice.toString(),
-    newSlOrdPx: '-1',
-    newSlTriggerPxType: 'last'
-  });
-  return { takeProfitPrice, stopLossPrice };
-}
-async function verifyAndAlignProtection({ instId, ordId, direction, initialOrderInfo }) {
-  if (DRY_RUN) return { ok: true, simulated: true };
-  let orderInfo = initialOrderInfo;
-  for (let attempt = 0; attempt < PROTECTION_VERIFY_ATTEMPTS; attempt++) {
-    if (!orderInfo || attempt > 0) orderInfo = await getOrderInfo(instId, ordId);
-    const averagePrice = parseFloat(orderInfo && orderInfo.avgPx);
-    const attached = Array.isArray(orderInfo && orderInfo.attachAlgoOrds) ? orderInfo.attachAlgoOrds[0] : null;
-    const attachedAlgoId = attached && attached.attachAlgoId;
-    if (Number.isFinite(averagePrice) && averagePrice > 0 && attached && attachedAlgoId) {
-      const { takeProfitPrice, stopLossPrice } = protectionPrices(direction, averagePrice);
-      const alreadyAligned = priceMatches(attached.tpTriggerPx, takeProfitPrice) && priceMatches(attached.slTriggerPx, stopLossPrice);
-      if (!alreadyAligned) await amendAttachedProtection(instId, attachedAlgoId, averagePrice, direction);
-      return { ok: true, averagePrice, takeProfitPrice, stopLossPrice, amended: !alreadyAligned, attachAlgoId: attachedAlgoId };
+  if (POS_MODE === 'long_short') body.posSide = direction === 'UP' ? 'long' : 'short';
+  const rows = await privateRequest('POST', '/api/v5/trade/order', body);
+  const ordId = rows[0]?.ordId;
+  if (!ordId) throw new Error(`OKX did not return ordId: ${JSON.stringify(rows)}`);
+  const orderInfo = await pollOrder(sym.swap, ordId);
+  if (!orderInfo) throw new Error(`Order ${ordId} submitted but fill status could not be verified`);
+  if (orderInfo.state === 'canceled') throw new Error(`Order ${ordId} was canceled`);
+  if (orderInfo.state === 'filled') {
+    const protection = Array.isArray(orderInfo.attachAlgoOrds) ? orderInfo.attachAlgoOrds[0] : null;
+    if (!protection) {
+      await new Promise(r => setTimeout(r, 1200));
+      const refreshed = await pollOrder(sym.swap, ordId, 2);
+      const p2 = Array.isArray(refreshed?.attachAlgoOrds) ? refreshed.attachAlgoOrds[0] : null;
+      if (!p2) throw new Error(`Order ${ordId} filled but attached TP/SL could not be verified`);
     }
-    await new Promise(resolve => setTimeout(resolve, PROTECTION_VERIFY_DELAY));
   }
-  return { ok: false, error: 'Attached TP/SL could not be verified after fill', orderInfo };
+  return { success:true, id:ordId, avgPx:Number(orderInfo.avgPx || price), sz, tp, sl, orderInfo };
 }
 
-/* ---------- Strategy state ---------- */
-const state = {};
-for (const s of SYMBOLS) state[s.base] = { last15CloseTs: null, lastBet: { '15m': null } };
+const active = new Map();
+const last15Bar = new Map();
 let paused = false;
-let globalOpenBets = 0;
-const monitoredSwapIds = new Set(SYMBOLS.map(s => s.swap));
-const activeTradesByInstrument = new Map();
-let accountSyncReady = DRY_RUN;
-let lastAccountSyncError = '';
+let running = false;
+let apiFailureStreak = 0;
+let lastRiskNotice = '';
 
-function hasNonZeroPosition(position) {
-  return Number.isFinite(Number(position.pos)) && Math.abs(Number(position.pos)) > 0;
-}
-
-async function syncTradingState(announce = false) {
+async function syncTradingState() {
   if (DRY_RUN) return true;
   try {
-    const [positions, pendingOrders] = await Promise.all([
-      privateGetOKX('/api/v5/account/positions?instType=SWAP'),
-      privateGetOKX('/api/v5/trade/orders-pending?instType=SWAP')
-    ]);
-
-    const nextActiveTrades = new Map();
-    for (const position of positions) {
-      if (monitoredSwapIds.has(position.instId) && hasNonZeroPosition(position)) {
-        nextActiveTrades.set(position.instId, { kind: 'position', position });
-      }
+    const positions = await privateRequest('GET', '/api/v5/account/positions?instType=SWAP');
+    const pending = await privateRequest('GET', '/api/v5/trade/orders-pending?instType=SWAP');
+    const monitored = new Set(SYMBOLS.map(s => s.swap));
+    const next = new Map();
+    for (const p of positions) {
+      if (monitored.has(p.instId) && Math.abs(Number(p.pos || 0)) > 0) next.set(p.instId, { kind:'position', data:p });
     }
-    for (const order of pendingOrders) {
-      if (monitoredSwapIds.has(order.instId)) {
-        nextActiveTrades.set(order.instId, { kind: 'pending-order', order });
-      }
+    for (const o of pending) {
+      if (monitored.has(o.instId)) next.set(o.instId, { kind:'pending', data:o });
     }
-
-    activeTradesByInstrument.clear();
-    for (const [instId, trade] of nextActiveTrades) activeTradesByInstrument.set(instId, trade);
-    globalOpenBets = activeTradesByInstrument.size;
-    accountSyncReady = true;
-    lastAccountSyncError = '';
-
-    if (announce && globalOpenBets > 0) {
-      await notifyTelegram(`已同步 ${globalOpenBets} 個既有持倉／未成交委託；這些標的不會再由機器人開新倉。`);
-    }
+    active.clear();
+    for (const [k,v] of next) active.set(k,v);
+    apiFailureStreak = 0;
     return true;
-  } catch (error) {
-    const message = error && error.message ? error.message : String(error);
-    const shouldNotify = announce || accountSyncReady || message !== lastAccountSyncError;
-    accountSyncReady = false;
-    lastAccountSyncError = message;
-    console.error('Trading state sync failed:', message);
-    if (shouldNotify) await notifyTelegram(`無法同步 OKX 持倉，為避免錯單已停止開新倉：${message}`);
+  } catch (e) {
+    apiFailureStreak++;
+    console.error('State sync failed:', e.message || e);
+    if (apiFailureStreak >= MAX_CONSECUTIVE_API_FAILURES) paused = true;
     return false;
   }
 }
 
-/* ---------- Core: evaluate and act ---------- */
-async function legacyEvaluateForTimeframe(sym, timeframe, candles15, candles5) {
-  try {
-    if (paused) return;
-    const instId = (timeframe === '5m') ? sym.inst5 : sym.inst15;
-    if (!instId) {
-      await notifyTelegram(`[${sym.label}] ${timeframe} - 沒有對應 event instId，請在 env 設定 ${sym.label}_${timeframe.toUpperCase()}_INST`);
-      return;
+async function updateDailyPnL() {
+  if (DRY_RUN) return;
+  resetDailyRiskIfNeeded();
+  const begin = new Date(`${botState.risk.day}T00:00:00.000Z`).getTime();
+  const rows = await privateRequest('GET', `/api/v5/trade/fills-history?${qs({ instType:'SWAP', beginTs:String(begin), limit:'100' })}`);
+  const fills = rows.filter(r => Number(r.fillTime || 0) >= begin);
+  const byOrder = new Map();
+  let total = 0;
+  for (const f of fills) {
+    const id = String(f.tradeId || f.billId || `${f.ordId}-${f.fillTime}`);
+    const fee = Number(f.fee || 0);
+    const pnl = Number(f.fillPnl || 0);
+    total += pnl + fee;
+    if (pnl !== 0 && f.ordId) {
+      const current = byOrder.get(f.ordId) || { pnl:0, lastTime:0 };
+      current.pnl += pnl + fee;
+      current.lastTime = Math.max(current.lastTime, Number(f.fillTime || 0));
+      byOrder.set(f.ordId, current);
     }
-
-    const { pivotHighs, pivotLows } = findPivots(candles15, 3);
-    const resistance = pickLevelFromPivots(pivotHighs, 0.006);
-    const support = pickLevelFromPivots(pivotLows, 0.006);
-    if (!resistance || !support) return;
-
-    const closes15 = closesFrom(candles15);
-    const closes5 = closesFrom(candles5);
-    const ema15 = ema(closes15, EMA_PERIOD);
-    const ema5 = ema(closes5, EMA_PERIOD);
-    if (!ema15 || !ema5) return;
-
-    const latest5Close = closes5[closes5.length - 1];
-    const buffer = BREAKOUT_BUFFER;
-
-    let direction = null;
-    if (latest5Close > resistance * (1 + buffer) && latest5Close > ema15 && latest5Close > ema5) direction = 'UP';
-    else if (latest5Close < support * (1 - buffer) && latest5Close < ema15 && latest5Close < ema5) direction = 'DOWN';
-    if (!direction) return;
-
-    const key = timeframe;
-    const lastBetTs = state[sym.base].lastBet[key];
-    const nowTs = Date.now();
-    const timeframeMs = (timeframe === '5m') ? 5 * 60 * 1000 : 15 * 60 * 1000;
-    if (lastBetTs && (nowTs - lastBetTs) < timeframeMs) return;
-
-    if (globalOpenBets >= MAX_CONCURRENT) {
-      await notifyTelegram(`⚠️ 超過最大同時押注 (${MAX_CONCURRENT})，${sym.label} ${timeframe} 信號跳過`);
-      return;
-    }
-
-    const bet = { instId, direction, amountU: MARGIN_PER_TRADE };
-    const resp = await submitSwapOrderOKX(bet);
-
-    if (resp && resp.success) {
-      state[sym.base].lastBet[key] = nowTs;
-      globalOpenBets++;
-      await notifyTelegram(`✅ 下單 ${DRY_RUN ? '(SIM)' : '(LIVE)'}\n標的: ${sym.label}\n時框: ${timeframe}\n方向: ${direction}\n金額(U): ${MARGIN_PER_TRADE}\ninstId: ${instId}\norderId: ${resp.id}\ndetails: ${JSON.stringify(resp.details)}`);
-      // optional: you may poll later and decrement globalOpenBets when order resolves
-      setTimeout(async () => { globalOpenBets = Math.max(0, globalOpenBets - 1); }, 5 * 60 * 1000); // safe decrement fallback
-    } else {
-      await notifyTelegram(`❌ 下單失敗 ${sym.label} ${timeframe} ${direction}\nerror: ${JSON.stringify(resp)}`);
-    }
-
-  } catch (e) {
-    console.error('evaluateForTimeframe error', e && e.message ? e.message : e);
+    if (!botState.risk.processedTradeIds.includes(id)) botState.risk.processedTradeIds.push(id);
+  }
+  botState.risk.dailyRealizedPnl = total;
+  const closingOrders = [...byOrder.values()].sort((a,b) => b.lastTime - a.lastTime);
+  let streak = 0;
+  for (const item of closingOrders) {
+    if (item.pnl < 0) streak++;
+    else if (item.pnl > 0) break;
+  }
+  botState.risk.consecutiveLosses = streak;
+  if (botState.risk.processedTradeIds.length > 1000) botState.risk.processedTradeIds = botState.risk.processedTradeIds.slice(-1000);
+  for (const [ordId] of byOrder) {
+    if (!botState.risk.processedClosingOrders.includes(ordId)) botState.risk.processedClosingOrders.push(ordId);
+  }
+  if (botState.risk.processedClosingOrders.length > 500) botState.risk.processedClosingOrders = botState.risk.processedClosingOrders.slice(-500);
+  if (botState.risk.dailyRealizedPnl <= -Math.abs(MAX_DAILY_LOSS_U) || botState.risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) botState.risk.halted = true;
+  persistState();
+  const notice = `${botState.risk.dailyRealizedPnl.toFixed(4)}|${botState.risk.consecutiveLosses}|${botState.risk.halted}`;
+  if (botState.risk.halted && notice !== lastRiskNotice) {
+    lastRiskNotice = notice;
+    await notifyTelegram(`⛔ 風控停機\n今日已實現損益：${botState.risk.dailyRealizedPnl.toFixed(2)}U\n連敗：${botState.risk.consecutiveLosses}\n停止開新倉。`);
   }
 }
 
-async function legacyProcessSymbol(sym) {
-  try {
-    const c15 = await fetchOKXCandles(sym.base, '15m', 80);
-    const c5 = await fetchOKXCandles(sym.base, '5m', 80);
-    if (!c15 || !c5) return;
-    const sorted15 = normalizeCandles(c15);
-    const sorted5 = normalizeCandles(c5);
-    const latest15 = sorted15[sorted15.length - 1];
-    const latest5 = sorted5[sorted5.length - 1];
-    const ts15 = latest15[0], ts5 = latest5[0];
-    const st = state[sym.base];
-    if (st.last5CloseTs !== ts5) {
-      st.last5CloseTs = ts5;
-      await evaluateForTimeframe(sym, '5m', sorted15, sorted5);
-    }
-    if (st.last15CloseTs !== ts15) {
-      st.last15CloseTs = ts15;
-      await evaluateForTimeframe(sym, '15m', sorted15, sorted5);
-    }
-  } catch (e) {
-    console.error('processSymbol error', sym.base, e && e.message ? e.message : e);
-  }
-}
+function evaluateSignal(c4h, c15) {
+  const h4 = confirmedCandles(c4h);
+  const m15 = confirmedCandles(c15);
+  if (h4.length < EMA_PERIOD + PIVOT_LOOKBACK * 2 + 2 || m15.length < Math.max(EMA_PERIOD + 1, VOLUME_LOOKBACK + 1, ATR_PERIOD + 1)) return null;
+  const { pivotHighs, pivotLows } = findPivots(h4, PIVOT_LOOKBACK);
+  const resistance = pickLevel(pivotHighs);
+  const support = pickLevel(pivotLows);
+  if (!(resistance > 0) || !(support > 0)) return null;
 
-/* ---------- Perpetual-swap strategy: 4H context, 15m entry ---------- */
-async function evaluateForTimeframe(sym, candles4h, candles15) {
-  try {
-    if (paused) return;
-    const { pivotHighs, pivotLows } = findPivots(candles4h, 3);
-    const resistance = pickLevelFromPivots(pivotHighs, 0.006);
-    const support = pickLevelFromPivots(pivotLows, 0.006);
-    if (!resistance || !support) return;
+  const ema4 = ema(closes(h4), EMA_PERIOD);
+  const ema15 = ema(closes(m15), EMA_PERIOD);
+  const close15 = Number(m15[m15.length-1][4]);
+  const atr = atrPct(m15, ATR_PERIOD);
+  if (!(ema4 > 0) || !(ema15 > 0) || !Number.isFinite(atr) || atr < MIN_ATR_PCT || atr > MAX_ATR_PCT) return null;
 
-    const closes4h = closesFrom(candles4h);
-    const closes15 = closesFrom(candles15);
-    const ema4h = ema(closes4h, EMA_PERIOD);
-    const ema15 = ema(closes15, EMA_PERIOD);
-    if (!ema4h || !ema15) return;
+  const latestVol = quoteVolume(m15[m15.length-1]);
+  const prev = m15.slice(-(VOLUME_LOOKBACK + 1), -1).map(quoteVolume);
+  const avgVol = prev.reduce((a,b) => a+b, 0) / prev.length;
+  if (!(latestVol > 0) || !(avgVol > 0) || latestVol < avgVol * MIN_VOLUME_MULTIPLIER) return null;
 
-    const latest15Close = closes15[closes15.length - 1];
-    const atrPct = atrPercent(candles15, ATR_PERIOD);
-    if (!Number.isFinite(atrPct) || atrPct < MIN_ATR_PCT || atrPct > MAX_ATR_PCT) return;
-
-    if (candles15.length < VOLUME_LOOKBACK + 1) return;
-    const latestVolume = quoteVolumeFrom(candles15[candles15.length - 1]);
-    const averageVolume = candles15
-      .slice(-(VOLUME_LOOKBACK + 1), -1)
-      .map(quoteVolumeFrom)
-      .reduce((sum, value) => sum + value, 0) / VOLUME_LOOKBACK;
-    if (!latestVolume || !averageVolume || latestVolume < averageVolume * MIN_VOLUME_MULTIPLIER) return;
-
-    let direction = null;
-    if (latest15Close > resistance * (1 + BREAKOUT_BUFFER) && latest15Close > ema4h && latest15Close > ema15) direction = 'UP';
-    else if (latest15Close < support * (1 - BREAKOUT_BUFFER) && latest15Close < ema4h && latest15Close < ema15) direction = 'DOWN';
-    if (!direction) return;
-
-    const nowTs = Date.now();
-    if (state[sym.base].lastBet['15m'] && nowTs - state[sym.base].lastBet['15m'] < 15 * 60 * 1000) return;
-    if (!DRY_RUN && !(await syncTradingState())) return;
-    if (activeTradesByInstrument.has(sym.swap)) return;
-    if (globalOpenBets >= MAX_CONCURRENT) return;
-
-    const resp = await submitSwapOrderOKX({ instId: sym.swap, direction, amountU: MARGIN_PER_TRADE });
-    if (!resp || !resp.success) {
-      await notifyTelegram(`Order failed ${sym.label} ${direction}\nerror: ${JSON.stringify(resp)}`);
-      return;
-    }
-
-    state[sym.base].lastBet['15m'] = nowTs;
-    activeTradesByInstrument.set(sym.swap, { kind: 'submitted-order', orderId: resp.id });
-    globalOpenBets = activeTradesByInstrument.size;
-    await notifyTelegram(`Order ${DRY_RUN ? '(SIM)' : '(LIVE)'}\nSymbol: ${sym.label}\nTimeframe: 15m + 4H\nDirection: ${direction}\nMargin: ${MARGIN_PER_TRADE}U\nLeverage: ${LEVERAGE}x\nTP/SL: 3% / 1%\ninstId: ${sym.swap}\norderId: ${resp.id}`);
-    if (DRY_RUN) {
-      setTimeout(() => {
-        activeTradesByInstrument.delete(sym.swap);
-        globalOpenBets = activeTradesByInstrument.size;
-      }, 4 * 60 * 60 * 1000);
-    }
-  } catch (e) {
-    console.error('evaluateForTimeframe error', e && e.message ? e.message : e);
-  }
+  if (close15 > resistance * (1 + BREAKOUT_BUFFER) && close15 > ema4 && close15 > ema15) return { direction:'UP', resistance, support, ema4, ema15, atr, volumeRatio:latestVol/avgVol };
+  if (close15 < support * (1 - BREAKOUT_BUFFER) && close15 < ema4 && close15 < ema15) return { direction:'DOWN', resistance, support, ema4, ema15, atr, volumeRatio:latestVol/avgVol };
+  return null;
 }
 
 async function processSymbol(sym) {
   try {
-    const [c4h, c15] = await Promise.all([fetchOKXCandles(sym.base, '4H', 80), fetchOKXCandles(sym.base, '15m', 80)]);
-    if (!c4h || !c15) return;
-    const sorted4h = confirmedCandles(c4h);
-    const sorted15 = confirmedCandles(c15);
-    const min15Candles = Math.max(EMA_PERIOD + 1, VOLUME_LOOKBACK + 1, ATR_PERIOD + 1);
-    if (sorted4h.length < EMA_PERIOD + 7 || sorted15.length < EMA_PERIOD + 1) return;
-    if (sorted4h.length < EMA_PERIOD + 7 || sorted15.length < min15Candles) return;
-    const ts15 = sorted15[sorted15.length - 1][0];
-    if (state[sym.base].last15CloseTs === ts15) return;
-    state[sym.base].last15CloseTs = ts15;
-    await evaluateForTimeframe(sym, sorted4h, sorted15);
+    if (paused || riskBlocked()) return;
+    const [c4h,c15] = await Promise.all([fetchCandles(sym.base,'4H',100), fetchCandles(sym.base,'15m',100)]);
+    const m15 = confirmedCandles(c15);
+    if (!m15.length) return;
+    const ts = String(m15[m15.length-1][0]);
+    if (last15Bar.get(sym.swap) === ts) return;
+    last15Bar.set(sym.swap, ts);
+
+    const signal = evaluateSignal(c4h,c15);
+    if (!signal) return;
+    if (!DRY_RUN && !(await syncTradingState())) return;
+    if (active.has(sym.swap)) return;
+    if (active.size >= MAX_CONCURRENT) return;
+    if (riskBlocked()) return;
+
+    const result = await placeOrder({ sym, direction:signal.direction });
+    active.set(sym.swap, { kind:'bot-order', data:result });
+    if (DRY_RUN) setTimeout(() => { active.delete(sym.swap); }, 4 * 60 * 60 * 1000);
+    audit('entry', { symbol:sym.label, instId:sym.swap, direction:signal.direction, margin:MARGIN_PER_TRADE, leverage:LEVERAGE, orderId:result.id, signal });
+    await notifyTelegram(`✅ ${DRY_RUN ? 'SIM' : 'LIVE'} 進場\n${sym.label} ${signal.direction}\n保證金 ${MARGIN_PER_TRADE}U × ${LEVERAGE}x\nTP ${TAKE_PROFIT_PCT*100}% / SL ${STOP_LOSS_PCT*100}%\n目前持倉 ${active.size}/${MAX_CONCURRENT}\nOrder: ${result.id}`);
   } catch (e) {
-    console.error('processSymbol error', sym.base, e && e.message ? e.message : e);
+    console.error(`${sym.label}:`, e.message || e);
+    audit('process_error', { symbol:sym.label, error:e.message || String(e) });
   }
 }
 
-/* ---------- Runner ---------- */
-let running = false;
 async function runLoop() {
   if (running) return;
   running = true;
   try {
-    for (const s of SYMBOLS) {
-      await processSymbol(s);
-      await new Promise(r => setTimeout(r, 700));
+    resetDailyRiskIfNeeded();
+    if (!DRY_RUN) await updateDailyPnL();
+    if (paused || riskBlocked()) return;
+    if (!DRY_RUN) await syncTradingState();
+    for (const sym of SYMBOLS) {
+      if (paused || riskBlocked()) break;
+      await processSymbol(sym);
+      await new Promise(r => setTimeout(r, 150));
     }
-  } finally {
-    running = false;
-  }
+  } finally { running = false; }
 }
-setInterval(runLoop, CHECK_INTERVAL);
-if (!DRY_RUN) setInterval(() => { void syncTradingState(); }, POSITION_SYNC_INTERVAL);
-async function bootstrap() {
-  if (!DRY_RUN) await syncTradingState(true);
-  await runLoop();
-}
-void bootstrap();
 
-/* ---------- HTTP control endpoints ---------- */
-app.post('/pause', (req, res) => {
-  const token = req.header('x-control-token') || req.query.token;
-  if (!CONTROL_TOKEN || token !== CONTROL_TOKEN) return res.status(401).json({ ok: false, msg: 'unauthorized' });
-  paused = true;
-  notifyTelegram('🤚 Bot 已暫停 (pause)'); 
-  return res.json({ ok: true, paused });
+function controlToken(req) { return req.header('x-control-token') || req.query.token || ''; }
+app.get('/health', (req,res) => res.json({
+  ok:true, mode:DRY_RUN?'DRY_RUN':'LIVE', paused, halted:botState.risk.halted,
+  dailyRealizedPnl:botState.risk.dailyRealizedPnl, consecutiveLosses:botState.risk.consecutiveLosses,
+  openPositions:active.size, maxPositions:MAX_CONCURRENT, marginPerTrade:MARGIN_PER_TRADE, leverage:LEVERAGE,
+  tp:TAKE_PROFIT_PCT, sl:STOP_LOSS_PCT, now:new Date().toISOString()
+}));
+app.post('/pause', (req,res) => {
+  if (!CONTROL_TOKEN || controlToken(req) !== CONTROL_TOKEN) return res.status(401).json({ok:false,msg:'unauthorized'});
+  paused = true; void notifyTelegram('⏸️ Bot 已手動暫停'); res.json({ok:true,paused});
 });
-app.post('/resume', (req, res) => {
-  const token = req.header('x-control-token') || req.query.token;
-  if (!CONTROL_TOKEN || token !== CONTROL_TOKEN) return res.status(401).json({ ok: false, msg: 'unauthorized' });
-  paused = false;
-  notifyTelegram('▶️ Bot 已恢復 (resume)');
-  return res.json({ ok: true, paused });
+app.post('/resume', (req,res) => {
+  if (!CONTROL_TOKEN || controlToken(req) !== CONTROL_TOKEN) return res.status(401).json({ok:false,msg:'unauthorized'});
+  resetDailyRiskIfNeeded();
+  if (botState.risk.halted) return res.status(409).json({ok:false,msg:'risk lock active; wait for next UTC day'});
+  paused = false; apiFailureStreak = 0; void notifyTelegram('▶️ Bot 已恢復'); res.json({ok:true,paused});
 });
-app.get('/health', (req, res) => res.json({ ok: true, DRY_RUN, paused, now: new Date().toISOString(), globalOpenBets }));
+app.get('/', (req,res) => res.send(`OKX Perpetual SNR Bot | ${DRY_RUN?'DRY_RUN':'LIVE'} | 4U × ${LEVERAGE}x | max ${MAX_CONCURRENT} positions`));
 
-/* ---------- Start ---------- */
-app.get('/', (req, res) => res.send(`Event SNR OKX Bot running. DRY_RUN=${DRY_RUN}`));
 const server = app.listen(PORT, () => {
-  console.log(`Bot listening on ${PORT} — DRY_RUN=${DRY_RUN}`);
-  notifyTelegram(`Bot started. DRY_RUN=${DRY_RUN}`);
+  console.log(`Bot listening on ${PORT}; mode=${DRY_RUN?'DRY_RUN':'LIVE'}; margin=${MARGIN_PER_TRADE}U; leverage=${LEVERAGE}x; max=${MAX_CONCURRENT}`);
+  void notifyTelegram(`Bot 啟動\n模式：${DRY_RUN?'模擬':'實盤'}\n4U × ${LEVERAGE}x\n最多 ${MAX_CONCURRENT} 倉\nTP/SL 3%/1%`);
 });
-process.on('SIGINT', () => { server.close(() => process.exit(0)); });
-process.on('unhandledRejection', r => console.error('Unhandled Rejection', r));
+
+setInterval(() => { void runLoop(); }, CHECK_INTERVAL);
+if (!DRY_RUN) setInterval(() => { void syncTradingState(); void updateDailyPnL(); }, POSITION_SYNC_INTERVAL);
+void runLoop();
+
+process.on('SIGINT', () => server.close(() => process.exit(0)));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+process.on('unhandledRejection', e => console.error('Unhandled rejection:', e));
