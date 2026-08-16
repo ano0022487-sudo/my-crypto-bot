@@ -13,6 +13,12 @@ const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
 const TelegramBot = require('node-telegram-bot-api');
+const express = require('express');
+const axios = require('axios');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
 app.use(express.json());
@@ -34,9 +40,22 @@ const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.01); // 1% risk
 const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.03); // 3% reward (1:3 R:R)
 const POS_MODE = (process.env.POS_MODE || 'net').toLowerCase(); // net or long_short
 const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001); // 0.1% buffer
+const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001); // 0.1% buffer
 const EMA_PERIOD = Number(process.env.EMA_PERIOD || 20);
+const VOLUME_LOOKBACK = Number(process.env.VOLUME_LOOKBACK || 20);
+const MIN_VOLUME_MULTIPLIER = Number(process.env.MIN_VOLUME_MULTIPLIER || 1.2);
+const ATR_PERIOD = Number(process.env.ATR_PERIOD || 14);
+const MIN_ATR_PCT = Number(process.env.MIN_ATR_PCT || 0.0015); // 0.15% of price
+const MAX_ATR_PCT = Number(process.env.MAX_ATR_PCT || 0.02); // 2.00% of price
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 4);
 const POSITION_SYNC_INTERVAL = Number(process.env.POSITION_SYNC_INTERVAL || 60 * 1000);
+const MAX_DAILY_LOSS_U = Number(process.env.MAX_DAILY_LOSS_U || 8);
+const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 3);
+const MAX_CONSECUTIVE_API_FAILURES = Number(process.env.MAX_CONSECUTIVE_API_FAILURES || 3);
+const HEARTBEAT_TIMEOUT = Number(process.env.HEARTBEAT_TIMEOUT || 120 * 1000);
+const PROTECTION_VERIFY_ATTEMPTS = Number(process.env.PROTECTION_VERIFY_ATTEMPTS || 8);
+const PROTECTION_VERIFY_DELAY = Number(process.env.PROTECTION_VERIFY_DELAY || 1000);
+const BOT_STATE_FILE = process.env.BOT_STATE_FILE || path.join(__dirname, 'okx-swap-bot-state.json');
 const CONTROL_TOKEN = process.env.CONTROL_TOKEN || ''; // required to protect /pause /resume
 
 /* ---------- Symbols (monitor spot candles for S/R) ---------- */
@@ -73,12 +92,52 @@ if (TELEGRAM_BOT_TOKEN) {
   });
 }
 async function notifyTelegram(text) {
+async function notifyTelegram(text) {
   try {
     if (!TELEGRAM_CHAT_ID) return;
     await bot.sendMessage(TELEGRAM_CHAT_ID, text);
   } catch (e) {
     console.debug('Telegram send failed:', e && e.message ? e.message : e);
   }
+}
+
+/* ---------- Helpers ---------- */
+  }
+}
+
+/* ---------- Persistent audit and risk state ---------- */
+function utcDay() {
+  return new Date().toISOString().slice(0, 10);
+}
+function newBotState() {
+  return {
+    version: 1,
+    risk: { day: utcDay(), startEquity: null, dailyRealizedPnl: 0, consecutiveLosses: 0, halted: false, processedClosures: [] },
+    audit: []
+  };
+}
+function loadBotState() {
+  try {
+    if (!fs.existsSync(BOT_STATE_FILE)) return newBotState();
+    const parsed = JSON.parse(fs.readFileSync(BOT_STATE_FILE, 'utf8'));
+    return { ...newBotState(), ...parsed, risk: { ...newBotState().risk, ...(parsed.risk || {}) }, audit: Array.isArray(parsed.audit) ? parsed.audit : [] };
+  } catch (error) {
+    console.error('Unable to load bot state:', error && error.message ? error.message : error);
+    return newBotState();
+  }
+}
+const botState = loadBotState();
+function persistBotState() {
+  try {
+    fs.writeFileSync(BOT_STATE_FILE, JSON.stringify(botState, null, 2), 'utf8');
+  } catch (error) {
+    console.error('Unable to persist bot state:', error && error.message ? error.message : error);
+  }
+}
+function appendAudit(event, details = {}) {
+  botState.audit.push({ at: new Date().toISOString(), event, ...details });
+  if (botState.audit.length > 500) botState.audit.splice(0, botState.audit.length - 500);
+  persistBotState();
 }
 
 /* ---------- Helpers ---------- */
@@ -119,6 +178,32 @@ async function privateGetOKX(requestPath) {
   }
   return Array.isArray(response.data.data) ? response.data.data : [];
 }
+async function privatePostOKX(requestPath, bodyObj) {
+  if (!hasTradingCredentials()) throw new Error('OKX trading credentials are missing');
+  const timestamp = new Date().toISOString();
+  const body = JSON.stringify(bodyObj);
+  const signature = generateSignature(timestamp, 'POST', requestPath, body);
+  const response = await axiosWithRetry({
+    method: 'POST',
+    url: `${BASE_URL}${requestPath}`,
+    data: body,
+    headers: {
+      'OK-ACCESS-KEY': API_KEY,
+      'OK-ACCESS-SIGN': signature,
+      'OK-ACCESS-TIMESTAMP': timestamp,
+      'OK-ACCESS-PASSPHRASE': PASSPHRASE,
+      'Content-Type': 'application/json'
+    },
+    timeout: 15000
+  });
+  if (!response || !response.data || String(response.data.code) !== '0') {
+    throw new Error(`OKX private request failed: ${JSON.stringify(response && response.data)}`);
+  }
+  return Array.isArray(response.data.data) ? response.data.data : [];
+}
+function createClientOrderId(prefix = 'snr') {
+  return `${prefix}${Date.now().toString(36)}${crypto.randomBytes(4).toString('hex')}`.slice(0, 32);
+}
 function normalizeCandles(candles) {
   return candles.slice().sort((a, b) => new Date(a[0]) - new Date(b[0]));
 }
@@ -130,6 +215,7 @@ function highsFrom(candles) { return normalizeCandles(candles).map(c => parseFlo
 function lowsFrom(candles) { return normalizeCandles(candles).map(c => parseFloat(c[3])); }
 
 /* ---------- Indicators ---------- */
+function ema(values, period) {
 function ema(values, period) {
   if (!values || values.length < period) return null;
   const k = 2 / (period + 1);
@@ -209,6 +295,29 @@ async function setLeverage(instId, posSide) {
   });
   if (!resp || !resp.data || String(resp.data.code) !== '0') throw new Error(`Leverage setup failed: ${JSON.stringify(resp && resp.data)}`);
 }
+function quoteVolumeFrom(candle) {
+  const quoteVolume = parseFloat(candle[7]);
+  if (Number.isFinite(quoteVolume)) return quoteVolume;
+  const currencyVolume = parseFloat(candle[6]);
+  if (Number.isFinite(currencyVolume)) return currencyVolume;
+  return parseFloat(candle[5]) || 0;
+}
+function atrPercent(candles, period) {
+  const sorted = normalizeCandles(candles);
+  if (sorted.length < period + 1) return null;
+  const trueRanges = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const high = parseFloat(sorted[i][2]);
+    const low = parseFloat(sorted[i][3]);
+    const previousClose = parseFloat(sorted[i - 1][4]);
+    if (![high, low, previousClose].every(Number.isFinite)) return null;
+    trueRanges.push(Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose)));
+  }
+  const recentRanges = trueRanges.slice(-period);
+  const latestClose = parseFloat(sorted[sorted.length - 1][4]);
+  if (!latestClose || recentRanges.length < period) return null;
+  return recentRanges.reduce((sum, value) => sum + value, 0) / recentRanges.length / latestClose;
+}
 
 async function submitSwapOrderOKX({ instId, direction, amountU }) {
   try {
@@ -240,9 +349,14 @@ async function submitSwapOrderOKX({ instId, direction, amountU }) {
     await setLeverage(instId, posSide);
     const requestPath = '/api/v5/trade/order';
     const timestamp = new Date().toISOString();
+    const timestamp = new Date().toISOString();
+    const clOrdId = createClientOrderId();
+    const attachAlgoClOrdId = createClientOrderId('snra');
     const bodyObj = {
       instId, tdMode: 'cross', side, ordType: 'market', sz: szFloat.toString(),
       attachAlgoOrds: [{ tpTriggerPx: takeProfitPrice.toString(), tpOrdPx: '-1', slTriggerPx: stopLossPrice.toString(), slOrdPx: '-1', tpTriggerPxType: 'last', slTriggerPxType: 'last' }]
+      instId, tdMode: 'cross', side, ordType: 'market', sz: szFloat.toString(), clOrdId,
+      attachAlgoOrds: [{ attachAlgoClOrdId, tpTriggerPx: takeProfitPrice.toString(), tpOrdPx: '-1', slTriggerPx: stopLossPrice.toString(), slOrdPx: '-1', tpTriggerPxType: 'last', slTriggerPxType: 'last' }]
     };
     if (POS_MODE === 'long_short') bodyObj.posSide = posSide;
     const body = JSON.stringify(bodyObj);
@@ -268,6 +382,19 @@ async function submitSwapOrderOKX({ instId, direction, amountU }) {
     const ord = Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
     const ordId = ord ? (ord.ordId || ord.clOrdId || null) : null;
     const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 6, 1000) : null;
+    const ord = Array.isArray(resp.data.data) && resp.data.data[0] ? resp.data.data[0] : null;
+    const ordId = ord ? (ord.ordId || ord.clOrdId || null) : null;
+    const orderInfo = ordId ? await pollOKXOrderStatus(instId, ordId, 6, 1000) : null;
+    let protection = { ok: false, error: 'OKX did not return an order ID' };
+    if (ordId) {
+      try {
+        protection = await verifyAndAlignProtection({ instId, ordId, direction, initialOrderInfo: orderInfo });
+      } catch (error) {
+        protection = { ok: false, error: error && error.message ? error.message : String(error) };
+      }
+    }
+
+    return { success: true, id: ordId || ('OKX-SIM-' + Date.now()), details: { resp: resp.data, orderInfo, clOrdId, attachAlgoClOrdId, protection } };
 
     return { success: true, id: ordId || ('OKX-SIM-' + Date.now()), details: { resp: resp.data, orderInfo } };
 
@@ -275,6 +402,7 @@ async function submitSwapOrderOKX({ instId, direction, amountU }) {
     return { success: false, error: e && e.message ? e.message : e };
   }
 }
+async function pollOKXOrderStatus(instId, ordId, attempts = 6, delay = 1000) {
 async function pollOKXOrderStatus(instId, ordId, attempts = 6, delay = 1000) {
   if (!API_KEY || !SECRET_KEY || !PASSPHRASE) return null;
   const requestPath = '/api/v5/trade/order';
@@ -302,6 +430,58 @@ async function pollOKXOrderStatus(instId, ordId, attempts = 6, delay = 1000) {
     await new Promise(r => setTimeout(r, delay));
   }
   return null;
+}
+
+/* ---------- Strategy state ---------- */
+  return null;
+}
+async function getOrderInfo(instId, ordId) {
+  const orders = await privateGetOKX(`/api/v5/trade/order?instId=${encodeURIComponent(instId)}&ordId=${encodeURIComponent(ordId)}`);
+  return orders[0] || null;
+}
+function protectionPrices(direction, averagePrice) {
+  return {
+    takeProfitPrice: direction === 'UP' ? averagePrice * (1 + TAKE_PROFIT_PCT) : averagePrice * (1 - TAKE_PROFIT_PCT),
+    stopLossPrice: direction === 'UP' ? averagePrice * (1 - STOP_LOSS_PCT) : averagePrice * (1 + STOP_LOSS_PCT)
+  };
+}
+function priceMatches(actual, expected) {
+  const actualNumber = parseFloat(actual);
+  if (!Number.isFinite(actualNumber) || !Number.isFinite(expected) || expected <= 0) return false;
+  return Math.abs(actualNumber - expected) / expected <= 0.0001;
+}
+async function amendAttachedProtection(instId, attachAlgoId, averagePrice, direction) {
+  const { takeProfitPrice, stopLossPrice } = protectionPrices(direction, averagePrice);
+  await privatePostOKX('/api/v5/trade/amend-algos', {
+    instId,
+    algoId: attachAlgoId,
+    reqId: createClientOrderId('snrr'),
+    newTpTriggerPx: takeProfitPrice.toString(),
+    newTpOrdPx: '-1',
+    newTpTriggerPxType: 'last',
+    newSlTriggerPx: stopLossPrice.toString(),
+    newSlOrdPx: '-1',
+    newSlTriggerPxType: 'last'
+  });
+  return { takeProfitPrice, stopLossPrice };
+}
+async function verifyAndAlignProtection({ instId, ordId, direction, initialOrderInfo }) {
+  if (DRY_RUN) return { ok: true, simulated: true };
+  let orderInfo = initialOrderInfo;
+  for (let attempt = 0; attempt < PROTECTION_VERIFY_ATTEMPTS; attempt++) {
+    if (!orderInfo || attempt > 0) orderInfo = await getOrderInfo(instId, ordId);
+    const averagePrice = parseFloat(orderInfo && orderInfo.avgPx);
+    const attached = Array.isArray(orderInfo && orderInfo.attachAlgoOrds) ? orderInfo.attachAlgoOrds[0] : null;
+    const attachedAlgoId = attached && attached.attachAlgoId;
+    if (Number.isFinite(averagePrice) && averagePrice > 0 && attached && attachedAlgoId) {
+      const { takeProfitPrice, stopLossPrice } = protectionPrices(direction, averagePrice);
+      const alreadyAligned = priceMatches(attached.tpTriggerPx, takeProfitPrice) && priceMatches(attached.slTriggerPx, stopLossPrice);
+      if (!alreadyAligned) await amendAttachedProtection(instId, attachedAlgoId, averagePrice, direction);
+      return { ok: true, averagePrice, takeProfitPrice, stopLossPrice, amended: !alreadyAligned, attachAlgoId: attachedAlgoId };
+    }
+    await new Promise(resolve => setTimeout(resolve, PROTECTION_VERIFY_DELAY));
+  }
+  return { ok: false, error: 'Attached TP/SL could not be verified after fill', orderInfo };
 }
 
 /* ---------- Strategy state ---------- */
@@ -457,6 +637,17 @@ async function evaluateForTimeframe(sym, candles4h, candles15) {
     if (!ema4h || !ema15) return;
 
     const latest15Close = closes15[closes15.length - 1];
+    const atrPct = atrPercent(candles15, ATR_PERIOD);
+    if (!Number.isFinite(atrPct) || atrPct < MIN_ATR_PCT || atrPct > MAX_ATR_PCT) return;
+
+    if (candles15.length < VOLUME_LOOKBACK + 1) return;
+    const latestVolume = quoteVolumeFrom(candles15[candles15.length - 1]);
+    const averageVolume = candles15
+      .slice(-(VOLUME_LOOKBACK + 1), -1)
+      .map(quoteVolumeFrom)
+      .reduce((sum, value) => sum + value, 0) / VOLUME_LOOKBACK;
+    if (!latestVolume || !averageVolume || latestVolume < averageVolume * MIN_VOLUME_MULTIPLIER) return;
+
     let direction = null;
     if (latest15Close > resistance * (1 + BREAKOUT_BUFFER) && latest15Close > ema4h && latest15Close > ema15) direction = 'UP';
     else if (latest15Close < support * (1 - BREAKOUT_BUFFER) && latest15Close < ema4h && latest15Close < ema15) direction = 'DOWN';
@@ -495,7 +686,9 @@ async function processSymbol(sym) {
     if (!c4h || !c15) return;
     const sorted4h = confirmedCandles(c4h);
     const sorted15 = confirmedCandles(c15);
+    const min15Candles = Math.max(EMA_PERIOD + 1, VOLUME_LOOKBACK + 1, ATR_PERIOD + 1);
     if (sorted4h.length < EMA_PERIOD + 7 || sorted15.length < EMA_PERIOD + 1) return;
+    if (sorted4h.length < EMA_PERIOD + 7 || sorted15.length < min15Candles) return;
     const ts15 = sorted15[sorted15.length - 1][0];
     if (state[sym.base].last15CloseTs === ts15) return;
     state[sym.base].last15CloseTs = ts15;
