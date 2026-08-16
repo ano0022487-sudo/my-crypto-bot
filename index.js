@@ -78,8 +78,15 @@ async function notifyTelegram(text) {
 function utcDay() { return new Date().toISOString().slice(0, 10); }
 function newState() {
   return {
-    version: 2,
-    risk: { day: utcDay(), dailyRealizedPnl: 0, consecutiveLosses: 0, halted: false, processedTradeIds: [], processedClosingOrders: [] },
+    version: 3,
+    risk: {
+      day: utcDay(),
+      dailyRealizedPnl: 0,
+      consecutiveLosses: 0,
+      halted: false,
+      processedTradeIds: [],
+      processedClosingOrders: []
+    },
     audit: []
   };
 }
@@ -89,7 +96,8 @@ function loadState() {
     const parsed = JSON.parse(fs.readFileSync(BOT_STATE_FILE, 'utf8'));
     const fresh = newState();
     return {
-      ...fresh, ...parsed,
+      ...fresh,
+      ...parsed,
       risk: { ...fresh.risk, ...(parsed.risk || {}) },
       audit: Array.isArray(parsed.audit) ? parsed.audit : []
     };
@@ -309,39 +317,77 @@ async function syncTradingState() {
 async function updateDailyPnL() {
   if (DRY_RUN) return;
   resetDailyRiskIfNeeded();
+
   const begin = new Date(`${botState.risk.day}T00:00:00.000Z`).getTime();
   const rows = await privateRequest('GET', `/api/v5/trade/fills-history?${qs({ instType:'SWAP', beginTs:String(begin), limit:'100' })}`);
-  const fills = rows.filter(r => Number(r.fillTime || 0) >= begin);
-  const byOrder = new Map();
+  const fills = rows
+    .filter(r => Number(r.fillTime || 0) >= begin)
+    .sort((a,b) => Number(a.fillTime || 0) - Number(b.fillTime || 0));
+
   let total = 0;
+  const closingByOrder = new Map();
+
   for (const f of fills) {
-    const id = String(f.tradeId || f.billId || `${f.ordId}-${f.fillTime}`);
-    const fee = Number(f.fee || 0);
+    const fillTime = Number(f.fillTime || 0);
+    const tradeId = String(f.tradeId || f.billId || `${f.ordId}-${fillTime}`);
     const pnl = Number(f.fillPnl || 0);
-    total += pnl + fee;
+    const fee = Number(f.fee || 0);
+    const realized = pnl + fee;
+    total += realized;
+
+    if (!botState.risk.processedTradeIds.includes(tradeId)) botState.risk.processedTradeIds.push(tradeId);
+
+    // Only fills with realized PnL are treated as closing events.
+    // Each closing order is one completed trade; its timestamp is the latest
+    // fill time belonging to that order, so the streak follows actual close order.
     if (pnl !== 0 && f.ordId) {
-      const current = byOrder.get(f.ordId) || { pnl:0, lastTime:0 };
-      current.pnl += pnl + fee;
-      current.lastTime = Math.max(current.lastTime, Number(f.fillTime || 0));
-      byOrder.set(f.ordId, current);
+      const ordId = String(f.ordId);
+      const current = closingByOrder.get(ordId) || {
+        ordId,
+        pnl: 0,
+        lastFillTime: 0,
+        instId: f.instId || '',
+        tradeIds: []
+      };
+      current.pnl += realized;
+      current.lastFillTime = Math.max(current.lastFillTime, fillTime);
+      if (tradeId) current.tradeIds.push(tradeId);
+      closingByOrder.set(ordId, current);
     }
-    if (!botState.risk.processedTradeIds.includes(id)) botState.risk.processedTradeIds.push(id);
   }
-  botState.risk.dailyRealizedPnl = total;
-  const closingOrders = [...byOrder.values()].sort((a,b) => b.lastTime - a.lastTime);
+
+  // Sort newest completed trade first. Do NOT sort by PnL, order ID, or object insertion order.
+  const completedTrades = [...closingByOrder.values()]
+    .filter(t => Number.isFinite(t.lastFillTime) && t.lastFillTime > 0)
+    .sort((a,b) => b.lastFillTime - a.lastFillTime);
+
   let streak = 0;
-  for (const item of closingOrders) {
-    if (item.pnl < 0) streak++;
-    else if (item.pnl > 0) break;
+  for (const trade of completedTrades) {
+    if (trade.pnl < 0) {
+      streak += 1;
+      continue;
+    }
+    if (trade.pnl > 0) break;
+    // Exactly zero after fees is ignored rather than breaking the loss streak.
   }
+
+  botState.risk.dailyRealizedPnl = total;
   botState.risk.consecutiveLosses = streak;
-  if (botState.risk.processedTradeIds.length > 1000) botState.risk.processedTradeIds = botState.risk.processedTradeIds.slice(-1000);
-  for (const [ordId] of byOrder) {
-    if (!botState.risk.processedClosingOrders.includes(ordId)) botState.risk.processedClosingOrders.push(ordId);
+
+  for (const trade of completedTrades) {
+    if (!botState.risk.processedClosingOrders.includes(trade.ordId)) {
+      botState.risk.processedClosingOrders.push(trade.ordId);
+    }
   }
+  if (botState.risk.processedTradeIds.length > 1000) botState.risk.processedTradeIds = botState.risk.processedTradeIds.slice(-1000);
   if (botState.risk.processedClosingOrders.length > 500) botState.risk.processedClosingOrders = botState.risk.processedClosingOrders.slice(-500);
-  if (botState.risk.dailyRealizedPnl <= -Math.abs(MAX_DAILY_LOSS_U) || botState.risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) botState.risk.halted = true;
+
+  if (botState.risk.dailyRealizedPnl <= -Math.abs(MAX_DAILY_LOSS_U) || botState.risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
+    botState.risk.halted = true;
+  }
+
   persistState();
+
   const notice = `${botState.risk.dailyRealizedPnl.toFixed(4)}|${botState.risk.consecutiveLosses}|${botState.risk.halted}`;
   if (botState.risk.halted && notice !== lastRiskNotice) {
     lastRiskNotice = notice;
