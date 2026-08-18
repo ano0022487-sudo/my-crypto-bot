@@ -2010,7 +2010,7 @@ async function placeEventOrder(
     candidate.inst;
 
   const tdMode =
-    'cross';
+    'cash';
 
   const tickSz =
     Number(
@@ -2167,7 +2167,7 @@ async function getOrder(
 
   return (
     rows?.[0] ||
-    null
+    null;
   );
 }
 
@@ -2211,7 +2211,7 @@ async function closePosition(
       inst.instId,
 
     tdMode:
-      'cross',
+      'cash',
 
     side:
       'sell',
