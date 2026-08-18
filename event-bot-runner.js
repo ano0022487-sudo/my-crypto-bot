@@ -6,7 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 
-// 確保 Node.js 在執行 /tmp 暫存檔時能正確找到專案內的 node_modules
+// 關鍵修復：把專案根目錄的 node_modules 加入模組搜尋路徑中
 module.paths.push(path.join(__dirname, 'node_modules'));
 
 const source = path.join(__dirname, 'event-bot.js');
