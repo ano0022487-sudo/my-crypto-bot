@@ -1,30 +1,16 @@
 'use strict';
 
-const fs = require('fs');
+// Stable launcher: load event-bot.js directly from the project directory.
+// This avoids copying the source to /tmp or another runtime path, which can
+// break Node module resolution and can run a stale/generated file.
 const path = require('path');
 
 const source = path.join(__dirname, 'event-bot.js');
-const runtime = path.join(__dirname, 'okx-event-bot-runtime.js');
 
 try {
-  if (!fs.existsSync(source)) {
-    throw new Error(`找不到 event-bot.js: ${source}`);
-  }
-
-  let code = fs.readFileSync(source, 'utf8');
-
-  // 事件合約使用 cash，不要自動改成 isolated
-  // 保留 event-bot.js 原始設定
-
-  fs.writeFileSync(runtime, code, 'utf8');
-
-  console.log('[Runner] Successfully generated runtime file.');
-  console.log(`[Runner] Source: ${source}`);
-  console.log(`[Runner] Runtime: ${runtime}`);
-
-  require(runtime);
-
+  console.log(`[Runner] Loading: ${source}`);
+  require(source);
 } catch (err) {
   console.error('[Runner Error]', err);
-  process.exit(1);
+  process.exitCode = 1;
 }
