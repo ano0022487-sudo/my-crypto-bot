@@ -1,3 +1,4 @@
+[file-tag: EventBot_Compounding.js]
 'use strict';
 
 /*
@@ -513,7 +514,7 @@ async function scanCandidates() {
 }
 
 /* =========================================================
-   ORDER EXECUTION (DYNAMIC STAKE)
+   ORDER EXECUTION (FIXED 5 CONTRACTS)
 ========================================================= */
 async function placeEventOrder(candidate, stakeTarget) {
   const inst = candidate.inst;
@@ -524,7 +525,7 @@ async function placeEventOrder(candidate, stakeTarget) {
   }
 
   const px = roundToTick(candidate.entryPx, tickSz);
-  const sz = Math.max(1, Math.floor(stakeTarget / px));
+  const sz = 5;
 
   const body = {
     instId: inst.instId,
@@ -590,17 +591,24 @@ async function closePosition(position, currentPx) {
     return { state: 'filled', avgPx: px, accFillSz: sz, pnl, simulated: true };
   }
 
-  const rows = await privateRequest('POST', '/api/v5/trade/order', body);
-  const result = rows?.[0];
-  if (!result || String(result.sCode) !== '0') {
-    throw new Error(`Exit rejected: ${JSON.stringify(result)}`);
+  try {
+    const rows = await privateRequest('POST', '/api/v5/trade/order', body);
+    const result = rows?.[0];
+    if (!result || String(result.sCode) !== '0') {
+      throw new Error(`Exit rejected: ${JSON.stringify(result)}`);
+    }
+    if (result.ordId) {
+      await sleep(500);
+      const filled = await getOrder(inst.instId, result.ordId);
+      return { ...result, ...filled };
+    }
+    return result;
+  } catch (err) {
+    if (err.message && err.message.includes('51169')) {
+      return { state: 'filled', avgPx: position.entryPx, accFillSz: sz, pnl: 0, simulated: true, forcedClear: true };
+    }
+    throw err;
   }
-  if (result.ordId) {
-    await sleep(500);
-    const filled = await getOrder(inst.instId, result.ordId);
-    return { ...result, ...filled };
-  }
-  return result;
 }
 
 async function managePosition() {
@@ -634,7 +642,7 @@ async function managePosition() {
 async function exitPosition(position, currentPx, reason) {
   const result = await closePosition(position, currentPx);
   const exitPx = Number(result?.avgPx || result?.fillPx || currentPx);
-  const pnl = (exitPx - position.entryPx) * position.sz;
+  const pnl = result?.forcedClear ? 0 : (exitPx - position.entryPx) * position.sz;
 
   state.realizedPnl += pnl;
 
@@ -642,7 +650,6 @@ async function exitPosition(position, currentPx, reason) {
     state.paperEquity = Math.max(0, Number(state.paperEquity || START_CAPITAL) + pnl);
   }
 
-  // MODIFIED: COMPOUND LOGIC
   if (pnl > 0) {
     state.consecutiveLosses = 0;
     state.compoundingCount = (state.compoundingCount || 0) + 1;
@@ -675,24 +682,15 @@ async function exitPosition(position, currentPx, reason) {
   saveState();
 
   await notify(
-    `${pnl >= 0 ? '🟢' : '🔴'} EVENT EXIT
-` +
-    `${position.inst.instId}
-` +
-    `${position.side.toUpperCase()}
-` +
-    `Reason ${reason}
-` +
-    `Entry ${position.entryPx.toFixed(4)}
-` +
-    `Exit ${exitPx.toFixed(4)}
-` +
-    `Contracts ${position.sz}
-` +
-    `PnL ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}U
-` +
-    `Next Stake ${state.nextStake.toFixed(2)}U
-` +
+    `${pnl >= 0 ? '🟢' : '🔴'} EVENT EXIT\n` +
+    `${position.inst.instId}\n` +
+    `${position.side.toUpperCase()}\n` +
+    `Reason ${reason}\n` +
+    `Entry ${position.entryPx.toFixed(4)}\n` +
+    `Exit ${exitPx.toFixed(4)}\n` +
+    `Contracts ${position.sz}\n` +
+    `PnL ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}U\n` +
+    `Next Stake ${state.nextStake.toFixed(2)}U\n` +
     `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
   );
 }
@@ -713,8 +711,7 @@ async function maybeTrade() {
   if (state.realizedPnl <= -dailyLossLimit) {
     state.halted = true;
     saveState();
-    await notify(`⛔ EVENT BOT DAILY LOSS LOCK
-PnL ${state.realizedPnl.toFixed(4)}U`);
+    await notify(`⛔ EVENT BOT DAILY LOSS LOCK\nPnL ${state.realizedPnl.toFixed(4)}U`);
     return;
   }
 
@@ -750,22 +747,14 @@ PnL ${state.realizedPnl.toFixed(4)}U`);
     saveState();
 
     await notify(
-      `🟡 EVENT ENTRY
-` +
-      `${candidate.inst.instId}
-` +
-      `${candidate.side.toUpperCase()}
-` +
-      `Entry ${avgPx.toFixed(4)}
-` +
-      `Contracts ${fillSz}
-` +
-      `Actual ${actualStake.toFixed(4)}U
-` +
-      `Score ${candidate.score}
-` +
-      `Compound LV ${state.compoundingCount}
-` +
+      `🟡 EVENT ENTRY\n` +
+      `${candidate.inst.instId}\n` +
+      `${candidate.side.toUpperCase()}\n` +
+      `Entry ${avgPx.toFixed(4)}\n` +
+      `Contracts ${fillSz}\n` +
+      `Actual ${actualStake.toFixed(4)}U\n` +
+      `Score ${candidate.score}\n` +
+      `Compound LV ${state.compoundingCount}\n` +
       `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
     );
   } catch (err) {
