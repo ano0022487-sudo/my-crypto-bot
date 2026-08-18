@@ -3,11 +3,8 @@
 const fs = require('fs');
 const path = require('path');
 
-// 強制將專案原本的 node_modules 加入 Node.js 搜尋路徑
-module.paths.push(path.join(__dirname, 'node_modules'));
-
 const source = path.join(__dirname, 'event-bot.js');
-const runtime = path.join('/tmp', 'okx-event-bot-runtime.js');
+const runtime = path.join(__dirname, 'okx-event-bot-runtime.js');
 
 try {
   let code = fs.readFileSync(source, 'utf8');
