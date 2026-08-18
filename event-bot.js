@@ -2,7 +2,7 @@
 
 /*
 ===========================================================
- OKX EVENT CONTRACT SNR ROLLING BOT (STAKE 3U FIXED)
+ OKX EVENT CONTRACT SNR ROLLING BOT (FIXED 2 CONTRACTS)
 ===========================================================
 */
 
@@ -75,21 +75,6 @@ const POSITION_CHECK_INTERVAL =
 const START_CAPITAL =
   Number(
     process.env.START_CAPITAL || 20
-  );
-
-const RISK_PCT =
-  Number(
-    process.env.RISK_PCT || 0.10
-  );
-
-const MAX_STAKE_PCT =
-  Number(
-    process.env.MAX_STAKE_PCT || 0.20
-  );
-
-const MIN_STAKE =
-  Number(
-    process.env.MIN_STAKE || 1
   );
 
 const MIN_EDGE =
@@ -1386,40 +1371,6 @@ function getStrike(
   return null;
 }
 
-function roundDown(
-  value,
-  step
-) {
-
-  if (
-    !(step > 0)
-  ) {
-
-    return value;
-  }
-
-  const decimals =
-    Math.max(
-      0,
-      (
-        String(step)
-          .split('.')[1] ||
-        ''
-      ).length
-    );
-
-  return Number(
-    (
-      Math.floor(
-        value / step
-      ) *
-      step
-    ).toFixed(
-      decimals
-    )
-  );
-}
-
 function roundToTick(
   price,
   tick
@@ -1522,12 +1473,6 @@ function modelProbability(
   const rsi5 =
     rsi(
       cl5,
-      14
-    );
-
-  const atr5 =
-    atr(
-      c5,
       14
     );
 
@@ -1695,7 +1640,7 @@ function modelProbability(
 }
 
 /* =========================================================
-   EQUITY & STAKE (3U FIXED)
+   EQUITY
 ========================================================= */
 
 async function getEquity() {
@@ -1760,18 +1705,6 @@ async function getEquity() {
 
   throw new Error(
     'Unable to read USDT equity'
-  );
-}
-
-function stakeForEquity(
-  equity
-) {
-  /*
-    強制鎖定單筆最大資金為 3 枚 USDT
-  */
-  return Math.min(
-    equity,
-    3
   );
 }
 
@@ -2128,12 +2061,11 @@ async function scanCandidates() {
 }
 
 /* =========================================================
-   ORDER EXECUTION
+   ORDER EXECUTION (FIXED 2 CONTRACTS)
 ========================================================= */
 
 async function placeEventOrder(
-  candidate,
-  stake
+  candidate
 ) {
 
   const inst =
@@ -2141,18 +2073,6 @@ async function placeEventOrder(
 
   const tdMode =
     'isolated';
-
-  const lotSz =
-    Number(
-      inst.lotSz ||
-      1
-    );
-
-  const minSz =
-    Number(
-      inst.minSz ||
-      lotSz
-    );
 
   const tickSz =
     Number(
@@ -2174,24 +2094,8 @@ async function placeEventOrder(
     );
   }
 
-  const rawSz =
-    stake /
-    candidate.entryPx;
-
-  let sz =
-    roundDown(
-      rawSz,
-      lotSz
-    );
-
-  if (
-    sz <
-    minSz
-  ) {
-
-    sz =
-      minSz;
-  }
+  // 固定買進兩張合約
+  const sz = 2;
 
   const px =
     roundToTick(
@@ -2807,26 +2711,11 @@ async function maybeTrade() {
   const candidate =
     candidates[0];
 
-  const stake =
-    stakeForEquity(
-      equity
-    );
-
-  if (
-    !(
-      stake > 0
-    )
-  ) {
-
-    return;
-  }
-
   try {
 
     const order =
       await placeEventOrder(
-        candidate,
-        stake
+        candidate
       );
 
     let filled =
@@ -2897,9 +2786,6 @@ async function maybeTrade() {
 
       stake:
         actualStake,
-
-      requestedStake:
-        stake,
 
       score:
         candidate.score,
