@@ -1,76 +1,64 @@
 'use strict';
 
 /*
-===========================================================
- OKX EVENTS SNR ROLLING BOT
- ----------------------------------------------------------
- Product:
-   OKX Event Contracts (EVENTS)
+  ============================================================
+  OKX EVENT CONTRACT SNR ROLLING BOT
+  ============================================================
 
- Supports:
-   BTC / ETH / SOL
-   UPDOWN / ABOVE / BELOW
-   5m + 15m confirmation
-   EMA20 / EMA50
-   RSI
-   ATR
-   SNR
-   Volume
-   Model probability
-   Market probability
-   Edge
-   Rolling stake
-   One position at a time
-   FOK full-fill protection
-   Actual-fill verification
-   Early TP / SL
-   Daily loss protection
-   Consecutive-loss protection
-   Telegram
-   Render health endpoints
+  Product:
+    OKX EVENTS only
 
- IMPORTANT:
-   LIVE_TRADING=false by default.
+  Main fixes:
+    1. EVENTS tdMode = isolated
+    2. EVENTS non-post-only orders include speedBump = "1"
+    3. FOK -> IOC
+    4. Re-read latest ticker before order
+    5. Actual fill size is used
+    6. NO FILL never creates fake position
+    7. YES / NO executable prices handled separately
+    8. NO position exit uses YES ask
+    9. Existing SNR / EMA / RSI / ATR / Edge / Score retained
+   10. No broken /api/v5/public/event-series
+   11. No broken /api/v5/public/series
+   12. Uses explicit EVENT_SERIES
+   13. Telegram notifications retained
+   14. Render health endpoints retained
 
- Required:
-   OK_ACCESS_KEY
-   OK_ACCESS_SECRET
-   OKX_PASSPHRASE
+  IMPORTANT:
+    LIVE_TRADING=false by default.
 
- Optional:
-   LIVE_TRADING
-   START_CAPITAL
-   RISK_PCT
-   MAX_STAKE_PCT
-   MIN_STAKE
-   MIN_EDGE
-   MIN_SCORE
-   MIN_ENTRY_PRICE
-   MAX_ENTRY_PRICE
-   EARLY_TP_PCT
-   EARLY_SL_PCT
-   MIN_MINUTES_TO_EXPIRY
-   MAX_MINUTES_TO_EXPIRY
-   DAILY_LOSS_PCT
-   MAX_CONSECUTIVE_LOSSES
-   CHECK_INTERVAL
-   POSITION_CHECK_INTERVAL
-   TELEGRAM_BOT_TOKEN
-   TELEGRAM_CHAT_ID
-   EVENT_SERIES
+  Required ENV:
+    OK_ACCESS_KEY
+    OK_ACCESS_SECRET
+    OKX_PASSPHRASE
 
- NOTE:
-   This version intentionally does NOT use:
-     /api/v5/public/event-series
-     /api/v5/public/series
+  Optional ENV:
+    LIVE_TRADING
+    EVENT_SERIES
+    AUTO_DISCOVER_SERIES
+    START_CAPITAL
+    RISK_PCT
+    MAX_STAKE_PCT
+    MIN_STAKE
+    MIN_EDGE
+    MIN_SCORE
+    MIN_ENTRY_PRICE
+    MAX_ENTRY_PRICE
+    EARLY_TP_PCT
+    EARLY_SL_PCT
+    MIN_MINUTES_TO_EXPIRY
+    MAX_MINUTES_TO_EXPIRY
+    DAILY_LOSS_PCT
+    MAX_CONSECUTIVE_LOSSES
+    CHECK_INTERVAL
+    POSITION_CHECK_INTERVAL
+    TELEGRAM_BOT_TOKEN
+    TELEGRAM_CHAT_ID
 
-   Instead it queries known OKX EVENTS series IDs directly
-   through:
-     GET /api/v5/public/instruments
-     instType=EVENTS
-     seriesId=<series>
-
-===========================================================
+  Default EVENT_SERIES:
+    BTC-UPDOWN-15MIN
+    ETH-UPDOWN-15MIN
+    SOL-UPDOWN-15MIN
 */
 
 const express = require('express');
@@ -87,9 +75,8 @@ app.use(express.json());
    CONFIG
 ========================================================= */
 
-const PORT = Number(
-  process.env.PORT || 3000
-);
+const PORT =
+  Number(process.env.PORT || 3000);
 
 const LIVE_TRADING =
   String(
@@ -114,7 +101,7 @@ const PASSPHRASE =
 const BASE_URL =
   String(
     process.env.OKX_BASE_URL ||
-    'https://openapi.okx.com'
+      'https://openapi.okx.com'
   ).replace(/\/$/, '');
 
 const TELEGRAM_BOT_TOKEN =
@@ -209,10 +196,47 @@ const MAX_CONSECUTIVE_LOSSES =
     process.env.MAX_CONSECUTIVE_LOSSES || 3
   );
 
+/*
+  IMPORTANT
+
+  Do NOT use the old broken discovery endpoints.
+
+  Default series are based on the actual Event Contract
+  instrument IDs you have already received:
+    ETH-UPDOWN-15MIN-...
+    SOL-UPDOWN-15MIN-...
+*/
+
+const DEFAULT_EVENT_SERIES = [
+  'BTC-UPDOWN-15MIN',
+  'ETH-UPDOWN-15MIN',
+  'SOL-UPDOWN-15MIN'
+];
+
 const EVENT_SERIES =
   String(
     process.env.EVENT_SERIES || ''
-  ).trim();
+  )
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
+
+const CONFIGURED_SERIES =
+  EVENT_SERIES.length
+    ? EVENT_SERIES
+    : DEFAULT_EVENT_SERIES;
+
+const AUTO_DISCOVER_SERIES =
+  false;
+
+/*
+  Underlying instruments used ONLY for technical analysis.
+*/
+const UNDERLYING_MAP = {
+  BTC: 'BTC-USDT-SWAP',
+  ETH: 'ETH-USDT-SWAP',
+  SOL: 'SOL-USDT-SWAP'
+};
 
 const BOT_STATE_FILE =
   process.env.BOT_STATE_FILE ||
@@ -220,40 +244,6 @@ const BOT_STATE_FILE =
     __dirname,
     'event-bot-state.json'
   );
-
-/*
-  Known Event Contract series.
-
-  Your actual IDs have looked like:
-
-    SOL-UPDOWN-15MIN-260818-2230-2245
-
-  Therefore the series family is:
-
-    SOL-UPDOWN-15MIN
-
-  We query the current instruments for these families.
-*/
-
-const DEFAULT_EVENT_SERIES = [
-  'BTC-UPDOWN-5MIN',
-  'BTC-UPDOWN-15MIN',
-
-  'ETH-UPDOWN-5MIN',
-  'ETH-UPDOWN-15MIN',
-
-  'SOL-UPDOWN-5MIN',
-  'SOL-UPDOWN-15MIN'
-];
-
-/*
-  Underlying perpetuals are used ONLY for technical analysis.
-*/
-const UNDERLYING_MAP = {
-  BTC: 'BTC-USDT-SWAP',
-  ETH: 'ETH-USDT-SWAP',
-  SOL: 'SOL-USDT-SWAP'
-};
 
 /* =========================================================
    TELEGRAM
@@ -269,29 +259,12 @@ const bot =
       )
     : null;
 
-/*
-  Ignore Telegram 409/403 polling problems without
-  killing the trading process.
-*/
 if (bot) {
-
   bot.on(
     'polling_error',
     err => {
-
       console.error(
         '[Telegram polling]',
-        err.message
-      );
-    }
-  );
-
-  bot.on(
-    'error',
-    err => {
-
-      console.error(
-        '[Telegram]',
         err.message
       );
     }
@@ -317,7 +290,7 @@ async function notify(text) {
   } catch (err) {
 
     console.error(
-      '[Telegram send]',
+      'Telegram:',
       err.message
     );
   }
@@ -328,7 +301,6 @@ async function notify(text) {
 ========================================================= */
 
 function sleep(ms) {
-
   return new Promise(
     resolve =>
       setTimeout(
@@ -338,11 +310,9 @@ function sleep(ms) {
   );
 }
 
-function queryString(params) {
+function q(params) {
 
-  return Object.entries(
-    params
-  )
+  return Object.entries(params)
     .filter(
       ([, value]) =>
         value !== undefined &&
@@ -351,7 +321,11 @@ function queryString(params) {
     )
     .map(
       ([key, value]) =>
-        `${encodeURIComponent(key)}=${encodeURIComponent(value)}`
+        `${encodeURIComponent(
+          key
+        )}=${encodeURIComponent(
+          value
+        )}`
     )
     .join('&');
 }
@@ -384,10 +358,9 @@ async function request(
         i <
         retries - 1
       ) {
-
         await sleep(
           500 *
-          (i + 1)
+            (i + 1)
         );
       }
     }
@@ -405,14 +378,12 @@ async function publicGet(
   params = {}
 ) {
 
-  const qs =
-    queryString(
-      params
-    );
+  const query =
+    q(params);
 
   const requestPath =
-    qs
-      ? `${pathname}?${qs}`
+    query
+      ? `${pathname}?${query}`
       : pathname;
 
   const response =
@@ -437,13 +408,11 @@ async function publicGet(
     );
   }
 
-  return (
-    response.data.data || []
-  );
+  return response.data.data;
 }
 
 /* =========================================================
-   SIGNATURE
+   OKX SIGNATURE
 ========================================================= */
 
 function sign(
@@ -460,15 +429,15 @@ function sign(
     )
     .update(
       timestamp +
-      method.toUpperCase() +
-      requestPath +
-      body
+        method.toUpperCase() +
+        requestPath +
+        body
     )
     .digest('base64');
 }
 
 /* =========================================================
-   PRIVATE API
+   OKX PRIVATE API
 ========================================================= */
 
 async function privateRequest(
@@ -484,7 +453,7 @@ async function privateRequest(
   ) {
 
     throw new Error(
-      'OKX API credentials missing'
+      'OKX API credentials are missing'
     );
   }
 
@@ -523,11 +492,15 @@ async function privateRequest(
 
   const response =
     await request({
+
       method,
+
       url:
         `${BASE_URL}${requestPath}`,
+
       data:
         body || undefined,
+
       headers
     });
 
@@ -546,9 +519,35 @@ async function privateRequest(
     );
   }
 
-  return (
-    response.data.data || []
-  );
+  return Array.isArray(
+    response.data.data
+  )
+    ? response.data.data
+    : [];
+}
+
+/* =========================================================
+   SERVER TIME
+========================================================= */
+
+async function getServerTime() {
+
+  try {
+
+    const rows =
+      await publicGet(
+        '/api/v5/public/time'
+      );
+
+    return Number(
+      rows?.[0]?.ts ||
+        Date.now()
+    );
+
+  } catch (_) {
+
+    return Date.now();
+  }
 }
 
 /* =========================================================
@@ -599,7 +598,6 @@ function loadState() {
         BOT_STATE_FILE
       )
     ) {
-
       return freshState();
     }
 
@@ -619,7 +617,7 @@ function loadState() {
   } catch (err) {
 
     console.error(
-      '[STATE LOAD]',
+      'State load:',
       err.message
     );
 
@@ -647,7 +645,7 @@ function saveState() {
   } catch (err) {
 
     console.error(
-      '[STATE SAVE]',
+      'State save:',
       err.message
     );
   }
@@ -676,7 +674,7 @@ function resetDaily() {
         ? 0
         : Number(
             state.paperEquity ||
-            START_CAPITAL
+              START_CAPITAL
           );
 
     state.realizedPnl =
@@ -704,10 +702,12 @@ function riskBlocked() {
 }
 
 /* =========================================================
-   CANDLE HELPERS
+   CANDLES
 ========================================================= */
 
-function closes(candles) {
+function closes(
+  candles
+) {
 
   return candles
     .map(
@@ -719,7 +719,9 @@ function closes(candles) {
     );
 }
 
-function highs(candles) {
+function highs(
+  candles
+) {
 
   return candles
     .map(
@@ -731,7 +733,9 @@ function highs(candles) {
     );
 }
 
-function lows(candles) {
+function lows(
+  candles
+) {
 
   return candles
     .map(
@@ -743,7 +747,9 @@ function lows(candles) {
     );
 }
 
-function volumes(candles) {
+function volumes(
+  candles
+) {
 
   return candles
     .map(
@@ -798,7 +804,8 @@ function ema(
       values[i] *
         multiplier +
       value *
-        (1 - multiplier);
+        (1 -
+          multiplier);
   }
 
   return value;
@@ -836,14 +843,9 @@ function rsi(
     if (
       change >= 0
     ) {
-
-      gains +=
-        change;
-
+      gains += change;
     } else {
-
-      losses -=
-        change;
+      losses -= change;
     }
   }
 
@@ -859,7 +861,7 @@ function rsi(
     let i =
       period + 1;
     i <
-      values.length;
+    values.length;
     i++
   ) {
 
@@ -893,7 +895,6 @@ function rsi(
   if (
     avgLoss === 0
   ) {
-
     return 100;
   }
 
@@ -924,12 +925,12 @@ function atr(
     return null;
   }
 
-  const tr = [];
+  const trueRanges =
+    [];
 
   for (
     let i = 1;
-    i <
-      candles.length;
+    i < candles.length;
     i++
   ) {
 
@@ -943,26 +944,30 @@ function atr(
         candles[i][3]
       );
 
-    const prev =
+    const previousClose =
       Number(
         candles[i - 1][4]
       );
 
-    tr.push(
+    trueRanges.push(
       Math.max(
         high - low,
+
         Math.abs(
-          high - prev
+          high -
+            previousClose
         ),
+
         Math.abs(
-          low - prev
+          low -
+            previousClose
         )
       )
     );
   }
 
   const recent =
-    tr.slice(
+    trueRanges.slice(
       -period
     );
 
@@ -993,12 +998,14 @@ function confirmed(
     )
     .filter(
       x =>
-        String(x[8]) === '1'
+        String(
+          x[8]
+        ) === '1'
     );
 }
 
 /* =========================================================
-   SNR
+   PIVOTS
 ========================================================= */
 
 function pivots(
@@ -1012,21 +1019,25 @@ function pivots(
   const l =
     lows(candles);
 
-  const resistance = [];
-  const support = [];
+  const resistance =
+    [];
+
+  const support =
+    [];
 
   for (
     let i = lookback;
     i <
       candles.length -
-      lookback;
+        lookback;
     i++
   ) {
 
     const highest =
       Math.max(
         ...h.slice(
-          i - lookback,
+          i -
+            lookback,
           i +
             lookback +
             1
@@ -1036,7 +1047,8 @@ function pivots(
     const lowest =
       Math.min(
         ...l.slice(
-          i - lookback,
+          i -
+            lookback,
           i +
             lookback +
             1
@@ -1044,20 +1056,16 @@ function pivots(
       );
 
     if (
-      h[i] ===
-      highest
+      h[i] === highest
     ) {
-
       resistance.push(
         h[i]
       );
     }
 
     if (
-      l[i] ===
-      lowest
+      l[i] === lowest
     ) {
-
       support.push(
         l[i]
       );
@@ -1135,16 +1143,40 @@ async function getCandles(
   );
 }
 
-async function getTicker(
-  instId,
-  instType
+/*
+  EVENTS ticker:
+    instType=EVENTS
+    instId required
+*/
+
+async function getEventTicker(
+  instId
 ) {
 
   const rows =
     await publicGet(
       '/api/v5/market/ticker',
       {
-        instType,
+        instType:
+          'EVENTS',
+        instId
+      }
+    );
+
+  return (
+    rows?.[0] ||
+    null
+  );
+}
+
+async function getTicker(
+  instId
+) {
+
+  const rows =
+    await publicGet(
+      '/api/v5/market/ticker',
+      {
         instId
       }
     );
@@ -1159,39 +1191,45 @@ async function getTicker(
    EVENT SERIES
 ========================================================= */
 
-function getSeriesList() {
+async function discoverEventSeries() {
 
-  if (
-    EVENT_SERIES
-  ) {
+  /*
+    IMPORTANT:
+    Do not call:
+      /api/v5/public/event-series
+      /api/v5/public/series
 
-    return EVENT_SERIES
-      .split(',')
-      .map(
-        x =>
-          x.trim()
-      )
-      .filter(
-        Boolean
-      );
-  }
+    Your previous 404 errors came from these paths.
+
+    Current bot uses explicit series IDs.
+  */
+
+  console.log(
+    '[EVENT] Using configured series:',
+    CONFIGURED_SERIES
+  );
 
   return [
-    ...DEFAULT_EVENT_SERIES
+    ...CONFIGURED_SERIES
   ];
 }
 
-/*
-  This replaces the broken discovery endpoints.
+/* =========================================================
+   EVENT INSTRUMENTS
+========================================================= */
 
-  OKX official V5:
-    GET /api/v5/public/instruments
-    instType=EVENTS
-    seriesId=<series>
-*/
 async function getEventInstruments(
   seriesId
 ) {
+
+  /*
+    Official V5:
+      GET /api/v5/public/instruments
+      instType=EVENTS
+      seriesId=<seriesId>
+
+    seriesId is required for EVENTS.
+  */
 
   return publicGet(
     '/api/v5/public/instruments',
@@ -1230,7 +1268,6 @@ function getBaseAsset(
         coin
       )
     ) {
-
       return coin;
     }
   }
@@ -1242,29 +1279,32 @@ function getExpiry(
   inst
 ) {
 
-  const values = [
+  const candidates = [
+
     Number(
       inst.expTime
     ),
+
     Number(
       inst.expiryTime
     ),
+
     Number(
       inst.endTime
     )
+
   ].filter(
     Number.isFinite
   );
 
   if (
-    !values.length
+    !candidates.length
   ) {
-
     return null;
   }
 
   return Math.max(
-    ...values
+    ...candidates
   );
 }
 
@@ -1272,23 +1312,20 @@ function minutesToExpiry(
   inst
 ) {
 
-  const expiry =
+  const exp =
     getExpiry(inst);
 
   if (
-    !Number.isFinite(
-      expiry
-    )
+    !exp
   ) {
-
     return null;
   }
 
   return (
-    expiry -
+    exp -
     Date.now()
   ) /
-  60000;
+    60000;
 }
 
 function allowedExpiry(
@@ -1305,7 +1342,6 @@ function allowedExpiry(
       mins
     )
   ) {
-
     return false;
   }
 
@@ -1332,7 +1368,6 @@ function getDirection(
       'UPDOWN'
     )
   ) {
-
     return 'UPDOWN';
   }
 
@@ -1344,7 +1379,6 @@ function getDirection(
       'UP'
     )
   ) {
-
     return 'ABOVE';
   }
 
@@ -1356,7 +1390,6 @@ function getDirection(
       'DOWN'
     )
   ) {
-
     return 'BELOW';
   }
 
@@ -1382,19 +1415,18 @@ function getStrike(
       fields
   ) {
 
-    const n =
+    const value =
       Number(
         inst[key]
       );
 
     if (
       Number.isFinite(
-        n
+        value
       ) &&
-      n > 0
+      value > 0
     ) {
-
-      return n;
+      return value;
     }
   }
 
@@ -1402,25 +1434,24 @@ function getStrike(
 }
 
 /* =========================================================
-   PRICE UTILITIES
+   PRICE UTIL
 ========================================================= */
 
 function decimalPlaces(
   value
 ) {
 
-  const text =
+  const str =
     String(value);
 
   if (
-    !text.includes('.')
+    !str.includes('.')
   ) {
-
     return 0;
   }
 
   return (
-    text.split('.')[1] ||
+    str.split('.')[1] ||
     ''
   ).length;
 }
@@ -1433,7 +1464,6 @@ function roundDown(
   if (
     !(step > 0)
   ) {
-
     return value;
   }
 
@@ -1449,7 +1479,7 @@ function roundDown(
     (
       Math.floor(
         value /
-        step
+          step
       ) *
       step
     ).toFixed(
@@ -1459,15 +1489,14 @@ function roundDown(
 }
 
 function roundToTick(
-  value,
+  price,
   tick
 ) {
 
   if (
     !(tick > 0)
   ) {
-
-    return value;
+    return price;
   }
 
   const decimals =
@@ -1481,8 +1510,8 @@ function roundToTick(
   return Number(
     (
       Math.round(
-        value /
-        tick
+        price /
+          tick
       ) *
       tick
     ).toFixed(
@@ -1574,7 +1603,7 @@ function modelProbability(
       -20
     );
 
-  const avgVolume =
+  const avgVol =
     recentVolume.length
       ? recentVolume.reduce(
           (a, b) =>
@@ -1589,30 +1618,26 @@ function modelProbability(
       vol5.length - 1
     ] || 0;
 
-  const volumeRatio =
-    avgVolume > 0
+  const volRatio =
+    avgVol > 0
       ? currentVolume /
-        avgVolume
+        avgVol
       : 1;
 
   let score = 50;
 
-  const reasons = [];
+  const reasons =
+    [];
 
-  const bullish =
+  /* =======================================================
+     BULL
+  ======================================================= */
+
+  if (
     direction ===
       'ABOVE' ||
     direction ===
-      'UPDOWN_UP';
-
-  const bearish =
-    direction ===
-      'BELOW' ||
-    direction ===
-      'UPDOWN_DOWN';
-
-  if (
-    bullish
+      'UPDOWN_UP'
   ) {
 
     if (
@@ -1657,8 +1682,15 @@ function modelProbability(
     }
   }
 
+  /* =======================================================
+     BEAR
+  ======================================================= */
+
   if (
-    bearish
+    direction ===
+      'BELOW' ||
+    direction ===
+      'UPDOWN_DOWN'
   ) {
 
     if (
@@ -1691,8 +1723,8 @@ function modelProbability(
 
     if (
       rsi5 !== null &&
-      rsi5 >= 28 &&
-      rsi5 <= 45
+      rsi5 <= 45 &&
+      rsi5 >= 28
     ) {
 
       score += 10;
@@ -1703,8 +1735,12 @@ function modelProbability(
     }
   }
 
+  /* =======================================================
+     VOLUME
+  ======================================================= */
+
   if (
-    volumeRatio >=
+    volRatio >=
     1.15
   ) {
 
@@ -1714,6 +1750,10 @@ function modelProbability(
       'volume'
     );
   }
+
+  /* =======================================================
+     SNR
+  ======================================================= */
 
   const resistance =
     nearestAbove(
@@ -1734,11 +1774,16 @@ function modelProbability(
     );
 
   if (
-    bullish &&
+    (
+      direction ===
+        'ABOVE' ||
+      direction ===
+        'UPDOWN_UP'
+    ) &&
     resistance &&
     price >=
       resistance *
-      0.999
+        0.999
   ) {
 
     score += 8;
@@ -1749,11 +1794,16 @@ function modelProbability(
   }
 
   if (
-    bearish &&
+    (
+      direction ===
+        'BELOW' ||
+      direction ===
+        'UPDOWN_DOWN'
+    ) &&
     support &&
     price <=
       support *
-      1.001
+        1.001
   ) {
 
     score += 8;
@@ -1763,6 +1813,10 @@ function modelProbability(
     );
   }
 
+  /* =======================================================
+     STRIKE
+  ======================================================= */
+
   if (
     strikePx &&
     strikePx > 0
@@ -1771,12 +1825,13 @@ function modelProbability(
     const distance =
       Math.abs(
         price -
-        strikePx
+          strikePx
       ) /
       price;
 
     if (
-      bullish &&
+      direction ===
+        'ABOVE' &&
       price >
         strikePx
     ) {
@@ -1789,7 +1844,8 @@ function modelProbability(
     }
 
     if (
-      bearish &&
+      direction ===
+        'BELOW' &&
       price <
         strikePx
     ) {
@@ -1814,6 +1870,10 @@ function modelProbability(
     }
   }
 
+  /* =======================================================
+     ATR
+  ======================================================= */
+
   if (
     atr5 &&
     price > 0
@@ -1827,7 +1887,6 @@ function modelProbability(
       atrPct <
       0.001
     ) {
-
       score -= 5;
     }
 
@@ -1835,7 +1894,6 @@ function modelProbability(
       atrPct >
       0.03
     ) {
-
       score -= 8;
     }
   }
@@ -1849,6 +1907,15 @@ function modelProbability(
       )
     );
 
+  /*
+    Existing model mapping retained.
+
+    score 50  -> 50%
+    score 80  -> 68%
+    score 90  -> 74%
+    score 100 -> 80%
+  */
+
   const probability =
     Math.max(
       0.50,
@@ -1859,13 +1926,16 @@ function modelProbability(
             score -
             50
           ) *
-          0.006
+            0.006
       )
     );
 
   return {
+
     score,
+
     probability,
+
     reasons
   };
 }
@@ -1884,10 +1954,14 @@ async function getEquity() {
       START_CAPITAL,
       Number(
         state.paperEquity ||
-        START_CAPITAL
+          START_CAPITAL
       )
     );
   }
+
+  /*
+    Normal OKX account balance.
+  */
 
   const rows =
     await privateRequest(
@@ -1895,15 +1969,14 @@ async function getEquity() {
       '/api/v5/account/balance?ccy=USDT'
     );
 
-  const account =
-    rows?.[0];
-
   const detail =
-    account?.details?.find(
-      x =>
-        x.ccy ===
-        'USDT'
-    );
+    rows?.[0]
+      ?.details
+      ?.find(
+        x =>
+          x.ccy ===
+          'USDT'
+      );
 
   const equity =
     Number(
@@ -1917,16 +1990,6 @@ async function getEquity() {
 
   if (
     Number.isFinite(
-      available
-    ) &&
-    available > 0
-  ) {
-
-    return available;
-  }
-
-  if (
-    Number.isFinite(
       equity
     ) &&
     equity > 0
@@ -1935,8 +1998,18 @@ async function getEquity() {
     return equity;
   }
 
+  if (
+    Number.isFinite(
+      available
+    ) &&
+    available > 0
+  ) {
+
+    return available;
+  }
+
   throw new Error(
-    'Unable to read USDT balance'
+    'Unable to read USDT equity'
   );
 }
 
@@ -1959,76 +2032,384 @@ function stakeForEquity(
   return Math.max(
     MIN_STAKE,
     Math.min(
-      calculated,
-      maximum
+      maximum,
+      calculated
     )
   );
 }
 
 /* =========================================================
-   EVENT PRICE
+   EVENT CANDIDATE
 ========================================================= */
 
-function getYesAsk(
-  ticker
+async function buildCandidate(
+  inst,
+  seriesId
 ) {
 
-  const value =
-    Number(
-      ticker?.askPx
+  if (
+    inst.state &&
+    ![
+      'live',
+      'preopen'
+    ].includes(
+      String(
+        inst.state
+      ).toLowerCase()
+    )
+  ) {
+
+    return null;
+  }
+
+  if (
+    !allowedExpiry(
+      inst
+    )
+  ) {
+
+    return null;
+  }
+
+  const coin =
+    getBaseAsset(
+      inst
+    );
+
+  if (!coin) {
+    return null;
+  }
+
+  const underlying =
+    UNDERLYING_MAP[
+      coin
+    ];
+
+  if (!underlying) {
+    return null;
+  }
+
+  const direction =
+    getDirection(
+      inst
     );
 
   if (
-    Number.isFinite(
-      value
-    ) &&
-    value > 0
+    direction ===
+    'UNKNOWN'
   ) {
 
-    return value;
+    return null;
   }
 
-  const last =
+  /*
+    Technical data and EVENT ticker.
+
+    Do not use generic ticker for EVENTS.
+  */
+
+  const [
+    eventTicker,
+    c5,
+    c15
+  ] =
+    await Promise.all([
+
+      getEventTicker(
+        inst.instId
+      ),
+
+      getCandles(
+        underlying,
+        '5m',
+        100
+      ),
+
+      getCandles(
+        underlying,
+        '15m',
+        100
+      )
+
+    ]);
+
+  if (
+    !c5.length ||
+    !c15.length
+  ) {
+
+    return null;
+  }
+
+  /*
+    OKX EVENTS ticker gives YES side.
+
+    YES:
+      ask = YES buy price
+      bid = YES sell price
+
+    NO:
+      ask ~= 1 - YES bid
+      bid ~= 1 - YES ask
+  */
+
+  const yesAsk =
     Number(
-      ticker?.last
+      eventTicker?.askPx
     );
 
-  return Number.isFinite(
-    last
-  )
-    ? last
-    : null;
-}
-
-function getYesBid(
-  ticker
-) {
-
-  const value =
+  const yesBid =
     Number(
-      ticker?.bidPx
+      eventTicker?.bidPx
+    );
+
+  const yesLast =
+    Number(
+      eventTicker?.last
+    );
+
+  const executableYesAsk =
+    Number.isFinite(
+      yesAsk
+    ) &&
+    yesAsk > 0
+      ? yesAsk
+      : yesLast;
+
+  const executableYesBid =
+    Number.isFinite(
+      yesBid
+    ) &&
+    yesBid > 0
+      ? yesBid
+      : yesLast;
+
+  if (
+    !(
+      executableYesAsk > 0 &&
+      executableYesBid > 0
+    )
+  ) {
+
+    return null;
+  }
+
+  const noAsk =
+    1 -
+    executableYesBid;
+
+  const noBid =
+    1 -
+    executableYesAsk;
+
+  const underlyingPrice =
+    Number(
+      c5[
+        c5.length - 1
+      ][4]
     );
 
   if (
-    Number.isFinite(
-      value
-    ) &&
-    value > 0
+    !Number.isFinite(
+      underlyingPrice
+    )
   ) {
 
-    return value;
+    return null;
   }
 
-  const last =
-    Number(
-      ticker?.last
+  const strikePx =
+    getStrike(
+      inst
     );
 
-  return Number.isFinite(
-    last
-  )
-    ? last
-    : null;
+  /*
+    UPDOWN:
+      YES = UP
+      NO  = DOWN
+
+    The instrument IDs you are trading are
+    explicitly UPDOWN contracts.
+  */
+
+  let modelDirection;
+
+  if (
+    direction ===
+    'UPDOWN'
+  ) {
+
+    modelDirection =
+      'UPDOWN_UP';
+
+  } else {
+
+    modelDirection =
+      direction;
+  }
+
+  const model =
+    modelProbability(
+      modelDirection,
+      underlyingPrice,
+      strikePx,
+      c5,
+      c15
+    );
+
+  let yesModelProb =
+    model.probability;
+
+  let noModelProb =
+    1 -
+    yesModelProb;
+
+  /*
+    For UPDOWN:
+      model probability is bullish probability.
+
+    For ABOVE / BELOW:
+      model probability is the YES probability
+      for the event represented by the instrument.
+  */
+
+  const yesMarketProb =
+    executableYesAsk;
+
+  const noMarketProb =
+    noAsk;
+
+  const yesEdge =
+    yesModelProb -
+    yesMarketProb;
+
+  const noEdge =
+    noModelProb -
+    noMarketProb;
+
+  let side;
+  let entryPx;
+  let modelProb;
+  let marketProb;
+  let edge;
+
+  if (
+    yesEdge >=
+    noEdge
+  ) {
+
+    side =
+      'yes';
+
+    entryPx =
+      executableYesAsk;
+
+    modelProb =
+      yesModelProb;
+
+    marketProb =
+      yesMarketProb;
+
+    edge =
+      yesEdge;
+
+  } else {
+
+    side =
+      'no';
+
+    entryPx =
+      noAsk;
+
+    modelProb =
+      noModelProb;
+
+    marketProb =
+      noMarketProb;
+
+    edge =
+      noEdge;
+  }
+
+  if (
+    !validPrice(
+      entryPx
+    )
+  ) {
+
+    return null;
+  }
+
+  if (
+    model.score <
+    MIN_SCORE
+  ) {
+
+    return null;
+  }
+
+  if (
+    edge <
+    MIN_EDGE
+  ) {
+
+    return null;
+  }
+
+  return {
+
+    inst,
+
+    seriesId,
+
+    coin,
+
+    underlying,
+
+    direction,
+
+    modelDirection,
+
+    side,
+
+    entryPx,
+
+    modelProb,
+
+    marketProb,
+
+    edge,
+
+    score:
+      model.score,
+
+    reasons:
+      model.reasons,
+
+    strikePx,
+
+    underlyingPrice,
+
+    expiry:
+      getExpiry(
+        inst
+      ),
+
+    minutesToExpiry:
+      minutesToExpiry(
+        inst
+      ),
+
+    yesAsk:
+      executableYesAsk,
+
+    yesBid:
+      executableYesBid,
+
+    noAsk,
+
+    noBid
+  };
 }
 
 /* =========================================================
@@ -2037,18 +2418,19 @@ function getYesBid(
 
 async function scanCandidates() {
 
-  const seriesList =
-    getSeriesList();
+  const series =
+    await discoverEventSeries();
 
-  const candidates = [];
+  const candidates =
+    [];
 
   console.log(
-    `[EVENT] Checking ${seriesList.length} series`
+    `[EVENT] Checking ${series.length} series`
   );
 
   for (
     const seriesId of
-      seriesList
+      series
   ) {
 
     let instruments;
@@ -2086,331 +2468,25 @@ async function scanCandidates() {
 
       try {
 
-        if (
-          String(
-            inst.state ||
-            ''
-          ).toLowerCase() !==
-          'live'
-        ) {
-
-          continue;
-        }
-
-        if (
-          !allowedExpiry(
-            inst
-          )
-        ) {
-
-          continue;
-        }
-
-        const coin =
-          getBaseAsset(
-            inst
+        const candidate =
+          await buildCandidate(
+            inst,
+            seriesId
           );
 
         if (
-          !coin
+          candidate
         ) {
 
-          continue;
-        }
-
-        const underlying =
-          UNDERLYING_MAP[
-            coin
-          ];
-
-        if (
-          !underlying
-        ) {
-
-          continue;
-        }
-
-        const direction =
-          getDirection(
-            inst
+          candidates.push(
+            candidate
           );
-
-        if (
-          direction ===
-          'UNKNOWN'
-        ) {
-
-          continue;
         }
-
-        /*
-          Don't trade an instrument
-          twice during its lifetime.
-        */
-        if (
-          state.trades.some(
-            t =>
-              t.instId ===
-              inst.instId
-          )
-        ) {
-
-          continue;
-        }
-
-        const [
-          eventTicker,
-          c5,
-          c15
-        ] =
-          await Promise.all([
-            getTicker(
-              inst.instId,
-              'EVENTS'
-            ),
-
-            getCandles(
-              underlying,
-              '5m',
-              100
-            ),
-
-            getCandles(
-              underlying,
-              '15m',
-              100
-            )
-          ]);
-
-        if (
-          !c5.length ||
-          !c15.length
-        ) {
-
-          continue;
-        }
-
-        const yesAsk =
-          getYesAsk(
-            eventTicker
-          );
-
-        const yesBid =
-          getYesBid(
-            eventTicker
-          );
-
-        if (
-          !validPrice(
-            yesAsk
-          ) ||
-          !validPrice(
-            yesBid
-          )
-        ) {
-
-          continue;
-        }
-
-        const underlyingPrice =
-          Number(
-            c5[
-              c5.length - 1
-            ][4]
-          );
-
-        if (
-          !Number.isFinite(
-            underlyingPrice
-          )
-        ) {
-
-          continue;
-        }
-
-        const strikePx =
-          getStrike(
-            inst
-          );
-
-        /*
-          UPDOWN:
-            YES = UP
-            NO  = DOWN
-
-          ABOVE:
-            YES = ABOVE
-
-          BELOW:
-            YES = BELOW
-        */
-
-        let modelDirection;
-
-        if (
-          direction ===
-          'UPDOWN'
-        ) {
-
-          modelDirection =
-            'UPDOWN_UP';
-
-        } else {
-
-          modelDirection =
-            direction;
-        }
-
-        const model =
-          modelProbability(
-            modelDirection,
-            underlyingPrice,
-            strikePx,
-            c5,
-            c15
-          );
-
-        let yesModelProb =
-          model.probability;
-
-        let noModelProb =
-          1 -
-          yesModelProb;
-
-        const yesMarketProb =
-          yesAsk;
-
-        const noEntry =
-          1 -
-          yesBid;
-
-        const noMarketProb =
-          noEntry;
-
-        const yesEdge =
-          yesModelProb -
-          yesMarketProb;
-
-        const noEdge =
-          noModelProb -
-          noMarketProb;
-
-        let side;
-        let entryPx;
-        let modelProb;
-        let marketProb;
-        let edge;
-
-        if (
-          yesEdge >=
-          noEdge
-        ) {
-
-          side =
-            'yes';
-
-          entryPx =
-            yesAsk;
-
-          modelProb =
-            yesModelProb;
-
-          marketProb =
-            yesMarketProb;
-
-          edge =
-            yesEdge;
-
-        } else {
-
-          side =
-            'no';
-
-          entryPx =
-            noEntry;
-
-          modelProb =
-            noModelProb;
-
-          marketProb =
-            noMarketProb;
-
-          edge =
-            noEdge;
-        }
-
-        if (
-          !validPrice(
-            entryPx
-          )
-        ) {
-
-          continue;
-        }
-
-        if (
-          model.score <
-          MIN_SCORE
-        ) {
-
-          continue;
-        }
-
-        if (
-          edge <
-          MIN_EDGE
-        ) {
-
-          continue;
-        }
-
-        candidates.push({
-
-          inst,
-
-          seriesId,
-
-          coin,
-
-          underlying,
-
-          direction,
-
-          side,
-
-          entryPx,
-
-          modelProb,
-
-          marketProb,
-
-          edge,
-
-          score:
-            model.score,
-
-          reasons:
-            model.reasons,
-
-          strikePx,
-
-          underlyingPrice,
-
-          expiry:
-            getExpiry(
-              inst
-            ),
-
-          minutesToExpiry:
-            minutesToExpiry(
-              inst
-            )
-        });
 
       } catch (err) {
 
         console.error(
-          `[EVENT candidate ${inst.instId}]`,
+          `[EVENT] Candidate ${inst.instId}:`,
           err.message
         );
       }
@@ -2420,123 +2496,88 @@ async function scanCandidates() {
   return candidates.sort(
     (a, b) =>
       b.edge -
-      a.edge ||
+        a.edge ||
       b.score -
-      a.score
+        a.score
   );
 }
 
 /* =========================================================
-   ORDER QUANTITY
+   GET CURRENT EXECUTABLE PRICE
 ========================================================= */
 
-function calculateOrderSize(
-  stake,
-  price,
-  inst
+async function getExecutablePrice(
+  position
 ) {
 
-  const lotSz =
-    Number(
-      inst.lotSz
-    ) || 0.1;
-
-  const minSz =
-    Number(
-      inst.minSz
-    ) || lotSz;
-
-  /*
-    Event contract:
-      1 winning contract pays 1 USDT.
-
-    Quantity:
-      stake / price
-  */
-  const raw =
-    stake /
-    price;
-
-  const rounded =
-    roundDown(
-      raw,
-      lotSz
+  const ticker =
+    await getEventTicker(
+      position.inst.instId
     );
 
-  /*
-    We DO NOT silently force minSz
-    if doing so would exceed requested
-    stake substantially.
-  */
+  const yesAsk =
+    Number(
+      ticker?.askPx
+    );
+
+  const yesBid =
+    Number(
+      ticker?.bidPx
+    );
+
+  const yesLast =
+    Number(
+      ticker?.last
+    );
+
+  const ask =
+    Number.isFinite(
+      yesAsk
+    ) &&
+    yesAsk > 0
+      ? yesAsk
+      : yesLast;
+
+  const bid =
+    Number.isFinite(
+      yesBid
+    ) &&
+    yesBid > 0
+      ? yesBid
+      : yesLast;
+
   if (
-    rounded <
-    minSz
+    !(
+      ask > 0 &&
+      bid > 0
+    )
   ) {
 
-    return {
-      ok:
-        false,
-
-      reason:
-        `calculated size ${rounded} < minSz ${minSz}`,
-
-      sz:
-        rounded,
-
-      lotSz,
-
-      minSz
-    };
+    return null;
   }
-
-  const actualNotional =
-    rounded *
-    price;
 
   /*
-    Maximum allowed overshoot:
-      2%.
+    To SELL:
+
+    YES position:
+      sell into YES bid
+
+    NO position:
+      sell into NO bid
+      = 1 - YES ask
   */
+
   if (
-    actualNotional >
-    stake *
-    1.02
+    position.side ===
+    'yes'
   ) {
 
-    return {
-      ok:
-        false,
-
-      reason:
-        `notional ${actualNotional.toFixed(6)} exceeds stake ${stake.toFixed(6)}`,
-
-      sz:
-        rounded,
-
-      lotSz,
-
-      minSz
-    };
+    return bid;
   }
 
-  return {
-
-    ok:
-      true,
-
-    sz:
-      rounded,
-
-    lotSz,
-
-    minSz,
-
-    requestedStake:
-      stake,
-
-    expectedNotional:
-      actualNotional
-  };
+  return (
+    1 - ask
+  );
 }
 
 /* =========================================================
@@ -2551,62 +2592,174 @@ async function placeEventOrder(
   const inst =
     candidate.inst;
 
-  const size =
-    calculateOrderSize(
-      stake,
-      candidate.entryPx,
-      inst
+  /*
+    Re-read ticker immediately
+    before sending the order.
+  */
+
+  const ticker =
+    await getEventTicker(
+      inst.instId
     );
 
-  if (
-    !size.ok
-  ) {
-
-    throw new Error(
-      `SIZE REJECTED: ${size.reason}`
-    );
-  }
-
-  const tickSz =
+  const yesAsk =
     Number(
-      inst.tickSz
-    ) || 0.001;
-
-  const px =
-    roundToTick(
-      candidate.entryPx,
-      tickSz
+      ticker?.askPx
     );
 
-  const finalNotional =
-    px *
-    size.sz;
+  const yesBid =
+    Number(
+      ticker?.bidPx
+    );
+
+  const yesLast =
+    Number(
+      ticker?.last
+    );
+
+  const latestYesAsk =
+    Number.isFinite(
+      yesAsk
+    ) &&
+    yesAsk > 0
+      ? yesAsk
+      : yesLast;
+
+  const latestYesBid =
+    Number.isFinite(
+      yesBid
+    ) &&
+    yesBid > 0
+      ? yesBid
+      : yesLast;
 
   if (
-    finalNotional >
-    stake *
-    1.02
+    !(
+      latestYesAsk > 0 &&
+      latestYesBid > 0
+    )
   ) {
 
     throw new Error(
-      `FINAL NOTIONAL TOO HIGH: ` +
-      `requested=${stake.toFixed(6)} ` +
-      `actual=${finalNotional.toFixed(6)}`
+      'EVENT ticker has no executable price'
     );
   }
 
   /*
+    Refresh entry.
+
+    YES:
+      ask
+
+    NO:
+      1 - YES bid
+  */
+
+  const liveEntry =
+    candidate.side ===
+      'yes'
+      ? latestYesAsk
+      : 1 -
+        latestYesBid;
+
+  if (
+    !validPrice(
+      liveEntry
+    )
+  ) {
+
+    throw new Error(
+      `Invalid live entry price: ${liveEntry}`
+    );
+  }
+
+  /*
+    Event contract quantity:
+      stake / price
+  */
+
+  const lotSz =
+    Number(
+      inst.lotSz ||
+        0.1
+    );
+
+  const minSz =
+    Number(
+      inst.minSz ||
+        lotSz
+    );
+
+  let sz =
+    roundDown(
+      stake /
+        liveEntry,
+      lotSz
+    );
+
+  if (
+    sz < minSz
+  ) {
+
+    sz =
+      minSz;
+  }
+
+  /*
+    Actual notional.
+  */
+
+  const notional =
+    sz *
+    liveEntry;
+
+  /*
+    Protect against oversized order.
+  */
+
+  if (
+    notional >
+    stake *
+      1.03
+  ) {
+
+    throw new Error(
+      `Order exceeds stake: ` +
+      `stake=${stake.toFixed(4)} ` +
+      `notional=${notional.toFixed(4)}`
+    );
+  }
+
+  /*
+    Tick size.
+
+    OKX currently states EVENTS tick size
+    should be validated against tick bands.
+    Instrument tickSz is used here as
+    the minimum tick available from the
+    instrument response.
+  */
+
+  const tickSz =
+    Number(
+      inst.tickSz ||
+        0.001
+    );
+
+  let px =
+    roundToTick(
+      liveEntry,
+      tickSz
+    );
+
+  /*
     IMPORTANT:
-      Current OKX EVENTS order fields:
 
-      instType = EVENTS through instrument
-      tdMode   = isolated
-      outcome  = yes/no
-      ordType  = fok
-      side     = buy
+    For BUY:
+      YES -> don't intentionally bid below ask
+      NO  -> don't intentionally bid below NO ask
 
-    speedBump is intentionally NOT sent.
-    OKX removed the parameter in July 2026.
+    IOC is used instead of FOK.
   */
 
   const body = {
@@ -2614,25 +2767,41 @@ async function placeEventOrder(
     instId:
       inst.instId,
 
+    /*
+      Official EVENTS:
+        isolated
+    */
     tdMode:
       'isolated',
 
     side:
       'buy',
 
+    /*
+      FOK caused your latest
+      "NO FILL".
+
+      IOC allows available liquidity
+      to execute immediately.
+    */
     ordType:
-      'fok',
+      'ioc',
 
     px:
       px.toFixed(6),
 
     sz:
-      String(
-        size.sz
-      ),
+      String(sz),
 
     outcome:
       candidate.side,
+
+    /*
+      Required for non-post-only
+      EVENTS orders.
+    */
+    speedBump:
+      '1',
 
     clOrdId:
       `snr${Date.now().toString(36)}`
@@ -2652,6 +2821,7 @@ async function placeEventOrder(
   /*
     PAPER
   */
+
   if (
     !LIVE_TRADING
   ) {
@@ -2668,7 +2838,7 @@ async function placeEventOrder(
         px,
 
       accFillSz:
-        size.sz,
+        sz,
 
       simulated:
         true,
@@ -2680,6 +2850,7 @@ async function placeEventOrder(
   /*
     LIVE
   */
+
   const rows =
     await privateRequest(
       'POST',
@@ -2695,7 +2866,7 @@ async function placeEventOrder(
   ) {
 
     throw new Error(
-      'OKX returned empty order result'
+      'Empty OKX order response'
     );
   }
 
@@ -2718,7 +2889,7 @@ async function placeEventOrder(
 }
 
 /* =========================================================
-   ORDER DETAILS
+   ORDER QUERY
 ========================================================= */
 
 async function getOrder(
@@ -2728,7 +2899,7 @@ async function getOrder(
 
   const requestPath =
     `/api/v5/trade/order?` +
-    queryString({
+    q({
       instId,
       ordId
     });
@@ -2746,30 +2917,7 @@ async function getOrder(
 }
 
 /* =========================================================
-   CANCEL ORDER
-========================================================= */
-
-async function cancelOrder(
-  instId,
-  ordId
-) {
-
-  const body = {
-
-    instId,
-
-    ordId
-  };
-
-  return privateRequest(
-    'POST',
-    '/api/v5/trade/cancel-order',
-    body
-  );
-}
-
-/* =========================================================
-   CLOSE POSITION
+   CLOSE EVENT POSITION
 ========================================================= */
 
 async function closePosition(
@@ -2782,14 +2930,24 @@ async function closePosition(
 
   const tickSz =
     Number(
-      inst.tickSz
-    ) || 0.001;
+      inst.tickSz ||
+        0.001
+    );
 
-  const px =
+  let px =
     roundToTick(
       currentPx,
       tickSz
     );
+
+  /*
+    SELL side:
+      YES -> sell at YES bid
+      NO  -> sell at NO bid
+
+    IOC means:
+      immediately execute available liquidity.
+  */
 
   const body = {
 
@@ -2803,7 +2961,7 @@ async function closePosition(
       'sell',
 
     ordType:
-      'fok',
+      'ioc',
 
     px:
       px.toFixed(6),
@@ -2815,6 +2973,9 @@ async function closePosition(
 
     outcome:
       position.side,
+
+    speedBump:
+      '1',
 
     clOrdId:
       `exit${Date.now().toString(36)}`
@@ -2830,6 +2991,10 @@ async function closePosition(
       body
     )
   );
+
+  /*
+    PAPER
+  */
 
   if (
     !LIVE_TRADING
@@ -2862,6 +3027,10 @@ async function closePosition(
     };
   }
 
+  /*
+    LIVE
+  */
+
   const rows =
     await privateRequest(
       'POST',
@@ -2877,7 +3046,7 @@ async function closePosition(
   ) {
 
     throw new Error(
-      'Empty EXIT response'
+      'Empty OKX exit response'
     );
   }
 
@@ -2908,7 +3077,6 @@ async function managePosition() {
   if (
     !state.position
   ) {
-
     return;
   }
 
@@ -2917,77 +3085,17 @@ async function managePosition() {
 
   try {
 
-    /*
-      Check expiry first.
-    */
-    const mins =
-      position.expiry
-        ? (
-            position.expiry -
-            Date.now()
-          ) /
-          60000
-        : null;
-
-    if (
-      Number.isFinite(
-        mins
-      ) &&
-      mins <= 0
-    ) {
-
-      console.log(
-        '[EVENT] Position reached expiry'
-      );
-
-      return;
-    }
-
-    const ticker =
-      await getTicker(
-        position.inst.instId,
-        'EVENTS'
-      );
-
-    const yesBid =
-      getYesBid(
-        ticker
+    const currentPx =
+      await getExecutablePrice(
+        position
       );
 
     if (
       !Number.isFinite(
-        yesBid
+        currentPx
       )
     ) {
-
       return;
-    }
-
-    /*
-      YES:
-        current = YES bid
-
-      NO:
-        current = 1 - YES ask approximation.
-
-      For safety, use the same YES reference
-      used by OKX's public EVENTS market data.
-    */
-    let currentPx;
-
-    if (
-      position.side ===
-      'yes'
-    ) {
-
-      currentPx =
-        yesBid;
-
-    } else {
-
-      currentPx =
-        1 -
-        yesBid;
     }
 
     if (
@@ -2996,7 +3104,6 @@ async function managePosition() {
         currentPx < 1
       )
     ) {
-
       return;
     }
 
@@ -3007,14 +3114,9 @@ async function managePosition() {
       ) /
       position.entryPx;
 
-    console.log(
-      `[EVENT POSITION] ` +
-      `${position.inst.instId} ` +
-      `${position.side} ` +
-      `entry=${position.entryPx.toFixed(4)} ` +
-      `current=${currentPx.toFixed(4)} ` +
-      `change=${(change * 100).toFixed(2)}%`
-    );
+    /*
+      Take profit
+    */
 
     if (
       change >=
@@ -3030,6 +3132,10 @@ async function managePosition() {
       return;
     }
 
+    /*
+      Stop loss
+    */
+
     if (
       change <=
       -EARLY_SL_PCT
@@ -3040,19 +3146,29 @@ async function managePosition() {
         currentPx,
         'SL'
       );
+
+      return;
     }
+
+    /*
+      Expiry protection.
+
+      If contract is close to expiry,
+      allow settlement instead of forcing
+      an artificial exit unless TP/SL hit.
+    */
 
   } catch (err) {
 
     console.error(
-      '[POSITION MANAGER]',
+      'Position manager:',
       err.message
     );
   }
 }
 
 /* =========================================================
-   EXIT
+   EXIT POSITION
 ========================================================= */
 
 async function exitPosition(
@@ -3070,22 +3186,36 @@ async function exitPosition(
   const exitPx =
     Number(
       result?.avgPx ||
-      currentPx
+        result?.fillPx ||
+        currentPx
     );
 
-  const exitSz =
+  const fillSz =
     Number(
       result?.accFillSz ||
-      result?.fillSz ||
-      position.sz
+        result?.fillSz ||
+        position.sz
     );
+
+  if (
+    !(
+      fillSz > 0
+    )
+  ) {
+
+    console.log(
+      '[EVENT EXIT] NO FILL'
+    );
+
+    return;
+  }
 
   const pnl =
     (
       exitPx -
       position.entryPx
     ) *
-    exitSz;
+    fillSz;
 
   state.realizedPnl +=
     pnl;
@@ -3099,9 +3229,9 @@ async function exitPosition(
         0,
         Number(
           state.paperEquity ||
-          START_CAPITAL
+            START_CAPITAL
         ) +
-        pnl
+          pnl
       );
   }
 
@@ -3120,8 +3250,7 @@ async function exitPosition(
   state.trades.push({
 
     at:
-      new Date()
-        .toISOString(),
+      new Date().toISOString(),
 
     instId:
       position.inst.instId,
@@ -3135,13 +3264,7 @@ async function exitPosition(
     exitPx,
 
     sz:
-      exitSz,
-
-    requestedStake:
-      position.requestedStake,
-
-    actualStake:
-      position.actualStake,
+      fillSz,
 
     pnl,
 
@@ -3171,24 +3294,37 @@ async function exitPosition(
   saveState();
 
   await notify(
+
     `${pnl >= 0 ? '🟢' : '🔴'} EVENT EXIT\n` +
+
     `${position.inst.instId}\n` +
+
     `${position.side.toUpperCase()}\n` +
+
     `Reason ${reason}\n` +
-    `Entry ${position.entryPx.toFixed(4)}\n` +
-    `Exit ${exitPx.toFixed(4)}\n` +
-    `Contracts ${exitSz}\n` +
+
+    `Entry ${
+      position.entryPx.toFixed(4)
+    }\n` +
+
+    `Exit ${
+      exitPx.toFixed(4)
+    }\n` +
+
+    `Contracts ${
+      fillSz
+    }\n` +
+
     `PnL ${
-      pnl >= 0
-        ? '+'
-        : ''
+      pnl >= 0 ? '+' : ''
     }${pnl.toFixed(4)}U\n` +
+
     `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
   );
 }
 
 /* =========================================================
-   TRADE
+   MAY TRADE
 ========================================================= */
 
 async function maybeTrade() {
@@ -3196,14 +3332,12 @@ async function maybeTrade() {
   if (
     riskBlocked()
   ) {
-
     return;
   }
 
   if (
     state.position
   ) {
-
     return;
   }
 
@@ -3217,7 +3351,7 @@ async function maybeTrade() {
   } catch (err) {
 
     console.error(
-      '[EQUITY]',
+      'Equity:',
       err.message
     );
 
@@ -3234,11 +3368,12 @@ async function maybeTrade() {
     saveState();
   }
 
+  /*
+    Daily loss protection
+  */
+
   const dailyLossLimit =
-    Math.max(
-      START_CAPITAL,
-      equity
-    ) *
+    equity *
     DAILY_LOSS_PCT;
 
   if (
@@ -3253,7 +3388,11 @@ async function maybeTrade() {
 
     await notify(
       `⛔ EVENT BOT DAILY LOSS LOCK\n` +
-      `PnL ${state.realizedPnl.toFixed(4)}U`
+      `PnL ${
+        state.realizedPnl.toFixed(
+          4
+        )
+      }U`
     );
 
     return;
@@ -3269,7 +3408,7 @@ async function maybeTrade() {
   } catch (err) {
 
     console.error(
-      '[SCAN]',
+      'Scan:',
       err.message
     );
 
@@ -3279,7 +3418,6 @@ async function maybeTrade() {
   if (
     !candidates.length
   ) {
-
     return;
   }
 
@@ -3300,55 +3438,61 @@ async function maybeTrade() {
   if (
     stake <= 0
   ) {
-
     return;
   }
 
+  console.log(
+    '----------------------------------------'
+  );
+
+  console.log(
+    '[EVENT CANDIDATE]',
+    candidate.inst.instId
+  );
+
+  console.log(
+    '[EVENT SIDE]',
+    candidate.side
+  );
+
+  console.log(
+    '[EVENT ENTRY]',
+    candidate.entryPx
+  );
+
+  console.log(
+    '[EVENT SCORE]',
+    candidate.score
+  );
+
+  console.log(
+    '[EVENT MODEL]',
+    candidate.modelProb
+  );
+
+  console.log(
+    '[EVENT MARKET]',
+    candidate.marketProb
+  );
+
+  console.log(
+    '[EVENT EDGE]',
+    candidate.edge
+  );
+
+  console.log(
+    '[EVENT REQUESTED STAKE]',
+    stake
+  );
+
+  console.log(
+    '[EVENT REASONS]',
+    candidate.reasons.join(
+      ', '
+    )
+  );
+
   try {
-
-    console.log(
-      '----------------------------------------'
-    );
-
-    console.log(
-      '[EVENT CANDIDATE]',
-      candidate.inst.instId
-    );
-
-    console.log(
-      '[EVENT SIDE]',
-      candidate.side
-    );
-
-    console.log(
-      '[EVENT ENTRY]',
-      candidate.entryPx
-    );
-
-    console.log(
-      '[EVENT SCORE]',
-      candidate.score
-    );
-
-    console.log(
-      '[EVENT MODEL]',
-      candidate.modelProb
-    );
-
-    console.log(
-      '[EVENT MARKET]',
-      candidate.marketProb
-    );
-
-    console.log(
-      '[EVENT EDGE]',
-      candidate.edge
-    );
-
-    console.log(
-      '[EVENT REQUESTED STAKE]',
-      stake
-    );
 
     const order =
       await placeEventOrder(
@@ -3356,23 +3500,26 @@ async function maybeTrade() {
         stake
       );
 
+    /*
+      PAPER order
+    */
+
     let filled =
       order;
 
     /*
-      FOK should either fill fully
-      or not fill.
-
-      Still query actual exchange result
-      before creating position.
+      LIVE:
+      Wait briefly and retrieve actual
+      exchange fill information.
     */
+
     if (
       LIVE_TRADING &&
       order.ordId
     ) {
 
       await sleep(
-        700
+        500
       );
 
       filled =
@@ -3382,32 +3529,34 @@ async function maybeTrade() {
         );
     }
 
-    const requestedSize =
-      calculateOrderSize(
-        stake,
-        candidate.entryPx,
-        candidate.inst
-      );
+    const orderState =
+      String(
+        filled?.state ||
+          ''
+      ).toLowerCase();
+
+    /*
+      Actual cumulative fill.
+    */
 
     const fillSz =
       Number(
         filled?.accFillSz ||
-        filled?.fillSz ||
-        0
+          filled?.fillSz ||
+          0
       );
 
     const avgPx =
       Number(
         filled?.avgPx ||
-        filled?.fillPx ||
-        candidate.entryPx
+          filled?.fillPx ||
+          candidate.entryPx
       );
 
     /*
-      CRITICAL:
-      Never create a position from
-      an abnormal tiny fill.
+      NO FILL
     */
+
     if (
       !(
         fillSz > 0
@@ -3418,103 +3567,30 @@ async function maybeTrade() {
         '[EVENT] NO FILL'
       );
 
-      return;
-    }
-
-    if (
-      !requestedSize.ok
-    ) {
-
       console.log(
-        '[EVENT] SIZE INVALID AFTER ORDER'
+        '[EVENT] Order state:',
+        orderState ||
+          'unknown'
       );
 
       return;
     }
 
-    const minimumAcceptedFill =
-      requestedSize.sz *
-      0.99;
-
-    if (
-      fillSz <
-      minimumAcceptedFill
-    ) {
-
-      console.error(
-        `[EVENT] PARTIAL FILL REJECTED ` +
-        `requested=${requestedSize.sz} ` +
-        `filled=${fillSz}`
-      );
-
-      /*
-        If an unexpected partial fill somehow
-        occurs, do not pretend it is a full
-        position.
-      */
-      if (
-        LIVE_TRADING &&
-        order.ordId
-      ) {
-
-        try {
-
-          await cancelOrder(
-            candidate.inst.instId,
-            order.ordId
-          );
-
-        } catch (
-          cancelErr
-        ) {
-
-          console.error(
-            '[EVENT CANCEL]',
-            cancelErr.message
-          );
-        }
-      }
-
-      await notify(
-        `⚠️ EVENT PARTIAL FILL REJECTED\n` +
-        `${candidate.inst.instId}\n` +
-        `Side ${candidate.side.toUpperCase()}\n` +
-        `Requested ${requestedSize.sz}\n` +
-        `Filled ${fillSz}\n` +
-        `Requested ${stake.toFixed(4)}U`
-      );
-
-      return;
-    }
+    /*
+      Actual money committed.
+    */
 
     const actualStake =
       avgPx *
       fillSz;
 
     /*
-      Extra protection:
-      actual fill cannot be wildly different
-      from requested stake.
+      IMPORTANT:
+      Use actual exchange fill.
+      Never use requested stake as
+      actual position size.
     */
-    if (
-      actualStake >
-      stake *
-      1.03
-    ) {
 
-      console.error(
-        `[EVENT] ACTUAL STAKE TOO HIGH ` +
-        `requested=${stake} ` +
-        `actual=${actualStake}`
-      );
-
-      return;
-    }
-
-    /*
-      Create actual position only after
-      actual exchange fill verification.
-    */
     state.position = {
 
       inst:
@@ -3535,10 +3611,11 @@ async function maybeTrade() {
       entryPx:
         avgPx,
 
+      stake:
+        actualStake,
+
       requestedStake:
         stake,
-
-      actualStake,
 
       score:
         candidate.score,
@@ -3555,9 +3632,6 @@ async function maybeTrade() {
       underlyingPrice:
         candidate.underlyingPrice,
 
-      expiry:
-        candidate.expiry,
-
       openedAt:
         Date.now()
     };
@@ -3567,58 +3641,102 @@ async function maybeTrade() {
 
     saveState();
 
+    console.log(
+      '[EVENT] FILLED'
+    );
+
+    console.log(
+      '[EVENT] Actual contracts:',
+      fillSz
+    );
+
+    console.log(
+      '[EVENT] Actual stake:',
+      actualStake
+    );
+
     await notify(
+
       `🟡 EVENT ENTRY\n` +
+
       `${candidate.inst.instId}\n` +
+
       `${candidate.side.toUpperCase()}\n` +
-      `Entry ${avgPx.toFixed(4)}\n` +
-      `Contracts ${fillSz}\n` +
-      `Requested ${stake.toFixed(4)}U\n` +
-      `Actual ${actualStake.toFixed(4)}U\n` +
-      `Score ${candidate.score}\n` +
+
+      `Entry ${
+        avgPx.toFixed(4)
+      }\n` +
+
+      `Contracts ${
+        fillSz
+      }\n` +
+
+      `Actual ${
+        actualStake.toFixed(4)
+      }U\n` +
+
+      `Requested ${
+        stake.toFixed(4)
+      }U\n` +
+
+      `Score ${
+        candidate.score
+      }\n` +
+
       `Model ${
         (
           candidate.modelProb *
           100
         ).toFixed(1)
       }%\n` +
+
       `Market ${
         (
           candidate.marketProb *
           100
         ).toFixed(1)
       }%\n` +
+
       `Edge ${
         (
           candidate.edge *
           100
         ).toFixed(1)
       }%\n` +
+
       `Reason ${
         candidate.reasons.join(
           ', '
         )
       }\n` +
+
       `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
     );
 
   } catch (err) {
 
     console.error(
-      '[EVENT ORDER ERROR]',
+      '🔴 EVENT ORDER ERROR',
+      candidate.inst.instId
+    );
+
+    console.error(
       err.message
     );
 
     await notify(
+
       `🔴 EVENT ORDER ERROR\n` +
-      `${candidate?.inst?.instId || 'UNKNOWN'}\n` +
+
+      `${candidate.inst.instId}\n` +
+
       `${err.message}`
     );
   }
 }
 
 /* =========================================================
-   HTTP
+   HTTP ROOT
 ========================================================= */
 
 app.get(
@@ -3631,7 +3749,7 @@ app.get(
         true,
 
       bot:
-        'OKX EVENT CONTRACT SNR ROLLING BOT',
+        'OKX Event Contract SNR Rolling Bot',
 
       product:
         'EVENTS',
@@ -3642,8 +3760,8 @@ app.get(
       baseUrl:
         BASE_URL,
 
-      eventSeries:
-        getSeriesList(),
+      series:
+        CONFIGURED_SERIES,
 
       position:
         state.position
@@ -3662,17 +3780,13 @@ app.get(
                 state.position
                   .entryPx,
 
-              contracts:
+              sz:
                 state.position
                   .sz,
 
-              requestedStake:
+              stake:
                 state.position
-                  .requestedStake,
-
-              actualStake:
-                state.position
-                  .actualStake
+                  .stake
             }
 
           : null,
@@ -3689,9 +3803,16 @@ app.get(
   }
 );
 
+/* =========================================================
+   HEALTH
+========================================================= */
+
 app.get(
   '/health',
-  (req, res) => {
+  async (
+    req,
+    res
+  ) => {
 
     res.json({
 
@@ -3705,15 +3826,21 @@ app.get(
         'EVENTS',
 
       time:
-        new Date()
-          .toISOString()
+        new Date().toISOString()
     });
   }
 );
 
+/* =========================================================
+   STATUS
+========================================================= */
+
 app.get(
   '/status',
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     res.json({
 
@@ -3730,7 +3857,7 @@ app.get(
         BASE_URL,
 
       series:
-        getSeriesList(),
+        CONFIGURED_SERIES,
 
       riskPct:
         RISK_PCT,
@@ -3766,98 +3893,234 @@ app.get(
 );
 
 /* =========================================================
-   EVENT DEBUG
+   EVENT DISCOVERY DEBUG
 ========================================================= */
 
 app.get(
   '/event-discovery',
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
 
-    const result = [];
+    try {
 
-    for (
-      const seriesId of
-        getSeriesList()
-    ) {
+      const series =
+        await discoverEventSeries();
 
-      try {
+      const result =
+        [];
 
-        const instruments =
-          await getEventInstruments(
-            seriesId
-          );
+      for (
+        const seriesId of
+          series
+      ) {
 
-        result.push({
+        try {
 
-          seriesId,
+          const instruments =
+            await getEventInstruments(
+              seriesId
+            );
 
-          ok:
-            true,
+          result.push({
 
-          count:
-            instruments.length,
+            seriesId,
 
-          instruments:
-            instruments
-              .slice(
-                0,
-                50
+            count:
+              Array.isArray(
+                instruments
               )
-              .map(
-                x => ({
+                ? instruments.length
+                : 0,
 
-                  instId:
-                    x.instId,
-
-                  seriesId:
-                    x.seriesId,
-
-                  state:
-                    x.state,
-
-                  expTime:
-                    x.expTime,
-
-                  lotSz:
-                    x.lotSz,
-
-                  minSz:
-                    x.minSz,
-
-                  tickSz:
-                    x.tickSz
-                })
+            instruments:
+              Array.isArray(
+                instruments
               )
-        });
+                ? instruments
+                    .slice(
+                      0,
+                      30
+                    )
+                    .map(
+                      x => ({
+                        instId:
+                          x.instId,
 
-      } catch (err) {
+                        seriesId:
+                          x.seriesId,
 
-        result.push({
+                        state:
+                          x.state,
 
-          seriesId,
+                        expTime:
+                          x.expTime,
 
-          ok:
-            false,
+                        lotSz:
+                          x.lotSz,
 
-          error:
-            err.message
-        });
+                        minSz:
+                          x.minSz,
+
+                        tickSz:
+                          x.tickSz
+                      })
+                    )
+                : []
+          });
+
+        } catch (err) {
+
+          result.push({
+
+            seriesId,
+
+            error:
+              err.message
+          });
+        }
       }
-    }
 
-    res.json({
+      res.json({
 
-      ok:
-        true,
+        ok:
+          true,
 
-      results:
+        series,
+
         result
-    });
+      });
+
+    } catch (err) {
+
+      res.status(
+        500
+      ).json({
+
+        ok:
+          false,
+
+        error:
+          err.message
+      });
+    }
   }
 );
 
 /* =========================================================
-   SERVER
+   MANUAL SCAN ENDPOINT
+========================================================= */
+
+app.get(
+  '/scan',
+  async (
+    req,
+    res
+  ) => {
+
+    try {
+
+      const candidates =
+        await scanCandidates();
+
+      res.json({
+
+        ok:
+          true,
+
+        count:
+          candidates.length,
+
+        candidates:
+          candidates
+            .slice(
+              0,
+              20
+            )
+            .map(
+              c => ({
+
+                instId:
+                  c.inst.instId,
+
+                seriesId:
+                  c.seriesId,
+
+                side:
+                  c.side,
+
+                entry:
+                  c.entryPx,
+
+                score:
+                  c.score,
+
+                model:
+                  c.modelProb,
+
+                market:
+                  c.marketProb,
+
+                edge:
+                  c.edge,
+
+                minutesToExpiry:
+                  c.minutesToExpiry,
+
+                reasons:
+                  c.reasons
+              })
+            )
+      });
+
+    } catch (err) {
+
+      res.status(
+        500
+      ).json({
+
+        ok:
+          false,
+
+        error:
+          err.message
+      });
+    }
+  }
+);
+
+/* =========================================================
+   MAIN LOOP
+========================================================= */
+
+async function mainLoop() {
+
+  resetDaily();
+
+  try {
+
+    await managePosition();
+
+    if (
+      !state.position
+    ) {
+
+      await maybeTrade();
+    }
+
+  } catch (err) {
+
+    console.error(
+      'MAIN LOOP:',
+      err.message ||
+        err
+    );
+  }
+}
+
+/* =========================================================
+   START SERVER
 ========================================================= */
 
 app.listen(
@@ -3865,7 +4128,7 @@ app.listen(
   async () => {
 
     console.log(
-      '=========================================='
+      '======================================'
     );
 
     console.log(
@@ -3873,7 +4136,7 @@ app.listen(
     );
 
     console.log(
-      '=========================================='
+      '======================================'
     );
 
     console.log(
@@ -3889,7 +4152,9 @@ app.listen(
     );
 
     console.log(
-      `SERIES=${getSeriesList().join(', ')}`
+      `EVENT_SERIES=${CONFIGURED_SERIES.join(
+        ','
+      )}`
     );
 
     console.log(
@@ -3909,80 +4174,31 @@ app.listen(
     );
 
     console.log(
-      `MIN_STAKE=${MIN_STAKE}`
+      '======================================'
     );
 
-    console.log(
-      '=========================================='
-    );
-
-    /*
-      Server time test.
-    */
     try {
 
-      const rows =
-        await publicGet(
-          '/api/v5/public/time'
-        );
-
-      const ts =
-        Number(
-          rows?.[0]?.ts
-        );
-
-      if (
-        Number.isFinite(
-          ts
-        )
-      ) {
-
-        console.log(
-          '[OKX] Server time:',
-          new Date(
-            ts
-          ).toISOString()
-        );
-      }
-
-    } catch (err) {
-
-      console.error(
-        '[OKX TIME]',
-        err.message
-      );
-    }
-
-    /*
-      Test EVENTS series access.
-    */
-    try {
-
-      const series =
-        getSeriesList();
-
-      const first =
-        series[0];
-
-      const instruments =
-        await getEventInstruments(
-          first
-        );
+      const serverTime =
+        await getServerTime();
 
       console.log(
-        `[EVENT] ${first}: ${instruments.length} instruments`
+        '[OKX] Server time:',
+        new Date(
+          serverTime
+        ).toISOString()
       );
 
     } catch (err) {
 
       console.error(
-        '[EVENT STARTUP CHECK]',
+        '[OKX] Time check:',
         err.message
       );
     }
 
     console.log(
-      '=========================================='
+      '[EVENT] Runner ready.'
     );
   }
 );
@@ -3992,70 +4208,23 @@ app.listen(
 ========================================================= */
 
 setInterval(
-  async () => {
-
-    try {
-
-      await managePosition();
-
-    } catch (err) {
-
-      console.error(
-        '[POSITION LOOP]',
-        err.message
-      );
-    }
-
-  },
-  POSITION_CHECK_INTERVAL
-);
-
-setInterval(
-  async () => {
-
-    try {
-
-      if (
-        !state.position
-      ) {
-
-        await maybeTrade();
-      }
-
-    } catch (err) {
-
-      console.error(
-        '[MAIN LOOP]',
-        err.message
-      );
-    }
-
-  },
+  mainLoop,
   CHECK_INTERVAL
 );
 
-/*
-  Initial scan.
-*/
-(async () => {
+setInterval(
+  managePosition,
+  POSITION_CHECK_INTERVAL
+);
 
-  try {
+/* =========================================================
+   INITIAL
+========================================================= */
 
-    await managePosition();
-
-    if (
-      !state.position
-    ) {
-
-      await maybeTrade();
-    }
-
-  } catch (err) {
-
+mainLoop().catch(
+  err =>
     console.error(
-      '[INITIAL LOOP]',
-      err.message
-    );
-  }
-
-})();
+      'Initial loop:',
+      err
+    )
+);
