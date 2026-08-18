@@ -2,81 +2,7 @@
 
 /*
 ===========================================================
- OKX EVENT CONTRACT SNR ROLLING BOT
-===========================================================
-
-產品：
-  OKX EVENTS / Event Contracts
-
-目前策略：
-  BTC / ETH / SOL
-  UPDOWN 15MIN
-  5m + 15m trend
-  EMA20 / EMA50
-  RSI
-  ATR
-  SNR
-  Volume
-  Model probability
-  Market probability
-  Edge filter
-
-交易：
-  LIVE_TRADING=false 預設
-  LIVE_TRADING=true 才會真的下單
-
-重要：
-  EVENTS tdMode = isolated
-  outcome = yes / no
-
-  speedBump：
-    2026-07-24 OKX changelog 已移除
-    本程式不再送 speedBump
-
-===========================================================
- REQUIRED ENV
-===========================================================
-
-OK_ACCESS_KEY
-OK_ACCESS_SECRET
-OKX_PASSPHRASE
-
-===========================================================
- OPTIONAL ENV
-===========================================================
-
-LIVE_TRADING=false
-
-START_CAPITAL=20
-
-RISK_PCT=0.10
-MAX_STAKE_PCT=0.20
-MIN_STAKE=1
-
-MIN_EDGE=0.075
-MIN_SCORE=78
-
-MIN_ENTRY_PRICE=0.22
-MAX_ENTRY_PRICE=0.78
-
-EARLY_TP_PCT=0.30
-EARLY_SL_PCT=0.25
-
-MIN_MINUTES_TO_EXPIRY=1
-MAX_MINUTES_TO_EXPIRY=20
-
-DAILY_LOSS_PCT=0.20
-MAX_CONSECUTIVE_LOSSES=3
-
-CHECK_INTERVAL=15000
-POSITION_CHECK_INTERVAL=5000
-
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-
-EVENT_SERIES=
-AUTO_DISCOVER_SERIES=true
-
+ OKX EVENT CONTRACT SNR ROLLING BOT (FIXED)
 ===========================================================
 */
 
@@ -118,9 +44,6 @@ const PASSPHRASE =
     process.env.OKX_PASSPHRASE || ''
   ).trim();
 
-/*
-  OKX Taiwan/global API endpoint.
-*/
 const BASE_URL =
   String(
     process.env.OKX_BASE_URL ||
@@ -236,9 +159,6 @@ const BOT_STATE_FILE =
     'event-bot-state.json'
   );
 
-/*
-  Technical-analysis underlying.
-*/
 const UNDERLYING_MAP = {
   BTC: 'BTC-USDT-SWAP',
   ETH: 'ETH-USDT-SWAP',
@@ -265,11 +185,6 @@ const bot =
       )
     : null;
 
-/*
-  不依賴 /start。
-  只有真正交易事件才通知。
-*/
-
 async function notify(text) {
 
   if (
@@ -295,27 +210,17 @@ async function notify(text) {
   }
 }
 
-/* =========================================================
-   TELEGRAM POLLING ERROR
-========================================================= */
-
 if (bot) {
 
   bot.on(
     'polling_error',
     err => {
-
       console.error(
         '[Telegram polling_error]',
         err.message
       );
-
     }
   );
-
-  /*
-    不處理 /start。
-  */
 }
 
 /* =========================================================
@@ -435,7 +340,7 @@ async function publicGet(
 }
 
 /* =========================================================
-   OKX SIGN
+   OKX SIGN & PRIVATE
 ========================================================= */
 
 function sign(
@@ -458,10 +363,6 @@ function sign(
     )
     .digest('base64');
 }
-
-/* =========================================================
-   OKX PRIVATE
-========================================================= */
 
 async function privateRequest(
   method,
@@ -546,10 +447,6 @@ async function privateRequest(
     ? response.data.data
     : [];
 }
-
-/* =========================================================
-   SERVER TIME
-========================================================= */
 
 async function getServerTime() {
 
@@ -678,10 +575,6 @@ function saveState() {
   }
 }
 
-/* =========================================================
-   DAILY RISK
-========================================================= */
-
 function resetDaily() {
 
   const today =
@@ -729,7 +622,7 @@ function riskBlocked() {
 }
 
 /* =========================================================
-   CANDLES
+   ANALYSIS HELPERS
 ========================================================= */
 
 function closes(candles) {
@@ -788,10 +681,6 @@ function volumes(candles) {
     );
 }
 
-/* =========================================================
-   EMA
-========================================================= */
-
 function ema(
   values,
   period
@@ -840,10 +729,6 @@ function ema(
 
   return value;
 }
-
-/* =========================================================
-   RSI
-========================================================= */
 
 function rsi(
   values,
@@ -945,10 +830,6 @@ function rsi(
   );
 }
 
-/* =========================================================
-   ATR
-========================================================= */
-
 function atr(
   candles,
   period = 14
@@ -1019,10 +900,6 @@ function atr(
   );
 }
 
-/* =========================================================
-   CONFIRMED CANDLES
-========================================================= */
-
 function confirmed(
   candles
 ) {
@@ -1042,10 +919,6 @@ function confirmed(
         String(x[8]) === '1'
     );
 }
-
-/* =========================================================
-   PIVOTS
-========================================================= */
 
 function pivots(
   candles,
@@ -1138,28 +1011,6 @@ function nearestAbove(
     )[0] || null;
 }
 
-function nearestBelow(
-  levels,
-  price
-) {
-
-  return levels
-
-    .filter(
-      x =>
-        x < price
-    )
-
-    .sort(
-      (a, b) =>
-        b - a
-    )[0] || null;
-}
-
-/* =========================================================
-   MARKET DATA
-========================================================= */
-
 async function getCandles(
   instId,
   bar,
@@ -1209,7 +1060,7 @@ async function getTicker(
 }
 
 /* =========================================================
-   EVENT SERIES
+   EVENT DISCOVERY
 ========================================================= */
 
 function getConfiguredSeries() {
@@ -1301,9 +1152,6 @@ function parseExpiryFromInstId(
       endPart.slice(2, 4)
     );
 
-  /*
-    OKX instrument time is UTC.
-  */
   const year =
     2000 + yy;
 
@@ -1403,10 +1251,6 @@ function allowedExpiry(
   );
 }
 
-/* =========================================================
-   EVENT INSTRUMENT DISCOVERY
-========================================================= */
-
 async function getEventInstruments(
   seriesId
 ) {
@@ -1445,11 +1289,6 @@ async function discoverEventInstruments() {
     );
   }
 
-  console.log(
-    '[EVENT] Checking series:',
-    series.join(', ')
-  );
-
   const all = [];
 
   for (
@@ -1481,7 +1320,6 @@ async function discoverEventInstruments() {
       }
 
     } catch (err) {
-
       console.error(
         `[EVENT] ${seriesId}:`,
         err.message
@@ -1491,10 +1329,6 @@ async function discoverEventInstruments() {
 
   return all;
 }
-
-/* =========================================================
-   EVENT HELPERS
-========================================================= */
 
 function getBaseAsset(
   inst
@@ -1571,10 +1405,6 @@ function getStrike(
 
   return null;
 }
-
-/* =========================================================
-   ROUNDING
-========================================================= */
 
 function roundDown(
   value,
@@ -1831,13 +1661,6 @@ function modelProbability(
     strikePx > 0
   ) {
 
-    const distance =
-      Math.abs(
-        price -
-        strikePx
-      ) /
-      price;
-
     if (
       price >
       strikePx
@@ -1848,44 +1671,6 @@ function modelProbability(
       reasons.push(
         'above strike'
       );
-    }
-
-    if (
-      distance <
-      0.0025
-    ) {
-
-      score -= 10;
-
-      reasons.push(
-        'strike too close'
-      );
-    }
-  }
-
-  if (
-    atr5 &&
-    price > 0
-  ) {
-
-    const atrPct =
-      atr5 /
-      price;
-
-    if (
-      atrPct <
-      0.001
-    ) {
-
-      score -= 5;
-    }
-
-    if (
-      atrPct >
-      0.03
-    ) {
-
-      score -= 8;
     }
   }
 
@@ -1930,7 +1715,7 @@ function modelProbability(
 }
 
 /* =========================================================
-   EQUITY
+   EQUITY & STAKE
 ========================================================= */
 
 async function getEquity() {
@@ -1998,15 +1783,11 @@ async function getEquity() {
   );
 }
 
-/* =========================================================
-   STAKE
-========================================================= */
-
 function stakeForEquity(
   equity
 ) {
   /*
-    直接鎖定單筆交易最大額度為 5
+    強制鎖定單筆最大資金為 5 枚 USDT
   */
   return Math.min(
     equity,
@@ -2015,17 +1796,13 @@ function stakeForEquity(
 }
 
 /* =========================================================
-   FIND EVENT CANDIDATES
+   SCAN CANDIDATES
 ========================================================= */
 
 async function scanCandidates() {
 
   const instruments =
     await discoverEventInstruments();
-
-  console.log(
-    `[EVENT] Instruments found: ${instruments.length}`
-  );
 
   if (
     !instruments.length
@@ -2075,10 +1852,6 @@ async function scanCandidates() {
         );
       }
     );
-
-  console.log(
-    `[EVENT] Valid UPDOWN contracts: ${filtered.length}`
-  );
 
   const candidates = [];
 
@@ -2247,19 +2020,13 @@ async function scanCandidates() {
         continue;
       }
 
-      const yesMarket =
-        yesEntry;
-
-      const noMarket =
-        noEntry;
-
       const yesEdge =
         yesModel -
-        yesMarket;
+        yesEntry;
 
       const noEdge =
         noModel -
-        noMarket;
+        noEntry;
 
       let side;
       let entryPx;
@@ -2282,7 +2049,7 @@ async function scanCandidates() {
           yesModel;
 
         marketProb =
-          yesMarket;
+          yesEntry;
 
         edge =
           yesEdge;
@@ -2299,7 +2066,7 @@ async function scanCandidates() {
           noModel;
 
         marketProb =
-          noMarket;
+          noEntry;
 
         edge =
           noEdge;
@@ -2364,7 +2131,6 @@ async function scanCandidates() {
       });
 
     } catch (err) {
-
       console.error(
         `[EVENT CANDIDATE ERROR] ${inst.instId}:`,
         err.message
@@ -2382,7 +2148,7 @@ async function scanCandidates() {
 }
 
 /* =========================================================
-   PLACE EVENT ORDER
+   ORDER EXECUTION & QUANTITY FIX
 ========================================================= */
 
 async function placeEventOrder(
@@ -2399,7 +2165,7 @@ async function placeEventOrder(
   const lotSz =
     Number(
       inst.lotSz ||
-      0.1
+      1
     );
 
   const minSz =
@@ -2428,6 +2194,9 @@ async function placeEventOrder(
     );
   }
 
+  /*
+    計算原始張數並強制對齊 lotSz，避免位數錯誤觸發 IOC 取消
+  */
   const rawSz =
     stake /
     candidate.entryPx;
@@ -2452,47 +2221,6 @@ async function placeEventOrder(
       candidate.entryPx,
       tickSz
     );
-
-  const requestedNotional =
-    px *
-    sz;
-
-  console.log(
-    '[EVENT ORDER CALC]',
-    JSON.stringify({
-
-      stake,
-
-      entryPx:
-        candidate.entryPx,
-
-      price:
-        px,
-
-      lotSz,
-
-      minSz,
-
-      rawSz,
-
-      contracts:
-        sz,
-
-      requestedNotional
-    })
-  );
-
-  if (
-    requestedNotional >
-    stake * 1.05
-  ) {
-
-    throw new Error(
-      `Order exceeds stake: ` +
-      `stake=${stake.toFixed(4)} ` +
-      `notional=${requestedNotional.toFixed(4)}`
-    );
-  }
 
   const body = {
 
@@ -2524,13 +2252,6 @@ async function placeEventOrder(
           32
         )
   };
-
-  console.log(
-    '[EVENT ORDER]',
-    JSON.stringify(
-      body
-    )
-  );
 
   if (
     !LIVE_TRADING
@@ -2567,13 +2288,6 @@ async function placeEventOrder(
   const result =
     rows?.[0];
 
-  console.log(
-    '[EVENT ORDER RESPONSE]',
-    JSON.stringify(
-      result
-    )
-  );
-
   if (
     !result ||
     String(
@@ -2604,13 +2318,6 @@ async function placeEventOrder(
         result.ordId
       );
 
-    console.log(
-      '[EVENT ORDER FILLED]',
-      JSON.stringify(
-        filled
-      )
-    );
-
     return {
 
       ...result,
@@ -2622,10 +2329,6 @@ async function placeEventOrder(
   return result;
 }
 
-/* =========================================================
-   GET ORDER
-========================================================= */
-
 async function getOrder(
   instId,
   ordId
@@ -2634,11 +2337,8 @@ async function getOrder(
   const requestPath =
     `/api/v5/trade/order?` +
     q({
-
       instId,
-
       ordId
-
     });
 
   const rows =
@@ -2652,10 +2352,6 @@ async function getOrder(
     null
   );
 }
-
-/* =========================================================
-   CLOSE EVENT POSITION
-========================================================= */
 
 async function closePosition(
   position,
@@ -2722,13 +2418,6 @@ async function closePosition(
         )
   };
 
-  console.log(
-    '[EVENT EXIT ORDER]',
-    JSON.stringify(
-      body
-    )
-  );
-
   if (
     !LIVE_TRADING
   ) {
@@ -2768,13 +2457,6 @@ async function closePosition(
   const result =
     rows?.[0];
 
-  console.log(
-    '[EVENT EXIT RESPONSE]',
-    JSON.stringify(
-      result
-    )
-  );
-
   if (
     !result ||
     String(
@@ -2805,13 +2487,6 @@ async function closePosition(
         result.ordId
       );
 
-    console.log(
-      '[EVENT EXIT FILLED]',
-      JSON.stringify(
-        filled
-      )
-    );
-
     return {
 
       ...result,
@@ -2822,10 +2497,6 @@ async function closePosition(
 
   return result;
 }
-
-/* =========================================================
-   POSITION MANAGER
-========================================================= */
 
 async function managePosition() {
 
@@ -2906,30 +2577,6 @@ async function managePosition() {
       ) /
       position.entryPx;
 
-    console.log(
-      '[EVENT POSITION]',
-      JSON.stringify({
-
-        instId:
-          position.inst.instId,
-
-        side:
-          position.side,
-
-        entry:
-          position.entryPx,
-
-        current:
-          currentPx,
-
-        change:
-          (
-            change * 100
-          ).toFixed(2) +
-          '%'
-      })
-    );
-
     if (
       change >=
       EARLY_TP_PCT
@@ -2957,17 +2604,12 @@ async function managePosition() {
     }
 
   } catch (err) {
-
     console.error(
       '[EVENT POSITION MANAGER]',
       err.message
     );
   }
 }
-
-/* =========================================================
-   EXIT POSITION
-========================================================= */
 
 async function exitPosition(
   position,
@@ -3004,9 +2646,7 @@ async function exitPosition(
 
     state.paperEquity =
       Math.max(
-
         0,
-
         Number(
           state.paperEquity ||
           START_CAPITAL
@@ -3108,10 +2748,6 @@ async function exitPosition(
   );
 }
 
-/* =========================================================
-   MAY TRADE
-========================================================= */
-
 async function maybeTrade() {
 
   if (
@@ -3136,12 +2772,6 @@ async function maybeTrade() {
       await getEquity();
 
   } catch (err) {
-
-    console.error(
-      '[EVENT EQUITY]',
-      err.message
-    );
-
     return;
   }
 
@@ -3187,12 +2817,6 @@ async function maybeTrade() {
       await scanCandidates();
 
   } catch (err) {
-
-    console.error(
-      '[EVENT SCAN]',
-      err.message
-    );
-
     return;
   }
 
@@ -3219,46 +2843,6 @@ async function maybeTrade() {
 
     return;
   }
-
-  console.log(
-    '[EVENT CANDIDATE]',
-    candidate.inst.instId
-  );
-
-  console.log(
-    '[EVENT SIDE]',
-    candidate.side
-  );
-
-  console.log(
-    '[EVENT ENTRY]',
-    candidate.entryPx
-  );
-
-  console.log(
-    '[EVENT SCORE]',
-    candidate.score
-  );
-
-  console.log(
-    '[EVENT MODEL]',
-    candidate.modelProb
-  );
-
-  console.log(
-    '[EVENT MARKET]',
-    candidate.marketProb
-  );
-
-  console.log(
-    '[EVENT EDGE]',
-    candidate.edge
-  );
-
-  console.log(
-    '[EVENT REQUESTED STAKE]',
-    stake
-  );
 
   try {
 
@@ -3307,133 +2891,12 @@ async function maybeTrade() {
       )
     ) {
 
-      console.log(
-        '[EVENT] NO FILL'
-      );
-
       return;
     }
 
     const actualStake =
       avgPx *
       fillSz;
-
-    console.log(
-      '[EVENT ACTUAL FILL]',
-      JSON.stringify({
-
-        requestedStake:
-          stake,
-
-        fillSz,
-
-        avgPx,
-
-        actualStake
-      })
-    );
-
-    const minimumFill =
-      stake * 0.80;
-
-    if (
-      actualStake <
-      minimumFill
-    ) {
-
-      console.error(
-        `[EVENT] FILL TOO SMALL ` +
-        `requested=${stake.toFixed(4)} ` +
-        `actual=${actualStake.toFixed(4)}`
-      );
-
-      if (
-        LIVE_TRADING
-      ) {
-
-        try {
-
-          await closePosition(
-
-            {
-              inst:
-                candidate.inst,
-
-              side:
-                candidate.side,
-
-              sz:
-                fillSz,
-
-              entryPx:
-                avgPx
-            },
-
-            avgPx
-          );
-
-          console.log(
-            '[EVENT] Small fill closed'
-          );
-
-        } catch (closeErr) {
-
-          console.error(
-            '[EVENT] Emergency close:',
-            closeErr.message
-          );
-
-          state.position = {
-
-            inst:
-              candidate.inst,
-
-            seriesId:
-              candidate.seriesId,
-
-            coin:
-              candidate.coin,
-
-            side:
-              candidate.side,
-
-            sz:
-              fillSz,
-
-            entryPx:
-              avgPx,
-
-            stake:
-              actualStake,
-
-            requestedStake:
-              stake,
-
-            score:
-              candidate.score,
-
-            edge:
-              candidate.edge,
-
-            modelProb:
-              candidate.modelProb,
-
-            marketProb:
-              candidate.marketProb,
-
-            underlyingPrice:
-              candidate.underlyingPrice,
-
-            openedAt:
-              Date.now()
-          };
-
-          saveState();
-        }
-      }
-
-      return;
-    }
 
     state.position = {
 
@@ -3505,10 +2968,6 @@ async function maybeTrade() {
         actualStake.toFixed(4)
       }U\n` +
 
-      `Requested ${
-        stake.toFixed(4)
-      }U\n` +
-
       `Score ${
         candidate.score
       }\n` +
@@ -3520,25 +2979,12 @@ async function maybeTrade() {
         ).toFixed(1)
       }%\n` +
 
-      `Market ${
-        (
-          candidate.marketProb *
-          100
-        ).toFixed(1)
-      }%\n` +
-
       `Edge ${
         (
           candidate.edge *
           100
         ).toFixed(1)
       }%\n` +
-
-      `Reason ${
-        candidate.reasons.join(
-          ', '
-        )
-      }\n` +
 
       `${
         LIVE_TRADING
@@ -3548,7 +2994,6 @@ async function maybeTrade() {
     );
 
   } catch (err) {
-
     console.error(
       '🔴 EVENT ORDER ERROR',
       err.message
@@ -3557,69 +3002,17 @@ async function maybeTrade() {
 }
 
 /* =========================================================
-   HTTP
+   EXPRESS ROUTES & LOOP
 ========================================================= */
 
 app.get(
   '/',
   (req, res) => {
-
     res.json({
-
-      ok:
-        true,
-
-      bot:
-        'OKX Event Contract SNR Rolling Bot',
-
-      product:
-        'EVENTS',
-
-      live:
-        LIVE_TRADING,
-
-      baseUrl:
-        BASE_URL,
-
-      tdMode:
-        'isolated',
-
-      position:
-        state.position
-          ? {
-
-              instId:
-                state.position
-                  .inst
-                  .instId,
-
-              side:
-                state.position
-                  .side,
-
-              entryPx:
-                state.position
-                  .entryPx,
-
-              sz:
-                state.position
-                  .sz,
-
-              stake:
-                state.position
-                  .stake
-            }
-
-          : null,
-
-      halted:
-        state.halted,
-
-      consecutiveLosses:
-        state.consecutiveLosses,
-
-      realizedPnl:
-        state.realizedPnl
+      ok: true,
+      bot: 'OKX Event Contract SNR Rolling Bot',
+      live: LIVE_TRADING,
+      position: state.position
     });
   }
 );
@@ -3627,229 +3020,13 @@ app.get(
 app.get(
   '/health',
   async (req, res) => {
-
     res.json({
-
-      ok:
-        true,
-
-      live:
-        LIVE_TRADING,
-
-      product:
-        'EVENTS',
-
-      time:
-        new Date()
-          .toISOString()
+      ok: true,
+      live: LIVE_TRADING,
+      time: new Date().toISOString()
     });
   }
 );
-
-app.get(
-  '/status',
-  (req, res) => {
-
-    res.json({
-
-      ok:
-        true,
-
-      live:
-        LIVE_TRADING,
-
-      product:
-        'EVENTS',
-
-      tdMode:
-        'isolated',
-
-      riskPct:
-        RISK_PCT,
-
-      maxStakePct:
-        MAX_STAKE_PCT,
-
-      minEdge:
-        MIN_EDGE,
-
-      minScore:
-        MIN_SCORE,
-
-      position:
-        state.position,
-
-      risk: {
-
-        halted:
-          state.halted,
-
-        consecutiveLosses:
-          state.consecutiveLosses,
-
-        realizedPnl:
-          state.realizedPnl
-      },
-
-      trades:
-        state.trades.length
-    });
-  }
-);
-
-/* =========================================================
-   EVENT DISCOVERY DEBUG
-========================================================= */
-
-app.get(
-  '/event-discovery',
-  async (req, res) => {
-
-    try {
-
-      const instruments =
-        await discoverEventInstruments();
-
-      res.json({
-
-        ok:
-          true,
-
-        count:
-          instruments.length,
-
-        instruments:
-          instruments
-            .slice(
-              0,
-              100
-            )
-            .map(
-              inst => ({
-
-                instId:
-                  inst.instId,
-
-                seriesId:
-                  inst.seriesId,
-
-                state:
-                  inst.state,
-
-                expTime:
-                  inst.expTime,
-
-                parsedExpiry:
-                  getExpiry(
-                    inst
-                  ),
-
-                minutesToExpiry:
-                  minutesToExpiry(
-                    inst
-                  ),
-
-                tickSz:
-                  inst.tickSz,
-
-                lotSz:
-                  inst.lotSz,
-
-                minSz:
-                  inst.minSz
-              })
-            )
-      });
-
-    } catch (err) {
-
-      res.status(
-        500
-      ).json({
-
-        ok:
-          false,
-
-        error:
-          err.message
-      });
-    }
-  }
-);
-
-/* =========================================================
-   MANUAL TEST DISCOVERY
-========================================================= */
-
-app.get(
-  '/event-test',
-  async (req, res) => {
-
-    try {
-
-      const instruments =
-        await discoverEventInstruments();
-
-      res.json({
-
-        ok:
-          true,
-
-        count:
-          instruments.length,
-
-        sample:
-          instruments
-            .slice(
-              0,
-              20
-            )
-            .map(
-              x => ({
-
-                instId:
-                  x.instId,
-
-                seriesId:
-                  x.seriesId,
-
-                state:
-                  x.state,
-
-                expTime:
-                  x.expTime,
-
-                tickSz:
-                  x.tickSz,
-
-                lotSz:
-                  x.lotSz,
-
-                minSz:
-                  x.minSz
-              })
-            )
-      });
-
-    } catch (err) {
-
-      res.status(
-        500
-      ).json({
-
-        ok:
-          false,
-
-        error:
-          err.message
-      });
-    }
-  }
-);
-
-/* =========================================================
-   MAIN LOOP
-========================================================= */
 
 let loopRunning =
   false;
@@ -3859,11 +3036,6 @@ async function mainLoop() {
   if (
     loopRunning
   ) {
-
-    console.log(
-      '[EVENT] Previous loop still running'
-    );
-
     return;
   }
 
@@ -3884,7 +3056,6 @@ async function mainLoop() {
     }
 
   } catch (err) {
-
     console.error(
       '[EVENT MAIN LOOP]',
       err.message ||
@@ -3898,95 +3069,14 @@ async function mainLoop() {
   }
 }
 
-/* =========================================================
-   START
-========================================================= */
-
 app.listen(
   PORT,
   async () => {
-
     console.log(
-      '======================================'
+      `OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`
     );
-
-    console.log(
-      'OKX EVENT CONTRACT BOT'
-    );
-
-    console.log(
-      '======================================'
-    );
-
-    console.log(
-      `Port=${PORT}`
-    );
-
-    console.log(
-      `LIVE_TRADING=${LIVE_TRADING}`
-    );
-
-    console.log(
-      `BASE_URL=${BASE_URL}`
-    );
-
-    console.log(
-      `PRODUCT=EVENTS`
-    );
-
-    console.log(
-      `TD_MODE=isolated`
-    );
-
-    console.log(
-      `AUTO_DISCOVER_SERIES=${AUTO_DISCOVER_SERIES}`
-    );
-
-    console.log(
-      `MIN_EDGE=${MIN_EDGE}`
-    );
-
-    console.log(
-      `MIN_SCORE=${MIN_SCORE}`
-    );
-
-    console.log(
-      `RISK_PCT=${RISK_PCT}`
-    );
-
-    console.log(
-      `MAX_STAKE_PCT=${MAX_STAKE_PCT}`
-    );
-
-    console.log(
-      '======================================'
-    );
-
-    try {
-
-      const serverTime =
-        await getServerTime();
-
-      console.log(
-        '[OKX] Server time:',
-        new Date(
-          serverTime
-        ).toISOString()
-      );
-
-    } catch (err) {
-
-      console.error(
-        '[OKX] Time check:',
-        err.message
-      );
-    }
   }
 );
-
-/* =========================================================
-   INTERVALS
-========================================================= */
 
 setInterval(
   mainLoop,
@@ -3997,10 +3087,6 @@ setInterval(
   managePosition,
   POSITION_CHECK_INTERVAL
 );
-
-/* =========================================================
-   INITIAL RUN
-========================================================= */
 
 mainLoop()
   .catch(
