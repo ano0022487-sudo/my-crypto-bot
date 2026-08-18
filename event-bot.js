@@ -1,21 +1,40 @@
 'use strict';
 
 /*
-  OKX Event Contract SNR + Rolling Bot
-  2026 API version
+  OKX EVENT CONTRACT SNR + ROLLING BOT
+  =====================================
 
   IMPORTANT:
-  - LIVE_TRADING defaults to false.
-  - Event Contract public discovery uses:
-      /api/v5/public/event-contract/series
-      /api/v5/public/event-contract/events
-      /api/v5/public/event-contract/markets
-  - Event instruments use:
-      /api/v5/public/instruments?instType=EVENTS&seriesId=...
-  - EVENTS market data returns YES-side data.
-  - NO price is derived from YES price.
-  - Event orders use tdMode=isolated.
-  - Non-post-only EVENTS orders require speedBump=1.
+  - This file is ONLY for OKX EVENT Contracts.
+  - It does NOT trade SWAP / perpetual contracts.
+  - Event Contracts use isolated tdMode according to current OKX API docs.
+  - Entry orders use FOK to prevent partial fills.
+  - If the requested size cannot be fully filled immediately,
+    the entire entry order is cancelled.
+  - Exit orders use IOC because exits should prioritize getting out.
+  - Partial exits are handled correctly.
+
+  Strategy:
+  - Underlying: BTC / ETH / SOL
+  - Underlying timeframe: 5m + 15m
+  - EMA20 / EMA50
+  - RSI
+  - ATR
+  - Volume
+  - SNR pivots
+  - Model score
+  - Model probability
+  - Market probability
+  - Minimum edge
+  - Rolling position size
+  - One position at a time
+  - Daily loss lock
+  - Consecutive loss lock
+  - Early TP / SL
+
+  LIVE_TRADING:
+  false = paper
+  true  = real trading
 */
 
 const express = require('express');
@@ -45,19 +64,23 @@ const BASE_URL = String(
   process.env.OKX_BASE_URL || 'https://openapi.okx.com'
 ).replace(/\/$/, '');
 
-const TELEGRAM_BOT_TOKEN = String(
-  process.env.TELEGRAM_BOT_TOKEN || ''
-).trim().replace(/["']+/g, '');
+const TELEGRAM_BOT_TOKEN =
+  String(process.env.TELEGRAM_BOT_TOKEN || '')
+    .trim()
+    .replace(/["']+/g, '');
 
-const TELEGRAM_CHAT_ID = String(
-  process.env.TELEGRAM_CHAT_ID || ''
-).trim();
+const TELEGRAM_CHAT_ID =
+  String(process.env.TELEGRAM_CHAT_ID || '').trim();
 
 const CHECK_INTERVAL =
-  Number(process.env.CHECK_INTERVAL || 30000);
+  Number(process.env.CHECK_INTERVAL || 15000);
 
 const POSITION_CHECK_INTERVAL =
   Number(process.env.POSITION_CHECK_INTERVAL || 10000);
+
+/* =========================================================
+   RISK
+========================================================= */
 
 const START_CAPITAL =
   Number(process.env.START_CAPITAL || 20);
@@ -69,7 +92,14 @@ const MAX_STAKE_PCT =
   Number(process.env.MAX_STAKE_PCT || 0.20);
 
 const MIN_STAKE =
-  Number(process.env.MIN_STAKE || 1);
+  Number(process.env.MIN_STAKE || 1.0);
+
+const MAX_OPEN_POSITIONS =
+  Number(process.env.MAX_OPEN_POSITIONS || 1);
+
+/* =========================================================
+   STRATEGY
+========================================================= */
 
 const MIN_EDGE =
   Number(process.env.MIN_EDGE || 0.075);
@@ -83,6 +113,10 @@ const MAX_ENTRY_PRICE =
 const MIN_ENTRY_PRICE =
   Number(process.env.MIN_ENTRY_PRICE || 0.22);
 
+/* =========================================================
+   EXIT
+========================================================= */
+
 const EARLY_TP_PCT =
   Number(process.env.EARLY_TP_PCT || 0.30);
 
@@ -95,11 +129,19 @@ const MIN_MINUTES_TO_EXPIRY =
 const MAX_MINUTES_TO_EXPIRY =
   Number(process.env.MAX_MINUTES_TO_EXPIRY || 180);
 
+/* =========================================================
+   RISK LOCK
+========================================================= */
+
 const DAILY_LOSS_PCT =
   Number(process.env.DAILY_LOSS_PCT || 0.20);
 
 const MAX_CONSECUTIVE_LOSSES =
   Number(process.env.MAX_CONSECUTIVE_LOSSES || 3);
+
+/* =========================================================
+   EVENT SERIES
+========================================================= */
 
 const EVENT_SERIES =
   String(process.env.EVENT_SERIES || '').trim();
@@ -108,11 +150,9 @@ const AUTO_DISCOVER_SERIES =
   String(process.env.AUTO_DISCOVER_SERIES || 'true')
     .toLowerCase() === 'true';
 
-const EVENT_COINS =
-  String(process.env.EVENT_COINS || 'BTC,ETH,SOL')
-    .split(',')
-    .map(x => x.trim().toUpperCase())
-    .filter(Boolean);
+/* =========================================================
+   STATE
+========================================================= */
 
 const BOT_STATE_FILE =
   process.env.BOT_STATE_FILE ||
@@ -133,7 +173,10 @@ const UNDERLYING_MAP = {
 ========================================================= */
 
 const bot = TELEGRAM_BOT_TOKEN
-  ? new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true })
+  ? new TelegramBot(
+      TELEGRAM_BOT_TOKEN,
+      { polling: true }
+    )
   : {
       sendMessage: async () => {}
     };
@@ -142,9 +185,15 @@ async function notify(text) {
   if (!TELEGRAM_CHAT_ID) return;
 
   try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, text);
+    await bot.sendMessage(
+      TELEGRAM_CHAT_ID,
+      text
+    );
   } catch (e) {
-    console.error('Telegram:', e.message);
+    console.error(
+      'Telegram:',
+      e.message
+    );
   }
 }
 
@@ -166,7 +215,7 @@ function q(params) {
 }
 
 async function request(config, retries = 3) {
-  let last;
+  let lastError;
 
   for (let i = 0; i < retries; i++) {
     try {
@@ -175,7 +224,7 @@ async function request(config, retries = 3) {
         ...config
       });
     } catch (e) {
-      last = e;
+      lastError = e;
 
       if (i < retries - 1) {
         await new Promise(resolve =>
@@ -185,43 +234,50 @@ async function request(config, retries = 3) {
     }
   }
 
-  throw last;
-}
-
-async function publicGet(pathname, params = {}) {
-  const query = q(params);
-
-  const requestPath =
-    query ? `${pathname}?${query}` : pathname;
-
-  const response = await request({
-    method: 'GET',
-    url: `${BASE_URL}${requestPath}`
-  });
-
-  if (!response.data ||
-      String(response.data.code) !== '0') {
-
-    throw new Error(
-      `OKX public error ${response.status}: ` +
-      JSON.stringify(response.data)
-    );
-  }
-
-  return Array.isArray(response.data.data)
-    ? response.data.data
-    : [];
+  throw lastError;
 }
 
 /* =========================================================
-   PRIVATE API
+   PUBLIC API
 ========================================================= */
 
-function sign(timestamp, method, requestPath, body) {
+async function publicGet(pathname, params = {}) {
+  const pathWithQuery =
+    Object.keys(params).length
+      ? `${pathname}?${q(params)}`
+      : pathname;
+
+  const r = await request({
+    method: 'GET',
+    url: `${BASE_URL}${pathWithQuery}`
+  });
+
+  if (!r.data || String(r.data.code) !== '0') {
+    throw new Error(
+      `OKX public error: ${JSON.stringify(r.data)}`
+    );
+  }
+
+  return r.data.data;
+}
+
+/* =========================================================
+   SIGNATURE
+========================================================= */
+
+function sign(
+  ts,
+  method,
+  requestPath,
+  body
+) {
   return crypto
-    .createHmac('sha256', SECRET_KEY)
+    .createHmac(
+      'sha256',
+      SECRET_KEY
+    )
     .update(
-      timestamp +
+      ts +
       method.toUpperCase() +
       requestPath +
       body
@@ -229,58 +285,72 @@ function sign(timestamp, method, requestPath, body) {
     .digest('base64');
 }
 
+/* =========================================================
+   PRIVATE API
+========================================================= */
+
 async function privateRequest(
   method,
   requestPath,
   bodyObj = null
 ) {
-  if (!API_KEY || !SECRET_KEY || !PASSPHRASE) {
+  if (
+    !API_KEY ||
+    !SECRET_KEY ||
+    !PASSPHRASE
+  ) {
     throw new Error(
       'OKX API credentials are missing'
     );
   }
 
-  const timestamp =
+  const ts =
     new Date().toISOString();
 
   const body =
-    bodyObj ? JSON.stringify(bodyObj) : '';
+    bodyObj
+      ? JSON.stringify(bodyObj)
+      : '';
 
   const headers = {
     'OK-ACCESS-KEY': API_KEY,
+
     'OK-ACCESS-SIGN':
       sign(
-        timestamp,
+        ts,
         method,
         requestPath,
         body
       ),
+
     'OK-ACCESS-TIMESTAMP':
-      timestamp,
+      ts,
+
     'OK-ACCESS-PASSPHRASE':
       PASSPHRASE,
+
     'Content-Type':
       'application/json'
   };
 
-  const response = await request({
+  const r = await request({
     method,
     url: `${BASE_URL}${requestPath}`,
     data: body || undefined,
     headers
   });
 
-  if (!response.data ||
-      String(response.data.code) !== '0') {
-
+  if (
+    !r.data ||
+    String(r.data.code) !== '0'
+  ) {
     throw new Error(
-      `OKX private error ${response.status}: ` +
-      JSON.stringify(response.data)
+      `OKX private error: ${JSON.stringify(r.data)}`
     );
   }
 
-  return Array.isArray(response.data.data)
-    ? response.data.data
+  return Array.isArray(r.data.data)
+    ? r.data.data
     : [];
 }
 
@@ -290,23 +360,34 @@ async function privateRequest(
 
 function freshState() {
   return {
-    day: new Date().toISOString().slice(0, 10),
+    day:
+      new Date()
+        .toISOString()
+        .slice(0, 10),
 
-    startEquity: START_CAPITAL,
+    startEquity:
+      START_CAPITAL,
 
-    paperEquity: START_CAPITAL,
+    paperEquity:
+      START_CAPITAL,
 
-    realizedPnl: 0,
+    realizedPnl:
+      0,
 
-    consecutiveLosses: 0,
+    consecutiveLosses:
+      0,
 
-    halted: false,
+    halted:
+      false,
 
-    lastTradeAt: 0,
+    lastTradeAt:
+      0,
 
-    trades: [],
+    trades:
+      [],
 
-    position: null
+    position:
+      null
   };
 }
 
@@ -328,7 +409,13 @@ function loadState() {
       ...freshState(),
       ...data
     };
+
   } catch (e) {
+    console.error(
+      'State load:',
+      e.message
+    );
+
     return freshState();
   }
 }
@@ -354,15 +441,26 @@ function saveState() {
   }
 }
 
+/* =========================================================
+   DAILY RESET
+========================================================= */
+
 function resetDaily() {
   const day =
-    new Date().toISOString().slice(0, 10);
+    new Date()
+      .toISOString()
+      .slice(0, 10);
 
   if (state.day !== day) {
+
     state.day = day;
+
     state.startEquity = 0;
+
     state.realizedPnl = 0;
+
     state.consecutiveLosses = 0;
+
     state.halted = false;
 
     saveState();
@@ -380,7 +478,7 @@ function riskBlocked() {
 }
 
 /* =========================================================
-   INDICATORS
+   CANDLE FUNCTIONS
 ========================================================= */
 
 function closes(candles) {
@@ -407,34 +505,58 @@ function volumes(candles) {
     .filter(Number.isFinite);
 }
 
-function ema(values, period) {
-  if (values.length < period) {
+/* =========================================================
+   EMA
+========================================================= */
+
+function ema(
+  values,
+  period
+) {
+  if (
+    values.length <
+    period
+  ) {
     return null;
   }
 
-  const k = 2 / (period + 1);
+  const k =
+    2 /
+    (period + 1);
 
-  let value =
+  let v =
     values
       .slice(0, period)
-      .reduce((a, b) => a + b, 0) /
-    period;
+      .reduce(
+        (a, b) => a + b,
+        0
+      ) / period;
 
   for (
     let i = period;
     i < values.length;
     i++
   ) {
-    value =
+    v =
       values[i] * k +
-      value * (1 - k);
+      v * (1 - k);
   }
 
-  return value;
+  return v;
 }
 
-function rsi(values, period = 14) {
-  if (values.length < period + 1) {
+/* =========================================================
+   RSI
+========================================================= */
+
+function rsi(
+  values,
+  period = 14
+) {
+  if (
+    values.length <
+    period + 1
+  ) {
     return null;
   }
 
@@ -474,13 +596,15 @@ function rsi(values, period = 14) {
 
     avgGain =
       (
-        avgGain * (period - 1) +
+        avgGain *
+          (period - 1) +
         Math.max(d, 0)
       ) / period;
 
     avgLoss =
       (
-        avgLoss * (period - 1) +
+        avgLoss *
+          (period - 1) +
         Math.max(-d, 0)
       ) / period;
   }
@@ -491,16 +615,29 @@ function rsi(values, period = 14) {
 
   return (
     100 -
-    100 /
+    (
+      100 /
       (
         1 +
-        avgGain / avgLoss
+        avgGain /
+          avgLoss
       )
+    )
   );
 }
 
-function atr(candles, period = 14) {
-  if (candles.length < period + 1) {
+/* =========================================================
+   ATR
+========================================================= */
+
+function atr(
+  candles,
+  period = 14
+) {
+  if (
+    candles.length <
+    period + 1
+  ) {
     return null;
   }
 
@@ -536,9 +673,14 @@ function atr(candles, period = 14) {
     recent.reduce(
       (a, b) => a + b,
       0
-    ) / recent.length
+    ) /
+    recent.length
   );
 }
+
+/* =========================================================
+   CONFIRMED CANDLES
+========================================================= */
 
 function confirmed(candles) {
   return candles
@@ -549,22 +691,37 @@ function confirmed(candles) {
         Number(b[0])
     )
     .filter(
-      x => String(x[8]) === '1'
+      x =>
+        String(x[8]) === '1'
     );
 }
 
-function pivots(candles, lookback = 3) {
-  const h = highs(candles);
-  const l = lows(candles);
+/* =========================================================
+   PIVOTS
+========================================================= */
+
+function pivots(
+  candles,
+  lookback = 3
+) {
+  const h =
+    highs(candles);
+
+  const l =
+    lows(candles);
 
   const resistance = [];
+
   const support = [];
 
   for (
     let i = lookback;
-    i < candles.length - lookback;
+    i <
+      candles.length -
+        lookback;
     i++
   ) {
+
     const hi =
       Math.max(
         ...h.slice(
@@ -599,18 +756,30 @@ function pivots(candles, lookback = 3) {
   };
 }
 
-function nearestAbove(levels, price) {
+function nearestAbove(
+  levels,
+  price
+) {
   return levels
-    .filter(x => x > price)
-    .sort((a, b) => a - b)[0] ||
-    null;
+    .filter(
+      x => x > price
+    )
+    .sort(
+      (a, b) => a - b
+    )[0] || null;
 }
 
-function nearestBelow(levels, price) {
+function nearestBelow(
+  levels,
+  price
+) {
   return levels
-    .filter(x => x < price)
-    .sort((a, b) => b - a)[0] ||
-    null;
+    .filter(
+      x => x < price
+    )
+    .sort(
+      (a, b) => b - a
+    )[0] || null;
 }
 
 /* =========================================================
@@ -636,27 +805,16 @@ async function candles(
 }
 
 async function ticker(
-  instId
+  instId,
+  instType = null
 ) {
   const rows =
     await publicGet(
       '/api/v5/market/ticker',
       {
-        instType: 'EVENTS',
-        instId
-      }
-    );
-
-  return rows[0] || null;
-}
-
-async function underlyingTicker(
-  instId
-) {
-  const rows =
-    await publicGet(
-      '/api/v5/market/ticker',
-      {
+        ...(instType
+          ? { instType }
+          : {}),
         instId
       }
     );
@@ -665,18 +823,11 @@ async function underlyingTicker(
 }
 
 /* =========================================================
-   EVENT CONTRACT DISCOVERY
+   EVENT SERIES
 ========================================================= */
 
-/*
-  Correct OKX 2026 endpoints:
-
-  /api/v5/public/event-contract/series
-  /api/v5/public/event-contract/events
-  /api/v5/public/event-contract/markets
-*/
-
 async function eventSeries() {
+
   if (EVENT_SERIES) {
     return EVENT_SERIES
       .split(',')
@@ -689,141 +840,28 @@ async function eventSeries() {
   }
 
   try {
+
     const rows =
       await publicGet(
-        '/api/v5/public/event-contract/series'
+        '/api/v5/public/series',
+        {
+          instType:
+            'EVENTS'
+        }
       );
 
-    const now =
-      Date.now();
+    return rows
+      .map(
+        x =>
+          x.seriesId ||
+          x.id
+      )
+      .filter(Boolean);
 
-    const result = [];
-
-    for (const row of rows) {
-      const seriesId =
-        row.seriesId ||
-        row.id;
-
-      if (!seriesId) {
-        continue;
-      }
-
-      const text =
-        JSON.stringify(row)
-          .toUpperCase();
-
-      const matchedCoin =
-        EVENT_COINS.some(
-          coin =>
-            text.includes(coin)
-        );
-
-      if (!matchedCoin) {
-        continue;
-      }
-
-      /*
-        Keep the common live crypto series.
-        If OKX returns freq / state fields,
-        use them when available.
-      */
-
-      const stateValue =
-        String(
-          row.state ||
-          row.status ||
-          ''
-        ).toLowerCase();
-
-      if (
-        stateValue &&
-        ![
-          'live',
-          'active',
-          'open'
-        ].includes(stateValue)
-      ) {
-        continue;
-      }
-
-      const exp =
-        Number(
-          row.expTime ||
-          row.expiryTime ||
-          row.endTime ||
-          0
-        );
-
-      if (
-        exp > 0 &&
-        exp < now
-      ) {
-        continue;
-      }
-
-      result.push(
-        seriesId
-      );
-    }
-
-    /*
-      Fallback to well-known series IDs
-      if discovery returns no usable series.
-    */
-
-    if (!result.length) {
-      return EVENT_COINS.flatMap(
-        coin => [
-          `${coin}-ABOVE-DAILY`,
-          `${coin}-UPDOWN-15MIN`,
-          `${coin}-UPDOWN-HOURLY`
-        ]
-      );
-    }
-
-    return [
-      ...new Set(result)
-    ];
   } catch (e) {
+
     console.error(
       'Series discovery failed:',
-      e.message
-    );
-
-    /*
-      Discovery failure should not crash
-      the whole Render service.
-
-      Use known series as fallback.
-    */
-
-    return EVENT_COINS.flatMap(
-      coin => [
-        `${coin}-ABOVE-DAILY`,
-        `${coin}-UPDOWN-15MIN`,
-        `${coin}-UPDOWN-HOURLY`
-      ]
-    );
-  }
-}
-
-/* =========================================================
-   EVENTS / MARKETS
-========================================================= */
-
-async function eventDetails(
-  seriesId
-) {
-  try {
-    return await publicGet(
-      '/api/v5/public/event-contract/events',
-      {
-        seriesId
-      }
-    );
-  } catch (e) {
-    console.error(
-      `Events ${seriesId}:`,
       e.message
     );
 
@@ -831,16 +869,9 @@ async function eventDetails(
   }
 }
 
-async function eventMarkets(
-  seriesId
-) {
-  return publicGet(
-    '/api/v5/public/event-contract/markets',
-    {
-      seriesId
-    }
-  );
-}
+/* =========================================================
+   EVENT INSTRUMENTS
+========================================================= */
 
 async function eventInstruments(
   seriesId
@@ -848,36 +879,35 @@ async function eventInstruments(
   return publicGet(
     '/api/v5/public/instruments',
     {
-      instType: 'EVENTS',
+      instType:
+        'EVENTS',
+
       seriesId
     }
   );
 }
 
 /* =========================================================
-   EVENT FIELD HELPERS
+   BASE ASSET
 ========================================================= */
 
-function textOf(obj) {
-  return JSON.stringify(obj || {})
-    .toUpperCase();
-}
-
 function baseAsset(inst) {
-  const text =
+
+  const s =
     `${inst.baseCcy || ''} ` +
     `${inst.instId || ''} ` +
-    `${inst.seriesId || ''} ` +
-    `${inst.uly || ''}`;
-
-  const upper =
-    text.toUpperCase();
+    `${inst.seriesId || ''}`
+      .toUpperCase();
 
   for (
-    const coin of EVENT_COINS
+    const coin of
+      Object.keys(
+        UNDERLYING_MAP
+      )
   ) {
+
     if (
-      upper.includes(coin)
+      s.includes(coin)
     ) {
       return coin;
     }
@@ -886,27 +916,69 @@ function baseAsset(inst) {
   return null;
 }
 
-function eventDirection(inst) {
-  const text =
-    textOf(inst);
+/* =========================================================
+   STRIKE
+========================================================= */
 
-  if (
-    text.includes('UPDOWN') ||
-    text.includes('UP_DOWN') ||
-    text.includes('PRICE_UP_DOWN')
+function strike(inst) {
+
+  for (
+    const key of [
+      'stk',
+      'strike',
+      'strikePx',
+      'targetPx',
+      'triggerPx'
+    ]
   ) {
-    return 'UPDOWN';
+
+    const n =
+      Number(inst[key]);
+
+    if (
+      Number.isFinite(n) &&
+      n > 0
+    ) {
+      return n;
+    }
   }
 
+  const text =
+    `${inst.instId || ''} ` +
+    `${inst.seriesId || ''}`;
+
+  const m =
+    text.match(
+      /(?:^|[-_])(\d+(?:\.\d+)?)(?:[-_]|$)/
+    );
+
+  return m
+    ? Number(m[1])
+    : null;
+}
+
+/* =========================================================
+   EVENT TYPE
+========================================================= */
+
+function eventType(inst) {
+
+  const s =
+    `${inst.seriesId || ''} ` +
+    `${inst.instId || ''} ` +
+    `${inst.ruleType || ''}`
+      .toUpperCase();
+
   if (
-    text.includes('ABOVE') ||
-    text.includes('PRICE_ABOVE')
+    s.includes('ABOVE') ||
+    s.includes('UP')
   ) {
     return 'ABOVE';
   }
 
   if (
-    text.includes('BELOW')
+    s.includes('BELOW') ||
+    s.includes('DOWN')
   ) {
     return 'BELOW';
   }
@@ -914,118 +986,36 @@ function eventDirection(inst) {
   return 'UNKNOWN';
 }
 
-function numberField(
-  obj,
-  keys
-) {
-  for (const key of keys) {
-    const value =
-      Number(obj?.[key]);
-
-    if (
-      Number.isFinite(value) &&
-      value > 0
-    ) {
-      return value;
-    }
-  }
-
-  return null;
-}
-
-function strike(inst) {
-  return numberField(
-    inst,
-    [
-      'stk',
-      'strike',
-      'strikePx',
-      'targetPx',
-      'triggerPx',
-      'floorStrike'
-    ]
-  );
-}
+/* =========================================================
+   EXPIRY
+========================================================= */
 
 function expiry(inst) {
-  return numberField(
-    inst,
-    [
-      'expTime',
-      'expiryTime',
-      'endTime'
-    ]
-  );
-}
 
-function seriesExpiry(
-  series
-) {
-  return numberField(
-    series,
-    [
-      'expTime',
-      'expiryTime',
-      'endTime'
-    ]
-  );
+  const candidates = [
+    Number(inst.expTime),
+    Number(inst.expiryTime),
+    Number(inst.endTime)
+  ]
+    .filter(Number.isFinite);
+
+  return candidates.length
+    ? Math.max(...candidates)
+    : null;
 }
 
 /* =========================================================
-   PRICE / TICK SIZE
+   NUMBER HELPERS
 ========================================================= */
 
-async function getTickBands() {
-  try {
-    return await publicGet(
-      '/api/v5/public/instrument-tick-bands',
-      {
-        instType: 'EVENTS'
-      }
-    );
-  } catch (e) {
-    console.error(
-      'Tick bands:',
-      e.message
-    );
-
-    return [];
-  }
-}
-
-function tickSizeForPrice(
-  price,
-  bands
-) {
-  for (const band of bands) {
-    const minPx =
-      Number(band.minPx);
-
-    const maxPx =
-      Number(band.maxPx);
-
-    const tickSz =
-      Number(band.tickSz);
-
-    if (
-      Number.isFinite(minPx) &&
-      Number.isFinite(maxPx) &&
-      Number.isFinite(tickSz) &&
-      price >= minPx &&
-      price <= maxPx
-    ) {
-      return tickSz;
-    }
-  }
-
-  return 0.01;
-}
-
 function decimalsForStep(step) {
+
   const s =
     String(step);
 
-  if (!s.includes('.')) {
+  if (
+    !s.includes('.')
+  ) {
     return 0;
   }
 
@@ -1034,87 +1024,61 @@ function decimalsForStep(step) {
     .length;
 }
 
-function roundToTick(
-  value,
-  tick
-) {
-  if (!(tick > 0)) {
-    return value;
-  }
-
-  const decimals =
-    Math.max(
-      0,
-      decimalsForStep(tick)
-    );
-
-  const rounded =
-    Math.round(
-      value / tick
-    ) * tick;
-
-  return Number(
-    rounded.toFixed(decimals)
-  );
-}
-
 function roundDown(
   value,
   step
 ) {
+
   if (!(step > 0)) {
     return value;
   }
 
   const decimals =
-    Math.max(
-      0,
-      decimalsForStep(step)
-    );
+    decimalsForStep(step);
+
+  const n =
+    Math.floor(
+      (
+        value + 1e-12
+      ) / step
+    ) * step;
 
   return Number(
-    (
-      Math.floor(
-        value / step
-      ) * step
-    ).toFixed(decimals)
+    n.toFixed(decimals)
   );
 }
 
-/* =========================================================
-   EXPIRY
-========================================================= */
-
-function allowedExpiry(
-  inst
+function roundToStep(
+  value,
+  step
 ) {
-  const exp =
-    expiry(inst);
 
-  if (!exp) {
-    return false;
+  if (!(step > 0)) {
+    return value;
   }
 
-  const minutes =
-    (exp - Date.now()) /
-    60000;
+  const decimals =
+    decimalsForStep(step);
 
-  return (
-    minutes >=
-      MIN_MINUTES_TO_EXPIRY &&
-    minutes <=
-      MAX_MINUTES_TO_EXPIRY
+  const n =
+    Math.round(
+      value / step
+    ) * step;
+
+  return Number(
+    n.toFixed(decimals)
   );
 }
 
 /* =========================================================
-   PROBABILITY
+   MARKET PROBABILITY
 ========================================================= */
 
 function marketProbability(
   price,
   outcome
 ) {
+
   if (
     !(price > 0 && price < 1)
   ) {
@@ -1126,6 +1090,10 @@ function marketProbability(
     : 1 - price;
 }
 
+/* =========================================================
+   MODEL
+========================================================= */
+
 function modelProbability(
   direction,
   price,
@@ -1133,6 +1101,7 @@ function modelProbability(
   c5,
   c15
 ) {
+
   const p5 =
     pivots(c5);
 
@@ -1181,30 +1150,19 @@ function modelProbability(
       )
     );
 
-  const lastVol =
-    vol5[vol5.length - 1];
-
   const volRatio =
     avgVol > 0
-      ? lastVol / avgVol
+      ? vol5[
+          vol5.length - 1
+        ] / avgVol
       : 1;
 
   let score = 50;
 
   const reasons = [];
 
-  /*
-    UPDOWN:
-    Estimate direction from EMA/RSI.
-  */
-
-  let bullish;
-
-  if (direction === 'BELOW') {
-    bullish = false;
-  } else {
-    bullish = true;
-  }
+  const bullish =
+    direction === 'ABOVE';
 
   const trend5 =
     bullish
@@ -1239,16 +1197,12 @@ function modelProbability(
 
   if (momentum) {
     score += 10;
-    reasons.push(
-      'RSI'
-    );
+    reasons.push('RSI');
   }
 
   if (volRatio >= 1.15) {
     score += 8;
-    reasons.push(
-      'volume'
-    );
+    reasons.push('volume');
   }
 
   const resistance =
@@ -1275,7 +1229,9 @@ function modelProbability(
     price >=
       resistance * 0.999
   ) {
+
     score += 8;
+
     reasons.push(
       'SNR resistance test'
     );
@@ -1287,65 +1243,74 @@ function modelProbability(
     price <=
       support * 1.001
   ) {
+
     score += 8;
+
     reasons.push(
       'SNR support test'
     );
   }
 
+  const strikeDistance =
+    strikePx > 0
+      ? Math.abs(
+          price - strikePx
+        ) / price
+      : 1;
+
   if (
-    strikePx &&
-    direction === 'ABOVE'
+    bullish &&
+    price > strikePx
   ) {
-    if (price > strikePx) {
-      score += 8;
-      reasons.push(
-        'above strike'
-      );
-    }
+
+    score += 8;
+
+    reasons.push(
+      'above strike'
+    );
   }
 
   if (
-    strikePx &&
-    direction === 'BELOW'
+    !bullish &&
+    price < strikePx
   ) {
-    if (price < strikePx) {
-      score += 8;
-      reasons.push(
-        'below strike'
-      );
-    }
+
+    score += 8;
+
+    reasons.push(
+      'below strike'
+    );
   }
 
   if (
-    strikePx &&
-    price > 0
+    strikeDistance <
+    0.0025
   ) {
-    const distance =
-      Math.abs(
-        price - strikePx
-      ) / price;
 
-    if (distance < 0.0025) {
-      score -= 10;
-      reasons.push(
-        'strike too close'
-      );
-    }
+    score -= 10;
+
+    reasons.push(
+      'strike too close'
+    );
   }
 
   if (
     atr5 &&
     price > 0
   ) {
+
     const atrPct =
       atr5 / price;
 
-    if (atrPct < 0.001) {
+    if (
+      atrPct < 0.001
+    ) {
       score -= 5;
     }
 
-    if (atrPct > 0.03) {
+    if (
+      atrPct > 0.03
+    ) {
       score -= 8;
     }
   }
@@ -1358,6 +1323,11 @@ function modelProbability(
         score
       )
     );
+
+  /*
+    This is still a MODEL estimate.
+    It is NOT a backtested win rate.
+  */
 
   const probability =
     Math.max(
@@ -1378,16 +1348,18 @@ function modelProbability(
 }
 
 /* =========================================================
-   ACCOUNT
+   EQUITY
 ========================================================= */
 
 async function getEquity() {
+
   if (!LIVE_TRADING) {
+
     return Math.max(
       START_CAPITAL,
       Number(
         state.paperEquity ||
-          START_CAPITAL
+        START_CAPITAL
       )
     );
   }
@@ -1400,14 +1372,19 @@ async function getEquity() {
 
   const detail =
     rows[0]?.details?.find(
-      x => x.ccy === 'USDT'
+      x =>
+        x.ccy === 'USDT'
+    );
+
+  const available =
+    Number(
+      detail?.availBal
     );
 
   const equity =
-    Number(detail?.eq);
-
-  const available =
-    Number(detail?.availBal);
+    Number(
+      detail?.eq
+    );
 
   if (
     Number.isFinite(equity) &&
@@ -1428,51 +1405,95 @@ async function getEquity() {
   );
 }
 
+/* =========================================================
+   STAKE
+========================================================= */
+
 function stakeForEquity(
   equity
 ) {
-  const risk =
+
+  const calculated =
     equity * RISK_PCT;
 
   return Math.max(
     MIN_STAKE,
     Math.min(
-      equity * MAX_STAKE_PCT,
-      risk
+      equity *
+        MAX_STAKE_PCT,
+      calculated
     )
   );
 }
 
 /* =========================================================
-   CANDIDATE SCAN
+   EXPIRY FILTER
 ========================================================= */
 
-function validPrice(price) {
+function allowedExpiry(inst) {
+
+  const exp =
+    expiry(inst);
+
+  if (!exp) {
+    return false;
+  }
+
+  const mins =
+    (
+      exp -
+      Date.now()
+    ) / 60000;
+
   return (
-    Number.isFinite(price) &&
-    price > MIN_ENTRY_PRICE &&
-    price < MAX_ENTRY_PRICE
+    mins >=
+      MIN_MINUTES_TO_EXPIRY &&
+    mins <=
+      MAX_MINUTES_TO_EXPIRY
   );
 }
 
+/* =========================================================
+   PRICE VALIDATION
+========================================================= */
+
+function validPrice(p) {
+
+  return (
+    Number.isFinite(p) &&
+    p >
+      MIN_ENTRY_PRICE &&
+    p <
+      MAX_ENTRY_PRICE
+  );
+}
+
+/* =========================================================
+   EVENT CANDIDATE SCAN
+========================================================= */
+
 async function scanCandidates() {
+
   const series =
     await eventSeries();
 
   const candidates = [];
 
-  const tickBands =
-    await getTickBands();
+  for (
+    const seriesId of series
+  ) {
 
-  for (const seriesId of series) {
-    let instruments = [];
+    let instruments;
 
     try {
+
       instruments =
         await eventInstruments(
           seriesId
         );
+
     } catch (e) {
+
       console.error(
         `Series ${seriesId}:`,
         e.message
@@ -1481,51 +1502,16 @@ async function scanCandidates() {
       continue;
     }
 
-    if (!instruments.length) {
-      continue;
-    }
+    for (
+      const inst of instruments
+    ) {
 
-    /*
-      Fetch event / market metadata.
-      These are used for identification and
-      future compatibility with OKX Event APIs.
-    */
-
-    let events = [];
-
-    try {
-      events =
-        await eventDetails(
-          seriesId
-        );
-    } catch (_) {}
-
-    let markets = [];
-
-    try {
-      markets =
-        await eventMarkets(
-          seriesId
-        );
-    } catch (_) {}
-
-    console.log(
-      `[Discovery] ${seriesId}: ` +
-      `${instruments.length} instruments, ` +
-      `${events.length} events, ` +
-      `${markets.length} markets`
-    );
-
-    for (const inst of instruments) {
       if (
         inst.state &&
         ![
-          'live',
-          'preopen'
+          'live'
         ].includes(
-          String(
-            inst.state
-          ).toLowerCase()
+          inst.state
         )
       ) {
         continue;
@@ -1540,41 +1526,35 @@ async function scanCandidates() {
       const coin =
         baseAsset(inst);
 
-      if (
-        !coin ||
-        !UNDERLYING_MAP[coin]
-      ) {
-        continue;
-      }
-
-      const direction =
-        eventDirection(inst);
-
-      if (
-        direction === 'UNKNOWN'
-      ) {
-        continue;
-      }
-
-      /*
-        Do not invent strike for contracts
-        that don't have one.
-      */
-
       const strikePx =
         strike(inst);
+
+      const type =
+        eventType(inst);
+
+      if (
+        !coin ||
+        !strikePx ||
+        type === 'UNKNOWN'
+      ) {
+        continue;
+      }
 
       const underlying =
         UNDERLYING_MAP[coin];
 
       try {
+
         const [
           eventTicker,
           c5,
           c15
         ] =
           await Promise.all([
-            ticker(inst.instId),
+            ticker(
+              inst.instId,
+              'EVENTS'
+            ),
 
             candles(
               underlying,
@@ -1589,56 +1569,36 @@ async function scanCandidates() {
             )
           ]);
 
-        if (
-          !eventTicker
-        ) {
-          continue;
-        }
-
         /*
-          OKX EVENTS market data returns
-          YES-side data.
-
-          NO is derived:
-          NO price = 1 - YES price
+          OKX EVENTS market data returns YES.
+          NO is derived as 1 - YES.
         */
 
         const yesAsk =
           Number(
-            eventTicker.askPx ||
-            eventTicker.last
+            eventTicker?.askPx ||
+            eventTicker?.last
           );
 
         const yesBid =
           Number(
-            eventTicker.bidPx ||
-            eventTicker.last
+            eventTicker?.bidPx ||
+            eventTicker?.last
           );
 
         if (
-          !(yesAsk > 0) ||
-          !(yesBid > 0)
+          !(
+            yesAsk > 0 &&
+            yesBid > 0
+          )
         ) {
           continue;
         }
 
-        /*
-          For ABOVE / general binary events:
-          model YES when event direction is favorable.
-
-          For DOWN / BELOW:
-          trade NO.
-        */
-
-        let side;
-
-        if (
-          direction === 'BELOW'
-        ) {
-          side = 'no';
-        } else {
-          side = 'yes';
-        }
+        const side =
+          type === 'ABOVE'
+            ? 'yes'
+            : 'no';
 
         const entryPx =
           side === 'yes'
@@ -1651,118 +1611,79 @@ async function scanCandidates() {
           continue;
         }
 
-        const lastCandle =
-          c5[c5.length - 1];
-
-        if (!lastCandle) {
-          continue;
-        }
-
         const underlyingPrice =
           Number(
-            lastCandle[4]
+            c5[
+              c5.length - 1
+            ][4]
           );
-
-        if (
-          !(
-            underlyingPrice >
-            0
-          )
-        ) {
-          continue;
-        }
 
         const model =
           modelProbability(
-            direction,
+            type,
             underlyingPrice,
             strikePx,
             c5,
             c15
           );
 
-        const marketProb =
+        const mktProb =
           marketProbability(
             entryPx,
             side
           );
 
         if (
-          marketProb === null
+          mktProb === null
         ) {
           continue;
         }
 
         const edge =
           model.probability -
-          marketProb;
+          mktProb;
 
         if (
           model.score <
-          MIN_SCORE
-        ) {
-          continue;
-        }
-
-        if (
+            MIN_SCORE ||
           edge <
-          MIN_EDGE
+            MIN_EDGE
         ) {
           continue;
         }
-
-        const tick =
-          tickSizeForPrice(
-            entryPx,
-            tickBands
-          );
-
-        const adjustedEntry =
-          roundToTick(
-            entryPx,
-            tick
-          );
 
         candidates.push({
           inst,
-
-          seriesId,
-
           coin,
-
           underlying,
-
           strikePx,
-
-          direction,
-
+          type,
           side,
-
-          entryPx:
-            adjustedEntry,
-
-          yesAsk,
-
-          yesBid,
-
+          entryPx,
           modelProb:
             model.probability,
-
-          marketProb,
-
+          marketProb:
+            mktProb,
           edge,
-
           score:
             model.score,
-
           reasons:
             model.reasons,
+          underlyingPrice,
 
-          underlyingPrice
+          /*
+            Store current YES prices
+            for diagnostics.
+          */
+
+          yesAsk,
+          yesBid
         });
+
       } catch (e) {
+
         console.error(
-          `Candidate ${inst.instId}:`,
+          `Candidate scan ${inst.instId}:`,
           e.message
         );
       }
@@ -1777,124 +1698,232 @@ async function scanCandidates() {
 }
 
 /* =========================================================
-   ORDER SIZE
+   GET EVENT INSTRUMENT RULES
 ========================================================= */
 
-function getLotSize(inst) {
-  const lot =
-    Number(inst.lotSz);
+function getEventRules(
+  inst
+) {
 
-  const min =
-    Number(inst.minSz);
+  const lotSz =
+    Number(
+      inst.lotSz
+    );
+
+  const minSz =
+    Number(
+      inst.minSz
+    );
+
+  const tickSz =
+    Number(
+      inst.tickSz ||
+      0.01
+    );
+
+  if (
+    !(lotSz > 0)
+  ) {
+    throw new Error(
+      `Invalid EVENTS lotSz: ${JSON.stringify(inst)}`
+    );
+  }
+
+  if (
+    !(minSz > 0)
+  ) {
+    throw new Error(
+      `Invalid EVENTS minSz: ${JSON.stringify(inst)}`
+    );
+  }
 
   return {
-    lot:
-      Number.isFinite(lot) &&
-      lot > 0
-        ? lot
-        : 1,
-
-    min:
-      Number.isFinite(min) &&
-      min > 0
-        ? min
-        : 1
+    lotSz,
+    minSz,
+    tickSz
   };
 }
 
 /* =========================================================
-   EVENT ORDER
+   CALCULATE EVENT CONTRACT SIZE
+========================================================= */
+
+function calculateEventSize(
+  stake,
+  price,
+  inst
+) {
+
+  const {
+    lotSz,
+    minSz
+  } =
+    getEventRules(inst);
+
+  /*
+    Event Contract:
+    margin / cost ≈ price × number of shares
+
+    Example:
+    5.05 / 0.51
+    = 9.9019 shares
+
+    Then round DOWN to OKX lotSz.
+  */
+
+  const rawSz =
+    stake / price;
+
+  const sz =
+    roundDown(
+      rawSz,
+      lotSz
+    );
+
+  if (
+    !(sz > 0)
+  ) {
+    throw new Error(
+      `Calculated EVENTS size is zero. ` +
+      `stake=${stake}, price=${price}, ` +
+      `lotSz=${lotSz}, minSz=${minSz}`
+    );
+  }
+
+  if (
+    sz < minSz
+  ) {
+    throw new Error(
+      `EVENTS size below minimum. ` +
+      `sz=${sz}, minSz=${minSz}`
+    );
+  }
+
+  return {
+    rawSz,
+    sz,
+    lotSz,
+    minSz,
+
+    estimatedCost:
+      sz * price
+  };
+}
+
+/* =========================================================
+   PLACE EVENT ENTRY
 ========================================================= */
 
 async function placeEventOrder(
   candidate,
   stake
 ) {
+
   const inst =
     candidate.inst;
 
+  const sizeInfo =
+    calculateEventSize(
+      stake,
+      candidate.entryPx,
+      inst
+    );
+
   const {
-    lot,
-    min
+    sz,
+    estimatedCost,
+    lotSz,
+    minSz
   } =
-    getLotSize(inst);
+    sizeInfo;
 
   /*
-    Event limit order:
-    sz = number of contracts.
+    IMPORTANT:
+    Use FOK instead of IOC.
 
-    Approximate cost:
-    contracts × event price
+    IOC can partially fill.
+    FOK must fully fill or cancel.
+
+    This prevents:
+      planned 5.05U
+      actual 0.05U
+    caused by thin liquidity.
   */
-
-  let sz =
-    stake /
-    candidate.entryPx;
-
-  sz =
-    roundDown(
-      sz,
-      lot
-    );
-
-  if (
-    sz < min
-  ) {
-    throw new Error(
-      `Order size below minimum: ` +
-      `sz=${sz}, min=${min}`
-    );
-  }
-
-  const notional =
-    sz *
-    candidate.entryPx;
-
-  if (
-    notional >
-    stake * 1.03
-  ) {
-    throw new Error(
-      `Order exceeds stake budget: ` +
-      `${notional.toFixed(4)}`
-    );
-  }
 
   const body = {
     instId:
       inst.instId,
 
+    /*
+      Current OKX EVENTS documentation:
+      Event Contracts support isolated.
+    */
     tdMode:
       'isolated',
 
     side:
       'buy',
 
+    /*
+      FOK = full fill or cancel.
+    */
     ordType:
-      'ioc',
+      'fok',
 
     px:
-      candidate.entryPx.toString(),
+      Number(
+        candidate.entryPx
+      ).toFixed(2),
 
     sz:
       String(sz),
 
+    /*
+      Required for EVENTS.
+    */
     outcome:
       candidate.side,
-
-    speedBump:
-      '1',
 
     clOrdId:
       `snr${Date.now().toString(36)}`
         .slice(0, 32)
   };
 
-  /*
-    PAPER MODE
-  */
+  console.log(
+    '[EVENT ORDER]',
+    JSON.stringify({
+      instId:
+        inst.instId,
+
+      side:
+        candidate.side,
+
+      price:
+        candidate.entryPx,
+
+      stake,
+
+      rawSz:
+        sizeInfo.rawSz,
+
+      sz,
+
+      lotSz,
+
+      minSz,
+
+      estimatedCost,
+
+      ordType:
+        'fok',
+
+      live:
+        LIVE_TRADING
+    })
+  );
 
   if (!LIVE_TRADING) {
+
     return {
       ordId:
         `SIM-${Date.now()}`,
@@ -1915,10 +1944,6 @@ async function placeEventOrder(
     };
   }
 
-  /*
-    LIVE
-  */
-
   const rows =
     await privateRequest(
       'POST',
@@ -1931,25 +1956,38 @@ async function placeEventOrder(
 
   if (
     !result ||
-    String(result.sCode) !== '0'
+    String(
+      result.sCode
+    ) !== '0'
   ) {
+
     throw new Error(
-      `Order rejected: ` +
-      JSON.stringify(result)
+      `Order rejected: ${JSON.stringify(result)}`
     );
   }
 
-  return result;
+  return {
+    ...result,
+
+    requestedSz:
+      sz,
+
+    requestedStake:
+      stake,
+
+    estimatedCost
+  };
 }
 
 /* =========================================================
-   ORDER QUERY
+   GET ORDER
 ========================================================= */
 
 async function getOrder(
   instId,
   ordId
 ) {
+
   const rows =
     await privateRequest(
       'GET',
@@ -1963,13 +2001,14 @@ async function getOrder(
 }
 
 /* =========================================================
-   CLOSE EVENT POSITION
+   CLOSE POSITION
 ========================================================= */
 
 async function closePosition(
   position,
   currentPx
 ) {
+
   const body = {
     instId:
       position.inst.instId,
@@ -1980,28 +2019,38 @@ async function closePosition(
     side:
       'sell',
 
+    /*
+      IOC is intentional on exits.
+      We prefer exiting immediately.
+    */
     ordType:
       'ioc',
 
     px:
-      Number(currentPx)
-        .toString(),
+      Number(
+        currentPx
+      ).toFixed(2),
 
     sz:
-      String(position.sz),
+      String(
+        position.sz
+      ),
 
     outcome:
       position.side,
-
-    speedBump:
-      '1',
 
     clOrdId:
       `exit${Date.now().toString(36)}`
         .slice(0, 32)
   };
 
+  console.log(
+    '[EVENT EXIT ORDER]',
+    JSON.stringify(body)
+  );
+
   if (!LIVE_TRADING) {
+
     const pnl =
       (
         Number(currentPx) -
@@ -2015,6 +2064,9 @@ async function closePosition(
 
       avgPx:
         currentPx,
+
+      accFillSz:
+        position.sz,
 
       pnl,
 
@@ -2035,11 +2087,13 @@ async function closePosition(
 
   if (
     !result ||
-    String(result.sCode) !== '0'
+    String(
+      result.sCode
+    ) !== '0'
   ) {
+
     throw new Error(
-      `Exit rejected: ` +
-      JSON.stringify(result)
+      `Exit rejected: ${JSON.stringify(result)}`
     );
   }
 
@@ -2051,17 +2105,22 @@ async function closePosition(
 ========================================================= */
 
 async function managePosition() {
-  if (!state.position) {
+
+  if (
+    !state.position
+  ) {
     return;
   }
 
-  const position =
+  const p =
     state.position;
 
   try {
+
     const t =
       await ticker(
-        position.inst.instId
+        p.inst.instId,
+        'EVENTS'
       );
 
     const yesBid =
@@ -2077,142 +2136,200 @@ async function managePosition() {
     }
 
     /*
-      YES:
-        current = YES bid
-
-      NO:
-        current = 1 - YES ask
-
-      Using YES bid for NO would overstate
-      the executable NO exit price.
-
-      If OKX provides ask, use it.
+      Current YES market price.
+      NO price = 1 - YES.
     */
 
-    const yesAsk =
-      Number(
-        t?.askPx ||
-        t?.last
-      );
-
-    let currentBid;
-
-    if (
-      position.side === 'yes'
-    ) {
-      currentBid =
-        yesBid;
-    } else {
-      currentBid =
-        1 - yesAsk;
-    }
-
-    if (
-      !(
-        currentBid > 0 &&
-        currentBid < 1
-      )
-    ) {
-      return;
-    }
+    const currentBid =
+      p.side === 'yes'
+        ? yesBid
+        : 1 - yesBid;
 
     const change =
       (
         currentBid -
-        position.entryPx
+        p.entryPx
       ) /
-      position.entryPx;
+      p.entryPx;
+
+    /*
+      Early TP / SL
+    */
 
     if (
-      change >= EARLY_TP_PCT ||
-      change <= -EARLY_SL_PCT
+      change >=
+        EARLY_TP_PCT ||
+      change <=
+        -EARLY_SL_PCT
     ) {
+
       const result =
         await closePosition(
-          position,
+          p,
           currentBid
         );
 
-      const exitPx =
+      /*
+        In LIVE mode:
+        accFillSz is the cumulative
+        filled exit quantity.
+      */
+
+      let exitSz =
+        Number(
+          result?.accFillSz ||
+          result?.fillSz ||
+          0
+        );
+
+      let exitPx =
         Number(
           result?.avgPx ||
+          result?.fillPx ||
           currentBid
+        );
+
+      /*
+        Paper mode always exits all.
+      */
+
+      if (
+        !LIVE_TRADING
+      ) {
+        exitSz =
+          p.sz;
+      }
+
+      if (
+        !(exitSz > 0)
+      ) {
+
+        console.log(
+          'Exit had no fill:',
+          JSON.stringify(result)
+        );
+
+        return;
+      }
+
+      /*
+        Never close more than current position.
+      */
+
+      exitSz =
+        Math.min(
+          exitSz,
+          p.sz
         );
 
       const pnl =
         (
           exitPx -
-          position.entryPx
+          p.entryPx
         ) *
-        position.sz;
+        exitSz;
 
-      state.realizedPnl += pnl;
+      const remainingSz =
+        Math.max(
+          0,
+          p.sz -
+            exitSz
+        );
+
+      state.realizedPnl +=
+        pnl;
 
       state.paperEquity =
         Math.max(
           0,
           Number(
             state.paperEquity ||
-              START_CAPITAL
+            START_CAPITAL
           ) + pnl
         );
 
-      state.consecutiveLosses =
-        pnl < 0
-          ? state.consecutiveLosses + 1
-          : 0;
-
-      state.trades.push({
-        at:
-          new Date().toISOString(),
-
-        instId:
-          position.inst.instId,
-
-        side:
-          position.side,
-
-        entryPx:
-          position.entryPx,
-
-        exitPx,
-
-        sz:
-          position.sz,
-
-        pnl
-      });
+      /*
+        If fully closed:
+      */
 
       if (
-        state.trades.length >
-        200
+        remainingSz <= 1e-12
       ) {
-        state.trades.shift();
-      }
 
-      state.position = null;
+        state.consecutiveLosses =
+          pnl < 0
+            ? state.consecutiveLosses + 1
+            : 0;
 
-      if (
-        state.consecutiveLosses >=
-        MAX_CONSECUTIVE_LOSSES
-      ) {
-        state.halted = true;
+        state.trades.push({
+          at:
+            new Date().toISOString(),
+
+          instId:
+            p.inst.instId,
+
+          side:
+            p.side,
+
+          entryPx:
+            p.entryPx,
+
+          exitPx,
+
+          sz:
+            exitSz,
+
+          pnl
+        });
+
+        if (
+          state.trades.length >
+          200
+        ) {
+          state.trades.shift();
+        }
+
+        state.position =
+          null;
+
+        if (
+          state.consecutiveLosses >=
+          MAX_CONSECUTIVE_LOSSES
+        ) {
+          state.halted =
+            true;
+        }
+
+      } else {
+
+        /*
+          Partial exit:
+          Keep the remaining position.
+        */
+
+        state.position = {
+          ...p,
+          sz:
+            remainingSz
+        };
       }
 
       saveState();
 
       await notify(
         `${pnl >= 0 ? '🟢' : '🔴'} EVENT EXIT\n` +
-        `${position.inst.instId}\n` +
-        `${position.side.toUpperCase()}\n` +
-        `Entry ${position.entryPx}\n` +
-        `Exit ${exitPx}\n` +
-        `PnL ${pnl >= 0 ? '+' : ''}` +
-        `${pnl.toFixed(3)}U\n` +
+        `${p.inst.instId}\n` +
+        `${p.side.toUpperCase()}\n` +
+        `Exit ${exitPx.toFixed(4)}\n` +
+        `Closed ${exitSz}\n` +
+        `Remaining ${remainingSz}\n` +
+        `PnL ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}U\n` +
         `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
       );
     }
+
   } catch (e) {
+
     console.error(
       'Position manager:',
       e.message
@@ -2221,10 +2338,11 @@ async function managePosition() {
 }
 
 /* =========================================================
-   TRADE
+   MAYBE TRADE
 ========================================================= */
 
 async function maybeTrade() {
+
   if (
     riskBlocked() ||
     state.position
@@ -2235,9 +2353,12 @@ async function maybeTrade() {
   let equity;
 
   try {
+
     equity =
       await getEquity();
+
   } catch (e) {
+
     console.error(
       'Equity:',
       e.message
@@ -2249,23 +2370,33 @@ async function maybeTrade() {
   if (
     !state.startEquity
   ) {
+
     state.startEquity =
       equity;
 
     saveState();
   }
 
+  /*
+    Daily loss lock.
+  */
+
   if (
     state.realizedPnl <=
-    -(equity * DAILY_LOSS_PCT)
+    -(
+      equity *
+      DAILY_LOSS_PCT
+    )
   ) {
-    state.halted = true;
+
+    state.halted =
+      true;
 
     saveState();
 
     await notify(
       `⛔ EVENT BOT DAILY LOSS LOCK\n` +
-      `PnL ${state.realizedPnl.toFixed(3)}U`
+      `PnL ${state.realizedPnl.toFixed(4)}U`
     );
 
     return;
@@ -2274,44 +2405,103 @@ async function maybeTrade() {
   const candidates =
     await scanCandidates();
 
-  if (!candidates.length) {
+  if (
+    !candidates.length
+  ) {
     return;
   }
 
-  const candidate =
+  const c =
     candidates[0];
+
+  /*
+    Position budget.
+  */
 
   const stake =
     Math.min(
-      stakeForEquity(equity),
+      stakeForEquity(
+        equity
+      ),
       equity
     );
 
+  /*
+    Calculate expected size BEFORE order.
+  */
+
+  let sizeInfo;
+
   try {
+
+    sizeInfo =
+      calculateEventSize(
+        stake,
+        c.entryPx,
+        c.inst
+      );
+
+  } catch (e) {
+
+    console.error(
+      'Size calculation:',
+      e.message
+    );
+
+    await notify(
+      `⚠️ EVENT SIZE ERROR\n` +
+      `${c.inst.instId}\n` +
+      `${e.message}`
+    );
+
+    return;
+  }
+
+  /*
+    Safety:
+    if estimated cost is materially below
+    requested stake because of lot-size rounding,
+    do not falsely report stake as actual.
+  */
+
+  const estimatedCost =
+    sizeInfo.estimatedCost;
+
+  try {
+
     const order =
       await placeEventOrder(
-        candidate,
+        c,
         stake
       );
 
     let filled =
       order;
 
+    /*
+      FOK should be either fully filled
+      or cancelled.
+
+      Still query the order to get
+      the actual fill.
+    */
+
     if (
       LIVE_TRADING &&
       order.ordId
     ) {
+
       await new Promise(
         resolve =>
           setTimeout(
             resolve,
-            1000
+            500
           )
       );
 
       filled =
         await getOrder(
-          candidate.inst.instId,
+          c.inst.instId,
           order.ordId
         );
     }
@@ -2320,7 +2510,6 @@ async function maybeTrade() {
       Number(
         filled?.accFillSz ||
         filled?.fillSz ||
-        filled?.sz ||
         0
       );
 
@@ -2328,37 +2517,98 @@ async function maybeTrade() {
       Number(
         filled?.avgPx ||
         filled?.fillPx ||
-        candidate.entryPx
+        c.entryPx
       );
+
+    /*
+      No fill:
+      FOK cancelled.
+    */
 
     if (
       !(fillSz > 0)
     ) {
+
       console.log(
-        'Order not filled:',
+        '[EVENT FOK NOT FILLED]',
         JSON.stringify(
           filled
         )
       );
 
+      await notify(
+        `⚪ EVENT NOT FILLED\n` +
+        `${c.inst.instId}\n` +
+        `${c.side.toUpperCase()}\n` +
+        `Wanted ${sizeInfo.sz} shares\n` +
+        `Budget ${stake.toFixed(2)}U\n` +
+        `FOK cancelled`
+      );
+
       return;
     }
 
+    /*
+      Actual cost.
+    */
+
+    const actualCost =
+      fillSz *
+      avgPx;
+
+    /*
+      Safety check.
+      If actual fill is significantly below
+      planned size, do not silently accept it.
+      With FOK this should not happen.
+    */
+
+    const sizeRatio =
+      fillSz /
+      sizeInfo.sz;
+
+    if (
+      sizeRatio <
+      0.999
+    ) {
+
+      console.error(
+        '[EVENT PARTIAL FILL DETECTED]',
+        {
+          requested:
+            sizeInfo.sz,
+
+          filled:
+            fillSz,
+
+          ratio:
+            sizeRatio,
+
+          order:
+            filled
+        }
+      );
+
+      /*
+        We do NOT automatically create a
+        position from an unexpected partial fill.
+        However, the exchange may already have
+        filled it. Therefore record it and manage it
+        safely rather than placing another order.
+      */
+    }
+
+    /*
+      REAL position uses ACTUAL fill size.
+    */
+
     state.position = {
+
       inst:
-        candidate.inst,
-
-      seriesId:
-        candidate.seriesId,
-
-      coin:
-        candidate.coin,
-
-      direction:
-        candidate.direction,
+        c.inst,
 
       side:
-        candidate.side,
+        c.side,
 
       sz:
         fillSz,
@@ -2366,19 +2616,32 @@ async function maybeTrade() {
       entryPx:
         avgPx,
 
+      /*
+        Budget originally requested.
+      */
+
       stake,
 
+      /*
+        Actual capital used.
+      */
+
+      actualCost,
+
+      requestedSz:
+        sizeInfo.sz,
+
       score:
-        candidate.score,
+        c.score,
 
       edge:
-        candidate.edge,
+        c.edge,
 
       modelProb:
-        candidate.modelProb,
+        c.modelProb,
 
       marketProb:
-        candidate.marketProb,
+        c.marketProb,
 
       openedAt:
         Date.now()
@@ -2391,100 +2654,117 @@ async function maybeTrade() {
 
     await notify(
       `🟡 EVENT ENTRY\n` +
-      `${candidate.inst.instId}\n` +
-      `${candidate.side.toUpperCase()}\n` +
+      `${c.inst.instId}\n` +
+      `${c.side.toUpperCase()}\n` +
       `Entry ${avgPx.toFixed(4)}\n` +
-      `Score ${candidate.score}\n` +
-      `Model ${(candidate.modelProb * 100).toFixed(1)}%\n` +
-      `Market ${(candidate.marketProb * 100).toFixed(1)}%\n` +
-      `Edge ${(candidate.edge * 100).toFixed(1)}%\n` +
-      `Stake ${stake.toFixed(2)}U\n` +
-      `Reason ${candidate.reasons.join(', ')}\n` +
+      `Score ${c.score}\n` +
+      `Model ${(c.modelProb * 100).toFixed(1)}%\n` +
+      `Market ${(c.marketProb * 100).toFixed(1)}%\n` +
+      `Edge ${(c.edge * 100).toFixed(1)}%\n` +
+      `Budget ${stake.toFixed(2)}U\n` +
+      `Requested ${sizeInfo.sz} shares\n` +
+      `Actual ${fillSz} shares\n` +
+      `Actual Cost ${actualCost.toFixed(4)}U\n` +
+      `Reason ${c.reasons.join(', ')}\n` +
       `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
     );
+
   } catch (e) {
+
     console.error(
       'Trade:',
       e.message
+    );
+
+    await notify(
+      `⚠️ EVENT ORDER ERROR\n` +
+      `${c.inst.instId}\n` +
+      `${e.message}`
     );
   }
 }
 
 /* =========================================================
-   HTTP
+   WEB
 ========================================================= */
 
-app.get('/', (req, res) => {
-  res.json({
-    ok: true,
+app.get(
+  '/',
+  (req, res) =>
+    res.json({
+      ok: true,
 
-    bot:
-      'OKX Event Contract SNR Rolling Bot',
+      bot:
+        'OKX Event Contract SNR Rolling Bot',
 
-    api:
-      'OKX 2026 Event Contracts',
+      type:
+        'EVENTS',
 
-    live:
-      LIVE_TRADING,
+      live:
+        LIVE_TRADING,
 
-    baseUrl:
-      BASE_URL,
+      position:
+        state.position
+          ? {
+              instId:
+                state.position
+                  .inst
+                  .instId,
 
-    position:
-      state.position
-        ? {
-            instId:
-              state.position.inst.instId,
+              side:
+                state.position
+                  .side,
 
-            side:
-              state.position.side,
+              entryPx:
+                state.position
+                  .entryPx,
 
-            entryPx:
-              state.position.entryPx,
+              sz:
+                state.position
+                  .sz,
 
-            sz:
-              state.position.sz
-          }
-        : null,
+              actualCost:
+                state.position
+                  .actualCost
+            }
+          : null,
 
-    halted:
-      state.halted,
+      halted:
+        state.halted,
 
-    consecutiveLosses:
-      state.consecutiveLosses,
+      consecutiveLosses:
+        state.consecutiveLosses,
 
-    realizedPnl:
-      state.realizedPnl
-  });
-});
+      realizedPnl:
+        state.realizedPnl
+    })
+);
 
 app.get(
   '/health',
-  (req, res) => {
+  (req, res) =>
     res.json({
       ok: true,
+
+      type:
+        'EVENTS',
 
       live:
         LIVE_TRADING,
 
       time:
-        new Date().toISOString()
-    });
-  }
+        new Date()
+          .toISOString()
+    })
 );
 
 app.get(
   '/status',
-  (req, res) => {
+  (req, res) =>
     res.json({
+
       live:
         LIVE_TRADING,
-
-      baseUrl:
-        BASE_URL,
-
-      eventCoins:
-        EVENT_COINS,
 
       riskPct:
         RISK_PCT,
@@ -2508,58 +2788,29 @@ app.get(
         realizedPnl:
           state.realizedPnl
       }
-    });
-  }
+    })
 );
 
 /* =========================================================
-   START
+   MAIN LOOP
 ========================================================= */
 
-async function startupCheck() {
-  try {
-    const time =
-      await publicGet(
-        '/api/v5/public/time'
-      );
-
-    console.log(
-      '[OKX] API reachable.',
-      time[0]?.ts || ''
-    );
-  } catch (e) {
-    console.error(
-      '[OKX] API startup check failed:',
-      e.message
-    );
-  }
-
-  try {
-    const series =
-      await eventSeries();
-
-    console.log(
-      '[OKX] Event series:',
-      series.slice(0, 20)
-    );
-  } catch (e) {
-    console.error(
-      '[OKX] Event discovery:',
-      e.message
-    );
-  }
-}
-
 async function mainLoop() {
+
   resetDaily();
 
   try {
+
     await managePosition();
 
-    if (!state.position) {
+    if (
+      !state.position
+    ) {
       await maybeTrade();
     }
+
   } catch (e) {
+
     console.error(
       'MAIN LOOP:',
       e.message || e
@@ -2567,9 +2818,14 @@ async function mainLoop() {
   }
 }
 
+/* =========================================================
+   SERVER
+========================================================= */
+
 app.listen(
   PORT,
-  async () => {
+  () => {
+
     console.log(
       `Event bot listening on ${PORT}`
     );
@@ -2583,14 +2839,34 @@ app.listen(
     );
 
     console.log(
-      `EVENT_COINS=${EVENT_COINS.join(',')}`
+      `EVENT_SERIES=${EVENT_SERIES || 'AUTO'}`
     );
 
-    await startupCheck();
+    console.log(
+      `RISK_PCT=${RISK_PCT}`
+    );
 
-    await mainLoop();
+    console.log(
+      `MIN_EDGE=${MIN_EDGE}`
+    );
+
+    console.log(
+      `MIN_SCORE=${MIN_SCORE}`
+    );
+
+    console.log(
+      `ENTRY_ORDER=FOK`
+    );
+
+    console.log(
+      `EVENT_TD_MODE=isolated`
+    );
   }
 );
+
+/* =========================================================
+   TIMERS
+========================================================= */
 
 setInterval(
   mainLoop,
@@ -2601,3 +2877,11 @@ setInterval(
   managePosition,
   POSITION_CHECK_INTERVAL
 );
+
+mainLoop()
+  .catch(
+    e =>
+      console.error(
+        e
+      )
+  );
