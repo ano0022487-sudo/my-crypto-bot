@@ -2,7 +2,7 @@
 
 /*
 ===========================================================
- OKX EVENT CONTRACT SNR ROLLING BOT (COMPOUNDING & FIXED 5)
+ OKX EVENT CONTRACT SNR ROLLING BOT (FIXED 5 CARDS)
 ===========================================================
 */
 
@@ -145,23 +145,11 @@ const BOT_STATE_FILE =
   );
 
 /* =========================================================
-   STRATEGY CONFIG (COMPOUNDING & SIZE)
+   HARDCODED ORDER CONFIG
 ========================================================= */
 
-const STRATEGY_CONFIG = {
-  USE_COMPOUNDING: true, // true: 啟用複利滾倉 | false: 強制一次買 5 張
-  LEVERAGE: 10,          // 滾倉槓桿倍數
-  FIXED_SIZE: 5,         // 固定模式張數
-};
-
-function calculateOrderSize(entryPx, currentEquity, contractValue = 1) {
-  if (!STRATEGY_CONFIG.USE_COMPOUNDING) {
-    return STRATEGY_CONFIG.FIXED_SIZE;
-  }
-  const totalNominalValue = currentEquity * STRATEGY_CONFIG.LEVERAGE;
-  const calculatedSz = Math.floor(totalNominalValue / (entryPx * contractValue));
-  return Math.max(1, calculatedSz);
-}
+// 強制固定每次開倉 5 張，停用任何動態計算
+const ORDER_SIZE_FIXED = 5;
 
 const UNDERLYING_MAP = {
   BTC: 'BTC-USDT-SWAP',
@@ -2080,7 +2068,7 @@ async function scanCandidates() {
 }
 
 /* =========================================================
-   ORDER EXECUTION (COMPOUNDING / FIXED)
+   ORDER EXECUTION (HARDCODED FIXED SIZE)
 ========================================================= */
 
 async function placeEventOrder(
@@ -2120,12 +2108,8 @@ async function placeEventOrder(
       tickSz
     );
 
-  // 計算動態下單張數
-  const sz = calculateOrderSize(
-    px,
-    currentEquity,
-    Number(inst.ctVal || 1)
-  );
+  // 硬編碼固定開倉 5 張
+  const sz = ORDER_SIZE_FIXED;
 
   const body = {
 
@@ -2783,7 +2767,7 @@ async function maybeTrade() {
       Number(
         filled?.accFillSz ||
         filled?.fillSz ||
-        0
+        ORDER_SIZE_FIXED
       );
 
     const avgPx =
@@ -2915,9 +2899,8 @@ app.get(
   (req, res) => {
     res.json({
       ok: true,
-      bot: 'OKX Event Contract SNR Rolling Bot',
+      bot: 'OKX Event Contract Bot (Fixed 5)',
       live: LIVE_TRADING,
-      compounding: STRATEGY_CONFIG.USE_COMPOUNDING,
       position: state.position
     });
   }
