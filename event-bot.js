@@ -315,7 +315,6 @@ if (bot) {
 
   /*
     不處理 /start。
-    你的需求是開單通知即可。
   */
 }
 
@@ -1213,17 +1212,6 @@ async function getTicker(
    EVENT SERIES
 ========================================================= */
 
-/*
-  不再呼叫：
-
-    /api/v5/public/event-series
-    /api/v5/public/series
-
-  這兩個路徑造成你之前的 404。
-
-  EVENTS instruments 官方需要 seriesId。
-*/
-
 function getConfiguredSeries() {
 
   if (
@@ -1245,14 +1233,6 @@ function getConfiguredSeries() {
     .filter(Boolean);
 }
 
-/*
-  目前主要交易：
-    BTC-UPDOWN-15MIN
-    ETH-UPDOWN-15MIN
-    SOL-UPDOWN-15MIN
-
-  這裡產生系列候選。
-*/
 function generatedSeries() {
 
   const result = [];
@@ -1269,20 +1249,6 @@ function generatedSeries() {
   return result;
 }
 
-/*
-  解析事件時間。
-
-  例如：
-
-  SOL-UPDOWN-15MIN-260818-2230-2245
-
-  年月日：
-    26 08 18
-
-  時間：
-    22:30
-    22:45
-*/
 function parseExpiryFromInstId(
   instId
 ) {
@@ -1352,13 +1318,6 @@ function parseExpiryFromInstId(
   );
 }
 
-/*
-  如果 API 回傳 expTime，
-  優先使用 API。
-
-  沒有 expTime，
-  再從 instId 解析。
-*/
 function getExpiry(
   inst
 ) {
@@ -1418,10 +1377,6 @@ function minutesToExpiry(
   60000;
 }
 
-/*
-  不使用 API expiry 時，
-  允許已經進入交易的 15m 合約。
-*/
 function allowedExpiry(
   inst
 ) {
@@ -1469,16 +1424,9 @@ async function getEventInstruments(
 
 async function discoverEventInstruments() {
 
-  /*
-    如果手動指定 EVENT_SERIES，
-    優先使用。
-  */
   let series =
     getConfiguredSeries();
 
-  /*
-    沒有指定才自動產生。
-  */
   if (
     !series.length &&
     AUTO_DISCOVER_SERIES
@@ -1575,13 +1523,6 @@ function getBaseAsset(
   return null;
 }
 
-/*
-  UPDOWN：
-    YES = 上漲
-    NO  = 下跌
-
-  本機器人只做 UPDOWN。
-*/
 function isUpDown(
   inst
 ) {
@@ -1806,17 +1747,11 @@ function modelProbability(
         avgVolume
       : 1;
 
-  /*
-    UP probability
-  */
   let score =
     50;
 
   const reasons = [];
 
-  /*
-    5m trend
-  */
   if (
     ema20_5 &&
     ema50_5 &&
@@ -1831,9 +1766,6 @@ function modelProbability(
     );
   }
 
-  /*
-    15m trend
-  */
   if (
     ema20_15 &&
     ema50_15 &&
@@ -1848,9 +1780,6 @@ function modelProbability(
     );
   }
 
-  /*
-    RSI
-  */
   if (
     rsi5 !== null &&
     rsi5 >= 55 &&
@@ -1864,9 +1793,6 @@ function modelProbability(
     );
   }
 
-  /*
-    Volume
-  */
   if (
     volumeRatio >= 1.15
   ) {
@@ -1878,9 +1804,6 @@ function modelProbability(
     );
   }
 
-  /*
-    Resistance test
-  */
   const resistance =
     nearestAbove(
       [
@@ -1903,9 +1826,6 @@ function modelProbability(
     );
   }
 
-  /*
-    Strike
-  */
   if (
     strikePx &&
     strikePx > 0
@@ -1943,9 +1863,6 @@ function modelProbability(
     }
   }
 
-  /*
-    ATR
-  */
   if (
     atr5 &&
     price > 0
@@ -1981,14 +1898,6 @@ function modelProbability(
       )
     );
 
-  /*
-    Model mapping
-
-    50 = 50%
-    80 = 68%
-    90 = 74%
-    100 = 80%
-  */
   const probability =
     Math.max(
       0.50,
@@ -2003,9 +1912,6 @@ function modelProbability(
       )
     );
 
-  /*
-    DOWN probability
-  */
   const downProbability =
     1 -
     probability;
@@ -2099,27 +2005,12 @@ async function getEquity() {
 function stakeForEquity(
   equity
 ) {
-
-  const calculated =
-    equity *
-    RISK_PCT;
-
-  const maximum =
-    equity *
-    MAX_STAKE_PCT;
-
   /*
-    不超過帳戶本金
+    直接鎖定單筆交易最大額度為 5
   */
   return Math.min(
     equity,
-    Math.max(
-      MIN_STAKE,
-      Math.min(
-        maximum,
-        calculated
-      )
-    )
+    5
   );
 }
 
@@ -2143,13 +2034,6 @@ async function scanCandidates() {
     return [];
   }
 
-  /*
-    只保留：
-      BTC / ETH / SOL
-      UPDOWN
-      live
-      1~20 min expiry
-  */
   const filtered =
     instruments.filter(
       inst => {
@@ -2198,10 +2082,6 @@ async function scanCandidates() {
 
   const candidates = [];
 
-  /*
-    技術資料快取。
-    同一個幣不要重複抓 5m / 15m。
-  */
   const marketCache =
     {};
 
@@ -2271,9 +2151,6 @@ async function scanCandidates() {
         continue;
       }
 
-      /*
-        EVENT ticker
-      */
       const ticker =
         await getTicker(
           inst.instId,
@@ -2339,24 +2216,12 @@ async function scanCandidates() {
           c15
         );
 
-      /*
-        YES = UP
-        NO = DOWN
-      */
-
       const yesModel =
         model.upProbability;
 
       const noModel =
         model.downProbability;
 
-      /*
-        YES executable price
-        = ask
-
-        NO executable approximation
-        = 1 - YES bid
-      */
       const yesEntry =
         yesAsk;
 
@@ -2440,9 +2305,6 @@ async function scanCandidates() {
           noEdge;
       }
 
-      /*
-        Filters
-      */
       if (
         model.score <
         MIN_SCORE
@@ -2531,11 +2393,6 @@ async function placeEventOrder(
   const inst =
     candidate.inst;
 
-  /*
-    官方 EVENTS：
-      tdMode = isolated
-  */
-
   const tdMode =
     'isolated';
 
@@ -2571,10 +2428,6 @@ async function placeEventOrder(
     );
   }
 
-  /*
-    contracts =
-      stake / price
-  */
   const rawSz =
     stake /
     candidate.entryPx;
@@ -2629,9 +2482,6 @@ async function placeEventOrder(
     })
   );
 
-  /*
-    防止最小 lotSz 導致超過 stake 太多
-  */
   if (
     requestedNotional >
     stake * 1.05
@@ -2644,13 +2494,6 @@ async function placeEventOrder(
     );
   }
 
-  /*
-    OKX EVENTS
-    tdMode = isolated
-    outcome = yes/no
-
-    speedBump 不再送。
-  */
   const body = {
 
     instId:
@@ -2689,9 +2532,6 @@ async function placeEventOrder(
     )
   );
 
-  /*
-    PAPER
-  */
   if (
     !LIVE_TRADING
   ) {
@@ -2717,9 +2557,6 @@ async function placeEventOrder(
     };
   }
 
-  /*
-    LIVE
-  */
   const rows =
     await privateRequest(
       'POST',
@@ -2753,9 +2590,6 @@ async function placeEventOrder(
     );
   }
 
-  /*
-    等待成交資料
-  */
   if (
     result.ordId
   ) {
@@ -2857,10 +2691,6 @@ async function closePosition(
     );
   }
 
-  /*
-    EVENTS：
-      tdMode = isolated
-  */
   const body = {
 
     instId:
@@ -2899,9 +2729,6 @@ async function closePosition(
     )
   );
 
-  /*
-    PAPER
-  */
   if (
     !LIVE_TRADING
   ) {
@@ -2931,9 +2758,6 @@ async function closePosition(
     };
   }
 
-  /*
-    LIVE
-  */
   const rows =
     await privateRequest(
       'POST',
@@ -3044,17 +2868,6 @@ async function managePosition() {
       return;
     }
 
-    /*
-      YES：
-        exit reference = YES bid
-
-      NO：
-        exit reference =
-          1 - YES ask
-
-      用 ask 評估 NO 賣出，
-      避免拿錯邊價格。
-    */
     let currentPx;
 
     if (
@@ -3117,9 +2930,6 @@ async function managePosition() {
       })
     );
 
-    /*
-      TAKE PROFIT
-    */
     if (
       change >=
       EARLY_TP_PCT
@@ -3134,9 +2944,6 @@ async function managePosition() {
       return;
     }
 
-    /*
-      STOP LOSS
-    */
     if (
       change <=
       -EARLY_SL_PCT
@@ -3181,10 +2988,6 @@ async function exitPosition(
       currentPx
     );
 
-  /*
-    EVENTS position PnL
-    = price difference × contracts
-  */
   const pnl =
     (
       exitPx -
@@ -3318,9 +3121,6 @@ async function maybeTrade() {
     return;
   }
 
-  /*
-    一次只允許一個事件倉位
-  */
   if (
     state.position
   ) {
@@ -3355,9 +3155,6 @@ async function maybeTrade() {
     saveState();
   }
 
-  /*
-    Daily loss
-  */
   const dailyLossLimit =
     equity *
     DAILY_LOSS_PCT;
@@ -3409,9 +3206,6 @@ async function maybeTrade() {
   const candidate =
     candidates[0];
 
-  /*
-    Stake
-  */
   const stake =
     stakeForEquity(
       equity
@@ -3477,9 +3271,6 @@ async function maybeTrade() {
     let filled =
       order;
 
-    /*
-      LIVE 再讀一次 order
-    */
     if (
       LIVE_TRADING &&
       order?.ordId
@@ -3496,9 +3287,6 @@ async function maybeTrade() {
         );
     }
 
-    /*
-      真正成交數量
-    */
     const fillSz =
       Number(
         filled?.accFillSz ||
@@ -3513,9 +3301,6 @@ async function maybeTrade() {
         candidate.entryPx
       );
 
-    /*
-      IOC 完全沒成交
-    */
     if (
       !(
         fillSz > 0
@@ -3548,17 +3333,6 @@ async function maybeTrade() {
       })
     );
 
-    /*
-      如果成交量小於要求的 80%，
-      不把它當正常倉位。
-
-      這是針對你之前：
-
-        Requested 4.964U
-        Actual 0.041U
-
-      的保護。
-    */
     const minimumFill =
       stake * 0.80;
 
@@ -3573,10 +3347,6 @@ async function maybeTrade() {
         `actual=${actualStake.toFixed(4)}`
       );
 
-      /*
-        LIVE：
-        嘗試立即平掉異常小倉位。
-      */
       if (
         LIVE_TRADING
       ) {
@@ -3612,12 +3382,6 @@ async function maybeTrade() {
             '[EVENT] Emergency close:',
             closeErr.message
           );
-
-          /*
-            如果平不掉，
-            仍然記錄實際倉位，
-            避免機器人遺失倉位。
-          */
 
           state.position = {
 
@@ -3671,9 +3435,6 @@ async function maybeTrade() {
       return;
     }
 
-    /*
-      正常成交
-    */
     state.position = {
 
       inst:
@@ -3724,9 +3485,6 @@ async function maybeTrade() {
 
     saveState();
 
-    /*
-      Telegram
-    */
     await notify(
 
       `🟡 EVENT ENTRY\n` +
@@ -4223,10 +3981,6 @@ app.listen(
         err.message
       );
     }
-
-    /*
-      不自動發 Telegram 測試訊息。
-    */
   }
 );
 
