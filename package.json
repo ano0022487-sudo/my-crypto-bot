@@ -1,7 +1,6 @@
 {
-  "name": "okx-event-bot",
+  "name": "my-crypto-bot",
   "version": "1.0.0",
-  "description": "OKX Trading Bot",
   "main": "event-bot-runner.js",
   "scripts": {
     "start": "node event-bot-runner.js"
