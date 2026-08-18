@@ -148,7 +148,7 @@ const BOT_STATE_FILE =
    HARDCODED ORDER CONFIG
 ========================================================= */
 
-// 強制固定每次開倉 5 張，停用任何動態計算
+// 固定開倉 5 張
 const ORDER_SIZE_FIXED = 5;
 
 const UNDERLYING_MAP = {
@@ -799,76 +799,6 @@ function rsi(
     100 -
     100 /
       (1 + rs)
-  );
-}
-
-function atr(
-  candles,
-  period = 14
-) {
-
-  if (
-    candles.length <
-    period + 1
-  ) {
-
-    return null;
-  }
-
-  const trueRanges = [];
-
-  for (
-    let i = 1;
-    i < candles.length;
-    i++
-  ) {
-
-    const high =
-      Number(
-        candles[i][2]
-      );
-
-    const low =
-      Number(
-        candles[i][3]
-      );
-
-    const previousClose =
-      Number(
-        candles[i - 1][4]
-      );
-
-    trueRanges.push(
-
-      Math.max(
-
-        high - low,
-
-        Math.abs(
-          high -
-          previousClose
-        ),
-
-        Math.abs(
-          low -
-          previousClose
-        )
-      )
-    );
-  }
-
-  const recent =
-    trueRanges.slice(
-      -period
-    );
-
-  return (
-    recent.reduce(
-      (a, b) =>
-        a + b,
-      0
-    ) /
-    recent.length
   );
 }
 
@@ -2080,7 +2010,7 @@ async function placeEventOrder(
     candidate.inst;
 
   const tdMode =
-    'isolated';
+    'cash';
 
   const tickSz =
     Number(
@@ -2108,7 +2038,6 @@ async function placeEventOrder(
       tickSz
     );
 
-  // 硬編碼固定開倉 5 張
   const sz = ORDER_SIZE_FIXED;
 
   const body = {
@@ -2282,7 +2211,7 @@ async function closePosition(
       inst.instId,
 
     tdMode:
-      'isolated',
+      'cash',
 
     side:
       'sell',
