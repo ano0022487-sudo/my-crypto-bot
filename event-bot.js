@@ -2009,8 +2009,9 @@ async function placeEventOrder(
   const inst =
     candidate.inst;
 
+  // OKX 事件合約僅支援 isolated 模式
   const tdMode =
-    'cash';
+    'isolated';
 
   const tickSz =
     Number(
@@ -2047,6 +2048,9 @@ async function placeEventOrder(
 
     tdMode:
       tdMode,
+
+    ccy:
+      'USDT',
 
     side:
       'buy',
@@ -2167,7 +2171,7 @@ async function getOrder(
 
   return (
     rows?.[0] ||
-    null;
+    null
   );
 }
 
@@ -2211,7 +2215,10 @@ async function closePosition(
       inst.instId,
 
     tdMode:
-      'cash',
+      'isolated',
+
+    ccy:
+      'USDT',
 
     side:
       'sell',
