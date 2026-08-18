@@ -1,64 +1,83 @@
 'use strict';
 
 /*
-  ============================================================
-  OKX EVENT CONTRACT SNR ROLLING BOT
-  ============================================================
+===========================================================
+ OKX EVENT CONTRACT SNR ROLLING BOT
+===========================================================
 
-  Product:
-    OKX EVENTS only
+產品：
+  OKX EVENTS / Event Contracts
 
-  Main fixes:
-    1. EVENTS tdMode = isolated
-    2. EVENTS non-post-only orders include speedBump = "1"
-    3. FOK -> IOC
-    4. Re-read latest ticker before order
-    5. Actual fill size is used
-    6. NO FILL never creates fake position
-    7. YES / NO executable prices handled separately
-    8. NO position exit uses YES ask
-    9. Existing SNR / EMA / RSI / ATR / Edge / Score retained
-   10. No broken /api/v5/public/event-series
-   11. No broken /api/v5/public/series
-   12. Uses explicit EVENT_SERIES
-   13. Telegram notifications retained
-   14. Render health endpoints retained
+目前策略：
+  BTC / ETH / SOL
+  UPDOWN 15MIN
+  5m + 15m trend
+  EMA20 / EMA50
+  RSI
+  ATR
+  SNR
+  Volume
+  Model probability
+  Market probability
+  Edge filter
 
-  IMPORTANT:
-    LIVE_TRADING=false by default.
+交易：
+  LIVE_TRADING=false 預設
+  LIVE_TRADING=true 才會真的下單
 
-  Required ENV:
-    OK_ACCESS_KEY
-    OK_ACCESS_SECRET
-    OKX_PASSPHRASE
+重要：
+  EVENTS tdMode = isolated
+  outcome = yes / no
 
-  Optional ENV:
-    LIVE_TRADING
-    EVENT_SERIES
-    AUTO_DISCOVER_SERIES
-    START_CAPITAL
-    RISK_PCT
-    MAX_STAKE_PCT
-    MIN_STAKE
-    MIN_EDGE
-    MIN_SCORE
-    MIN_ENTRY_PRICE
-    MAX_ENTRY_PRICE
-    EARLY_TP_PCT
-    EARLY_SL_PCT
-    MIN_MINUTES_TO_EXPIRY
-    MAX_MINUTES_TO_EXPIRY
-    DAILY_LOSS_PCT
-    MAX_CONSECUTIVE_LOSSES
-    CHECK_INTERVAL
-    POSITION_CHECK_INTERVAL
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
+  speedBump：
+    2026-07-24 OKX changelog 已移除
+    本程式不再送 speedBump
 
-  Default EVENT_SERIES:
-    BTC-UPDOWN-15MIN
-    ETH-UPDOWN-15MIN
-    SOL-UPDOWN-15MIN
+===========================================================
+ REQUIRED ENV
+===========================================================
+
+OK_ACCESS_KEY
+OK_ACCESS_SECRET
+OKX_PASSPHRASE
+
+===========================================================
+ OPTIONAL ENV
+===========================================================
+
+LIVE_TRADING=false
+
+START_CAPITAL=20
+
+RISK_PCT=0.10
+MAX_STAKE_PCT=0.20
+MIN_STAKE=1
+
+MIN_EDGE=0.075
+MIN_SCORE=78
+
+MIN_ENTRY_PRICE=0.22
+MAX_ENTRY_PRICE=0.78
+
+EARLY_TP_PCT=0.30
+EARLY_SL_PCT=0.25
+
+MIN_MINUTES_TO_EXPIRY=1
+MAX_MINUTES_TO_EXPIRY=20
+
+DAILY_LOSS_PCT=0.20
+MAX_CONSECUTIVE_LOSSES=3
+
+CHECK_INTERVAL=15000
+POSITION_CHECK_INTERVAL=5000
+
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+EVENT_SERIES=
+AUTO_DISCOVER_SERIES=true
+
+===========================================================
 */
 
 const express = require('express');
@@ -69,6 +88,7 @@ const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
+
 app.use(express.json());
 
 /* =========================================================
@@ -98,10 +118,13 @@ const PASSPHRASE =
     process.env.OKX_PASSPHRASE || ''
   ).trim();
 
+/*
+  OKX Taiwan/global API endpoint.
+*/
 const BASE_URL =
   String(
     process.env.OKX_BASE_URL ||
-      'https://openapi.okx.com'
+    'https://www.okx.com'
   ).replace(/\/$/, '');
 
 const TELEGRAM_BOT_TOKEN =
@@ -178,12 +201,12 @@ const EARLY_SL_PCT =
 
 const MIN_MINUTES_TO_EXPIRY =
   Number(
-    process.env.MIN_MINUTES_TO_EXPIRY || 2
+    process.env.MIN_MINUTES_TO_EXPIRY || 1
   );
 
 const MAX_MINUTES_TO_EXPIRY =
   Number(
-    process.env.MAX_MINUTES_TO_EXPIRY || 30
+    process.env.MAX_MINUTES_TO_EXPIRY || 20
   );
 
 const DAILY_LOSS_PCT =
@@ -196,47 +219,15 @@ const MAX_CONSECUTIVE_LOSSES =
     process.env.MAX_CONSECUTIVE_LOSSES || 3
   );
 
-/*
-  IMPORTANT
-
-  Do NOT use the old broken discovery endpoints.
-
-  Default series are based on the actual Event Contract
-  instrument IDs you have already received:
-    ETH-UPDOWN-15MIN-...
-    SOL-UPDOWN-15MIN-...
-*/
-
-const DEFAULT_EVENT_SERIES = [
-  'BTC-UPDOWN-15MIN',
-  'ETH-UPDOWN-15MIN',
-  'SOL-UPDOWN-15MIN'
-];
-
 const EVENT_SERIES =
   String(
     process.env.EVENT_SERIES || ''
-  )
-    .split(',')
-    .map(x => x.trim())
-    .filter(Boolean);
-
-const CONFIGURED_SERIES =
-  EVENT_SERIES.length
-    ? EVENT_SERIES
-    : DEFAULT_EVENT_SERIES;
+  ).trim();
 
 const AUTO_DISCOVER_SERIES =
-  false;
-
-/*
-  Underlying instruments used ONLY for technical analysis.
-*/
-const UNDERLYING_MAP = {
-  BTC: 'BTC-USDT-SWAP',
-  ETH: 'ETH-USDT-SWAP',
-  SOL: 'SOL-USDT-SWAP'
-};
+  String(
+    process.env.AUTO_DISCOVER_SERIES || 'true'
+  ).toLowerCase() === 'true';
 
 const BOT_STATE_FILE =
   process.env.BOT_STATE_FILE ||
@@ -244,6 +235,21 @@ const BOT_STATE_FILE =
     __dirname,
     'event-bot-state.json'
   );
+
+/*
+  Technical-analysis underlying.
+*/
+const UNDERLYING_MAP = {
+  BTC: 'BTC-USDT-SWAP',
+  ETH: 'ETH-USDT-SWAP',
+  SOL: 'SOL-USDT-SWAP'
+};
+
+const ASSETS = [
+  'BTC',
+  'ETH',
+  'SOL'
+];
 
 /* =========================================================
    TELEGRAM
@@ -259,17 +265,10 @@ const bot =
       )
     : null;
 
-if (bot) {
-  bot.on(
-    'polling_error',
-    err => {
-      console.error(
-        '[Telegram polling]',
-        err.message
-      );
-    }
-  );
-}
+/*
+  不依賴 /start。
+  只有真正交易事件才通知。
+*/
 
 async function notify(text) {
 
@@ -297,10 +296,35 @@ async function notify(text) {
 }
 
 /* =========================================================
+   TELEGRAM POLLING ERROR
+========================================================= */
+
+if (bot) {
+
+  bot.on(
+    'polling_error',
+    err => {
+
+      console.error(
+        '[Telegram polling_error]',
+        err.message
+      );
+
+    }
+  );
+
+  /*
+    不處理 /start。
+    你的需求是開單通知即可。
+  */
+}
+
+/* =========================================================
    UTIL
 ========================================================= */
 
 function sleep(ms) {
+
   return new Promise(
     resolve =>
       setTimeout(
@@ -313,20 +337,19 @@ function sleep(ms) {
 function q(params) {
 
   return Object.entries(params)
+
     .filter(
       ([, value]) =>
         value !== undefined &&
         value !== null &&
         value !== ''
     )
+
     .map(
       ([key, value]) =>
-        `${encodeURIComponent(
-          key
-        )}=${encodeURIComponent(
-          value
-        )}`
+        `${encodeURIComponent(key)}=${encodeURIComponent(value)}`
     )
+
     .join('&');
 }
 
@@ -358,9 +381,10 @@ async function request(
         i <
         retries - 1
       ) {
+
         await sleep(
           500 *
-            (i + 1)
+          (i + 1)
         );
       }
     }
@@ -370,7 +394,7 @@ async function request(
 }
 
 /* =========================================================
-   OKX PUBLIC API
+   OKX PUBLIC
 ========================================================= */
 
 async function publicGet(
@@ -412,7 +436,7 @@ async function publicGet(
 }
 
 /* =========================================================
-   OKX SIGNATURE
+   OKX SIGN
 ========================================================= */
 
 function sign(
@@ -429,15 +453,15 @@ function sign(
     )
     .update(
       timestamp +
-        method.toUpperCase() +
-        requestPath +
-        body
+      method.toUpperCase() +
+      requestPath +
+      body
     )
     .digest('base64');
 }
 
 /* =========================================================
-   OKX PRIVATE API
+   OKX PRIVATE
 ========================================================= */
 
 async function privateRequest(
@@ -453,7 +477,7 @@ async function privateRequest(
   ) {
 
     throw new Error(
-      'OKX API credentials are missing'
+      'OKX API credentials missing'
     );
   }
 
@@ -462,9 +486,7 @@ async function privateRequest(
 
   const body =
     bodyObj
-      ? JSON.stringify(
-          bodyObj
-        )
+      ? JSON.stringify(bodyObj)
       : '';
 
   const headers = {
@@ -541,7 +563,7 @@ async function getServerTime() {
 
     return Number(
       rows?.[0]?.ts ||
-        Date.now()
+      Date.now()
     );
 
   } catch (_) {
@@ -598,6 +620,7 @@ function loadState() {
         BOT_STATE_FILE
       )
     ) {
+
       return freshState();
     }
 
@@ -610,7 +633,9 @@ function loadState() {
       );
 
     return {
+
       ...freshState(),
+
       ...data
     };
 
@@ -633,12 +658,15 @@ function saveState() {
   try {
 
     fs.writeFileSync(
+
       BOT_STATE_FILE,
+
       JSON.stringify(
         state,
         null,
         2
       ),
+
       'utf8'
     );
 
@@ -674,7 +702,7 @@ function resetDaily() {
         ? 0
         : Number(
             state.paperEquity ||
-              START_CAPITAL
+            START_CAPITAL
           );
 
     state.realizedPnl =
@@ -705,57 +733,57 @@ function riskBlocked() {
    CANDLES
 ========================================================= */
 
-function closes(
-  candles
-) {
+function closes(candles) {
 
   return candles
+
     .map(
       x =>
         Number(x[4])
     )
+
     .filter(
       Number.isFinite
     );
 }
 
-function highs(
-  candles
-) {
+function highs(candles) {
 
   return candles
+
     .map(
       x =>
         Number(x[2])
     )
+
     .filter(
       Number.isFinite
     );
 }
 
-function lows(
-  candles
-) {
+function lows(candles) {
 
   return candles
+
     .map(
       x =>
         Number(x[3])
     )
+
     .filter(
       Number.isFinite
     );
 }
 
-function volumes(
-  candles
-) {
+function volumes(candles) {
 
   return candles
+
     .map(
       x =>
         Number(x[5])
     )
+
     .filter(
       Number.isFinite
     );
@@ -771,9 +799,10 @@ function ema(
 ) {
 
   if (
-    !Array.isArray(values) ||
-    values.length < period
+    values.length <
+    period
   ) {
+
     return null;
   }
 
@@ -804,8 +833,10 @@ function ema(
       values[i] *
         multiplier +
       value *
-        (1 -
-          multiplier);
+        (
+          1 -
+          multiplier
+        );
   }
 
   return value;
@@ -824,6 +855,7 @@ function rsi(
     values.length <
     period + 1
   ) {
+
     return null;
   }
 
@@ -843,9 +875,14 @@ function rsi(
     if (
       change >= 0
     ) {
-      gains += change;
+
+      gains +=
+        change;
+
     } else {
-      losses -= change;
+
+      losses -=
+        change;
     }
   }
 
@@ -860,8 +897,7 @@ function rsi(
   for (
     let i =
       period + 1;
-    i <
-    values.length;
+    i < values.length;
     i++
   ) {
 
@@ -895,6 +931,7 @@ function rsi(
   if (
     avgLoss === 0
   ) {
+
     return 100;
   }
 
@@ -922,11 +959,11 @@ function atr(
     candles.length <
     period + 1
   ) {
+
     return null;
   }
 
-  const trueRanges =
-    [];
+  const trueRanges = [];
 
   for (
     let i = 1;
@@ -950,17 +987,19 @@ function atr(
       );
 
     trueRanges.push(
+
       Math.max(
+
         high - low,
 
         Math.abs(
           high -
-            previousClose
+          previousClose
         ),
 
         Math.abs(
           low -
-            previousClose
+          previousClose
         )
       )
     );
@@ -990,17 +1029,18 @@ function confirmed(
 ) {
 
   return candles
+
     .slice()
+
     .sort(
       (a, b) =>
         Number(a[0]) -
         Number(b[0])
     )
+
     .filter(
       x =>
-        String(
-          x[8]
-        ) === '1'
+        String(x[8]) === '1'
     );
 }
 
@@ -1019,25 +1059,21 @@ function pivots(
   const l =
     lows(candles);
 
-  const resistance =
-    [];
-
-  const support =
-    [];
+  const resistance = [];
+  const support = [];
 
   for (
     let i = lookback;
     i <
       candles.length -
-        lookback;
+      lookback;
     i++
   ) {
 
     const highest =
       Math.max(
         ...h.slice(
-          i -
-            lookback,
+          i - lookback,
           i +
             lookback +
             1
@@ -1047,8 +1083,7 @@ function pivots(
     const lowest =
       Math.min(
         ...l.slice(
-          i -
-            lookback,
+          i - lookback,
           i +
             lookback +
             1
@@ -1056,16 +1091,20 @@ function pivots(
       );
 
     if (
-      h[i] === highest
+      h[i] ===
+      highest
     ) {
+
       resistance.push(
         h[i]
       );
     }
 
     if (
-      l[i] === lowest
+      l[i] ===
+      lowest
     ) {
+
       support.push(
         l[i]
       );
@@ -1075,14 +1114,10 @@ function pivots(
   return {
 
     resistance:
-      resistance.slice(
-        -10
-      ),
+      resistance.slice(-10),
 
     support:
-      support.slice(
-        -10
-      )
+      support.slice(-10)
   };
 }
 
@@ -1092,10 +1127,12 @@ function nearestAbove(
 ) {
 
   return levels
+
     .filter(
       x =>
         x > price
     )
+
     .sort(
       (a, b) =>
         a - b
@@ -1108,10 +1145,12 @@ function nearestBelow(
 ) {
 
   return levels
+
     .filter(
       x =>
         x < price
     )
+
     .sort(
       (a, b) =>
         b - a
@@ -1143,143 +1182,188 @@ async function getCandles(
   );
 }
 
-/*
-  EVENTS ticker:
-    instType=EVENTS
-    instId required
-*/
-
-async function getEventTicker(
-  instId
-) {
-
-  const rows =
-    await publicGet(
-      '/api/v5/market/ticker',
-      {
-        instType:
-          'EVENTS',
-        instId
-      }
-    );
-
-  return (
-    rows?.[0] ||
-    null
-  );
-}
-
 async function getTicker(
-  instId
+  instId,
+  instType = null
 ) {
+
+  const params = {
+    instId
+  };
+
+  if (
+    instType
+  ) {
+
+    params.instType =
+      instType;
+  }
 
   const rows =
     await publicGet(
       '/api/v5/market/ticker',
-      {
-        instId
-      }
+      params
     );
 
-  return (
-    rows?.[0] ||
-    null
-  );
+  return rows?.[0] ||
+    null;
 }
 
 /* =========================================================
    EVENT SERIES
 ========================================================= */
 
-async function discoverEventSeries() {
+/*
+  不再呼叫：
 
-  /*
-    IMPORTANT:
-    Do not call:
-      /api/v5/public/event-series
-      /api/v5/public/series
+    /api/v5/public/event-series
+    /api/v5/public/series
 
-    Your previous 404 errors came from these paths.
+  這兩個路徑造成你之前的 404。
 
-    Current bot uses explicit series IDs.
-  */
+  EVENTS instruments 官方需要 seriesId。
+*/
 
-  console.log(
-    '[EVENT] Using configured series:',
-    CONFIGURED_SERIES
-  );
+function getConfiguredSeries() {
 
-  return [
-    ...CONFIGURED_SERIES
-  ];
+  if (
+    !EVENT_SERIES
+  ) {
+
+    return [];
+  }
+
+  return EVENT_SERIES
+
+    .split(',')
+
+    .map(
+      x =>
+        x.trim()
+    )
+
+    .filter(Boolean);
 }
 
-/* =========================================================
-   EVENT INSTRUMENTS
-========================================================= */
+/*
+  目前主要交易：
+    BTC-UPDOWN-15MIN
+    ETH-UPDOWN-15MIN
+    SOL-UPDOWN-15MIN
 
-async function getEventInstruments(
-  seriesId
-) {
+  這裡產生系列候選。
+*/
+function generatedSeries() {
 
-  /*
-    Official V5:
-      GET /api/v5/public/instruments
-      instType=EVENTS
-      seriesId=<seriesId>
+  const result = [];
 
-    seriesId is required for EVENTS.
-  */
+  for (
+    const coin of ASSETS
+  ) {
 
-  return publicGet(
-    '/api/v5/public/instruments',
-    {
-      instType:
-        'EVENTS',
+    result.push(
+      `${coin}-UPDOWN-15MIN`
+    );
+  }
 
-      seriesId
-    }
-  );
+  return result;
 }
 
-/* =========================================================
-   EVENT HELPERS
-========================================================= */
+/*
+  解析事件時間。
 
-function getBaseAsset(
-  inst
+  例如：
+
+  SOL-UPDOWN-15MIN-260818-2230-2245
+
+  年月日：
+    26 08 18
+
+  時間：
+    22:30
+    22:45
+*/
+function parseExpiryFromInstId(
+  instId
 ) {
 
   const text =
-    `${inst.baseCcy || ''} ` +
-    `${inst.instId || ''} ` +
-    `${inst.seriesId || ''}`
-      .toUpperCase();
+    String(
+      instId || ''
+    ).toUpperCase();
 
-  for (
-    const coin of
-      Object.keys(
-        UNDERLYING_MAP
-      )
+  const match =
+    text.match(
+      /-(\d{6})-(\d{4})-(\d{4})$/
+    );
+
+  if (
+    !match
   ) {
 
-    if (
-      text.includes(
-        coin
-      )
-    ) {
-      return coin;
-    }
+    return null;
   }
 
-  return null;
+  const datePart =
+    match[1];
+
+  const endPart =
+    match[3];
+
+  const yy =
+    Number(
+      datePart.slice(0, 2)
+    );
+
+  const mm =
+    Number(
+      datePart.slice(2, 4)
+    );
+
+  const dd =
+    Number(
+      datePart.slice(4, 6)
+    );
+
+  const hh =
+    Number(
+      endPart.slice(0, 2)
+    );
+
+  const min =
+    Number(
+      endPart.slice(2, 4)
+    );
+
+  /*
+    OKX instrument time is UTC.
+  */
+  const year =
+    2000 + yy;
+
+  return Date.UTC(
+    year,
+    mm - 1,
+    dd,
+    hh,
+    min,
+    0,
+    0
+  );
 }
 
+/*
+  如果 API 回傳 expTime，
+  優先使用 API。
+
+  沒有 expTime，
+  再從 instId 解析。
+*/
 function getExpiry(
   inst
 ) {
 
-  const candidates = [
+  const values = [
 
     Number(
       inst.expTime
@@ -1298,13 +1382,16 @@ function getExpiry(
   );
 
   if (
-    !candidates.length
+    values.length
   ) {
-    return null;
+
+    return Math.max(
+      ...values
+    );
   }
 
-  return Math.max(
-    ...candidates
+  return parseExpiryFromInstId(
+    inst.instId
   );
 }
 
@@ -1312,22 +1399,29 @@ function minutesToExpiry(
   inst
 ) {
 
-  const exp =
+  const expiry =
     getExpiry(inst);
 
   if (
-    !exp
+    !Number.isFinite(
+      expiry
+    )
   ) {
+
     return null;
   }
 
   return (
-    exp -
+    expiry -
     Date.now()
   ) /
-    60000;
+  60000;
 }
 
+/*
+  不使用 API expiry 時，
+  允許已經進入交易的 15m 合約。
+*/
 function allowedExpiry(
   inst
 ) {
@@ -1342,6 +1436,7 @@ function allowedExpiry(
       mins
     )
   ) {
+
     return false;
   }
 
@@ -1353,47 +1448,152 @@ function allowedExpiry(
   );
 }
 
-function getDirection(
+/* =========================================================
+   EVENT INSTRUMENT DISCOVERY
+========================================================= */
+
+async function getEventInstruments(
+  seriesId
+) {
+
+  return publicGet(
+    '/api/v5/public/instruments',
+    {
+      instType:
+        'EVENTS',
+
+      seriesId
+    }
+  );
+}
+
+async function discoverEventInstruments() {
+
+  /*
+    如果手動指定 EVENT_SERIES，
+    優先使用。
+  */
+  let series =
+    getConfiguredSeries();
+
+  /*
+    沒有指定才自動產生。
+  */
+  if (
+    !series.length &&
+    AUTO_DISCOVER_SERIES
+  ) {
+
+    series =
+      generatedSeries();
+  }
+
+  if (
+    !series.length
+  ) {
+
+    throw new Error(
+      'No EVENT series configured'
+    );
+  }
+
+  console.log(
+    '[EVENT] Checking series:',
+    series.join(', ')
+  );
+
+  const all = [];
+
+  for (
+    const seriesId of series
+  ) {
+
+    try {
+
+      const rows =
+        await getEventInstruments(
+          seriesId
+        );
+
+      if (
+        Array.isArray(rows)
+      ) {
+
+        for (
+          const inst of rows
+        ) {
+
+          all.push({
+            ...inst,
+            seriesId:
+              inst.seriesId ||
+              seriesId
+          });
+        }
+      }
+
+    } catch (err) {
+
+      console.error(
+        `[EVENT] ${seriesId}:`,
+        err.message
+      );
+    }
+  }
+
+  return all;
+}
+
+/* =========================================================
+   EVENT HELPERS
+========================================================= */
+
+function getBaseAsset(
   inst
 ) {
 
   const text =
-    `${inst.seriesId || ''} ` +
+    `${inst.baseCcy || ''} ` +
     `${inst.instId || ''} ` +
-    `${inst.ruleType || ''}`
+    `${inst.seriesId || ''}`
       .toUpperCase();
 
-  if (
-    text.includes(
-      'UPDOWN'
-    )
+  for (
+    const coin of ASSETS
   ) {
-    return 'UPDOWN';
+
+    if (
+      text.includes(
+        coin
+      )
+    ) {
+
+      return coin;
+    }
   }
 
-  if (
-    text.includes(
-      'ABOVE'
-    ) ||
-    text.includes(
-      'UP'
-    )
-  ) {
-    return 'ABOVE';
-  }
+  return null;
+}
 
-  if (
-    text.includes(
-      'BELOW'
-    ) ||
-    text.includes(
-      'DOWN'
-    )
-  ) {
-    return 'BELOW';
-  }
+/*
+  UPDOWN：
+    YES = 上漲
+    NO  = 下跌
 
-  return 'UNKNOWN';
+  本機器人只做 UPDOWN。
+*/
+function isUpDown(
+  inst
+) {
+
+  const text =
+    `${inst.instId || ''} ` +
+    `${inst.seriesId || ''}`
+      .toUpperCase();
+
+  return text.includes(
+    'UPDOWN'
+  );
 }
 
 function getStrike(
@@ -1405,14 +1605,11 @@ function getStrike(
     'strike',
     'strikePx',
     'targetPx',
-    'triggerPx',
-    'floorStrike',
-    'capStrike'
+    'triggerPx'
   ];
 
   for (
-    const key of
-      fields
+    const key of fields
   ) {
 
     const value =
@@ -1426,6 +1623,7 @@ function getStrike(
       ) &&
       value > 0
     ) {
+
       return value;
     }
   }
@@ -1434,27 +1632,8 @@ function getStrike(
 }
 
 /* =========================================================
-   PRICE UTIL
+   ROUNDING
 ========================================================= */
-
-function decimalPlaces(
-  value
-) {
-
-  const str =
-    String(value);
-
-  if (
-    !str.includes('.')
-  ) {
-    return 0;
-  }
-
-  return (
-    str.split('.')[1] ||
-    ''
-  ).length;
-}
 
 function roundDown(
   value,
@@ -1464,22 +1643,24 @@ function roundDown(
   if (
     !(step > 0)
   ) {
+
     return value;
   }
 
   const decimals =
     Math.max(
       0,
-      decimalPlaces(
-        step
-      )
+      (
+        String(step)
+          .split('.')[1] ||
+        ''
+      ).length
     );
 
   return Number(
     (
       Math.floor(
-        value /
-          step
+        value / step
       ) *
       step
     ).toFixed(
@@ -1496,22 +1677,24 @@ function roundToTick(
   if (
     !(tick > 0)
   ) {
+
     return price;
   }
 
   const decimals =
     Math.max(
       0,
-      decimalPlaces(
-        tick
-      )
+      (
+        String(tick)
+          .split('.')[1] ||
+        ''
+      ).length
     );
 
   return Number(
     (
       Math.round(
-        price /
-          tick
+        price / tick
       ) *
       tick
     ).toFixed(
@@ -1528,9 +1711,9 @@ function validPrice(
     Number.isFinite(
       price
     ) &&
-    price >
+    price >=
       MIN_ENTRY_PRICE &&
-    price <
+    price <=
       MAX_ENTRY_PRICE
   );
 }
@@ -1540,7 +1723,6 @@ function validPrice(
 ========================================================= */
 
 function modelProbability(
-  direction,
   price,
   strikePx,
   c5,
@@ -1603,7 +1785,7 @@ function modelProbability(
       -20
     );
 
-  const avgVol =
+  const avgVolume =
     recentVolume.length
       ? recentVolume.reduce(
           (a, b) =>
@@ -1618,130 +1800,75 @@ function modelProbability(
       vol5.length - 1
     ] || 0;
 
-  const volRatio =
-    avgVol > 0
+  const volumeRatio =
+    avgVolume > 0
       ? currentVolume /
-        avgVol
+        avgVolume
       : 1;
 
-  let score = 50;
+  /*
+    UP probability
+  */
+  let score =
+    50;
 
-  const reasons =
-    [];
+  const reasons = [];
 
-  /* =======================================================
-     BULL
-  ======================================================= */
-
+  /*
+    5m trend
+  */
   if (
-    direction ===
-      'ABOVE' ||
-    direction ===
-      'UPDOWN_UP'
+    ema20_5 &&
+    ema50_5 &&
+    ema20_5 >
+      ema50_5
   ) {
 
-    if (
-      ema20_5 &&
-      ema50_5 &&
-      ema20_5 >
-        ema50_5
-    ) {
+    score += 10;
 
-      score += 10;
-
-      reasons.push(
-        '5m trend'
-      );
-    }
-
-    if (
-      ema20_15 &&
-      ema50_15 &&
-      ema20_15 >
-        ema50_15
-    ) {
-
-      score += 15;
-
-      reasons.push(
-        '15m trend'
-      );
-    }
-
-    if (
-      rsi5 !== null &&
-      rsi5 >= 55 &&
-      rsi5 <= 72
-    ) {
-
-      score += 10;
-
-      reasons.push(
-        'RSI'
-      );
-    }
+    reasons.push(
+      '5m trend'
+    );
   }
 
-  /* =======================================================
-     BEAR
-  ======================================================= */
-
+  /*
+    15m trend
+  */
   if (
-    direction ===
-      'BELOW' ||
-    direction ===
-      'UPDOWN_DOWN'
+    ema20_15 &&
+    ema50_15 &&
+    ema20_15 >
+      ema50_15
   ) {
 
-    if (
-      ema20_5 &&
-      ema50_5 &&
-      ema20_5 <
-        ema50_5
-    ) {
+    score += 15;
 
-      score += 10;
-
-      reasons.push(
-        '5m trend'
-      );
-    }
-
-    if (
-      ema20_15 &&
-      ema50_15 &&
-      ema20_15 <
-        ema50_15
-    ) {
-
-      score += 15;
-
-      reasons.push(
-        '15m trend'
-      );
-    }
-
-    if (
-      rsi5 !== null &&
-      rsi5 <= 45 &&
-      rsi5 >= 28
-    ) {
-
-      score += 10;
-
-      reasons.push(
-        'RSI'
-      );
-    }
+    reasons.push(
+      '15m trend'
+    );
   }
 
-  /* =======================================================
-     VOLUME
-  ======================================================= */
-
+  /*
+    RSI
+  */
   if (
-    volRatio >=
-    1.15
+    rsi5 !== null &&
+    rsi5 >= 55 &&
+    rsi5 <= 72
+  ) {
+
+    score += 10;
+
+    reasons.push(
+      'RSI'
+    );
+  }
+
+  /*
+    Volume
+  */
+  if (
+    volumeRatio >= 1.15
   ) {
 
     score += 8;
@@ -1751,10 +1878,9 @@ function modelProbability(
     );
   }
 
-  /* =======================================================
-     SNR
-  ======================================================= */
-
+  /*
+    Resistance test
+  */
   const resistance =
     nearestAbove(
       [
@@ -1764,26 +1890,10 @@ function modelProbability(
       price
     );
 
-  const support =
-    nearestBelow(
-      [
-        ...p5.support,
-        ...p15.support
-      ],
-      price
-    );
-
   if (
-    (
-      direction ===
-        'ABOVE' ||
-      direction ===
-        'UPDOWN_UP'
-    ) &&
     resistance &&
     price >=
-      resistance *
-        0.999
+      resistance * 0.999
   ) {
 
     score += 8;
@@ -1793,30 +1903,9 @@ function modelProbability(
     );
   }
 
-  if (
-    (
-      direction ===
-        'BELOW' ||
-      direction ===
-        'UPDOWN_DOWN'
-    ) &&
-    support &&
-    price <=
-      support *
-        1.001
-  ) {
-
-    score += 8;
-
-    reasons.push(
-      'SNR support test'
-    );
-  }
-
-  /* =======================================================
-     STRIKE
-  ======================================================= */
-
+  /*
+    Strike
+  */
   if (
     strikePx &&
     strikePx > 0
@@ -1825,35 +1914,19 @@ function modelProbability(
     const distance =
       Math.abs(
         price -
-          strikePx
+        strikePx
       ) /
       price;
 
     if (
-      direction ===
-        'ABOVE' &&
       price >
-        strikePx
+      strikePx
     ) {
 
       score += 8;
 
       reasons.push(
         'above strike'
-      );
-    }
-
-    if (
-      direction ===
-        'BELOW' &&
-      price <
-        strikePx
-    ) {
-
-      score += 8;
-
-      reasons.push(
-        'below strike'
       );
     }
 
@@ -1870,10 +1943,9 @@ function modelProbability(
     }
   }
 
-  /* =======================================================
-     ATR
-  ======================================================= */
-
+  /*
+    ATR
+  */
   if (
     atr5 &&
     price > 0
@@ -1887,6 +1959,7 @@ function modelProbability(
       atrPct <
       0.001
     ) {
+
       score -= 5;
     }
 
@@ -1894,6 +1967,7 @@ function modelProbability(
       atrPct >
       0.03
     ) {
+
       score -= 8;
     }
   }
@@ -1908,33 +1982,42 @@ function modelProbability(
     );
 
   /*
-    Existing model mapping retained.
+    Model mapping
 
-    score 50  -> 50%
-    score 80  -> 68%
-    score 90  -> 74%
-    score 100 -> 80%
+    50 = 50%
+    80 = 68%
+    90 = 74%
+    100 = 80%
   */
-
   const probability =
     Math.max(
       0.50,
       Math.min(
         0.80,
         0.50 +
-          (
-            score -
-            50
-          ) *
-            0.006
+        (
+          score -
+          50
+        ) *
+        0.006
       )
     );
+
+  /*
+    DOWN probability
+  */
+  const downProbability =
+    1 -
+    probability;
 
   return {
 
     score,
 
-    probability,
+    upProbability:
+      probability,
+
+    downProbability,
 
     reasons
   };
@@ -1951,17 +2034,13 @@ async function getEquity() {
   ) {
 
     return Math.max(
-      START_CAPITAL,
+      0,
       Number(
         state.paperEquity ||
-          START_CAPITAL
+        START_CAPITAL
       )
     );
   }
-
-  /*
-    Normal OKX account balance.
-  */
 
   const rows =
     await privateRequest(
@@ -2029,554 +2108,414 @@ function stakeForEquity(
     equity *
     MAX_STAKE_PCT;
 
-  return Math.max(
-    MIN_STAKE,
-    Math.min(
-      maximum,
-      calculated
+  /*
+    不超過帳戶本金
+  */
+  return Math.min(
+    equity,
+    Math.max(
+      MIN_STAKE,
+      Math.min(
+        maximum,
+        calculated
+      )
     )
   );
 }
 
 /* =========================================================
-   EVENT CANDIDATE
-========================================================= */
-
-async function buildCandidate(
-  inst,
-  seriesId
-) {
-
-  if (
-    inst.state &&
-    ![
-      'live',
-      'preopen'
-    ].includes(
-      String(
-        inst.state
-      ).toLowerCase()
-    )
-  ) {
-
-    return null;
-  }
-
-  if (
-    !allowedExpiry(
-      inst
-    )
-  ) {
-
-    return null;
-  }
-
-  const coin =
-    getBaseAsset(
-      inst
-    );
-
-  if (!coin) {
-    return null;
-  }
-
-  const underlying =
-    UNDERLYING_MAP[
-      coin
-    ];
-
-  if (!underlying) {
-    return null;
-  }
-
-  const direction =
-    getDirection(
-      inst
-    );
-
-  if (
-    direction ===
-    'UNKNOWN'
-  ) {
-
-    return null;
-  }
-
-  /*
-    Technical data and EVENT ticker.
-
-    Do not use generic ticker for EVENTS.
-  */
-
-  const [
-    eventTicker,
-    c5,
-    c15
-  ] =
-    await Promise.all([
-
-      getEventTicker(
-        inst.instId
-      ),
-
-      getCandles(
-        underlying,
-        '5m',
-        100
-      ),
-
-      getCandles(
-        underlying,
-        '15m',
-        100
-      )
-
-    ]);
-
-  if (
-    !c5.length ||
-    !c15.length
-  ) {
-
-    return null;
-  }
-
-  /*
-    OKX EVENTS ticker gives YES side.
-
-    YES:
-      ask = YES buy price
-      bid = YES sell price
-
-    NO:
-      ask ~= 1 - YES bid
-      bid ~= 1 - YES ask
-  */
-
-  const yesAsk =
-    Number(
-      eventTicker?.askPx
-    );
-
-  const yesBid =
-    Number(
-      eventTicker?.bidPx
-    );
-
-  const yesLast =
-    Number(
-      eventTicker?.last
-    );
-
-  const executableYesAsk =
-    Number.isFinite(
-      yesAsk
-    ) &&
-    yesAsk > 0
-      ? yesAsk
-      : yesLast;
-
-  const executableYesBid =
-    Number.isFinite(
-      yesBid
-    ) &&
-    yesBid > 0
-      ? yesBid
-      : yesLast;
-
-  if (
-    !(
-      executableYesAsk > 0 &&
-      executableYesBid > 0
-    )
-  ) {
-
-    return null;
-  }
-
-  const noAsk =
-    1 -
-    executableYesBid;
-
-  const noBid =
-    1 -
-    executableYesAsk;
-
-  const underlyingPrice =
-    Number(
-      c5[
-        c5.length - 1
-      ][4]
-    );
-
-  if (
-    !Number.isFinite(
-      underlyingPrice
-    )
-  ) {
-
-    return null;
-  }
-
-  const strikePx =
-    getStrike(
-      inst
-    );
-
-  /*
-    UPDOWN:
-      YES = UP
-      NO  = DOWN
-
-    The instrument IDs you are trading are
-    explicitly UPDOWN contracts.
-  */
-
-  let modelDirection;
-
-  if (
-    direction ===
-    'UPDOWN'
-  ) {
-
-    modelDirection =
-      'UPDOWN_UP';
-
-  } else {
-
-    modelDirection =
-      direction;
-  }
-
-  const model =
-    modelProbability(
-      modelDirection,
-      underlyingPrice,
-      strikePx,
-      c5,
-      c15
-    );
-
-  let yesModelProb =
-    model.probability;
-
-  let noModelProb =
-    1 -
-    yesModelProb;
-
-  /*
-    For UPDOWN:
-      model probability is bullish probability.
-
-    For ABOVE / BELOW:
-      model probability is the YES probability
-      for the event represented by the instrument.
-  */
-
-  const yesMarketProb =
-    executableYesAsk;
-
-  const noMarketProb =
-    noAsk;
-
-  const yesEdge =
-    yesModelProb -
-    yesMarketProb;
-
-  const noEdge =
-    noModelProb -
-    noMarketProb;
-
-  let side;
-  let entryPx;
-  let modelProb;
-  let marketProb;
-  let edge;
-
-  if (
-    yesEdge >=
-    noEdge
-  ) {
-
-    side =
-      'yes';
-
-    entryPx =
-      executableYesAsk;
-
-    modelProb =
-      yesModelProb;
-
-    marketProb =
-      yesMarketProb;
-
-    edge =
-      yesEdge;
-
-  } else {
-
-    side =
-      'no';
-
-    entryPx =
-      noAsk;
-
-    modelProb =
-      noModelProb;
-
-    marketProb =
-      noMarketProb;
-
-    edge =
-      noEdge;
-  }
-
-  if (
-    !validPrice(
-      entryPx
-    )
-  ) {
-
-    return null;
-  }
-
-  if (
-    model.score <
-    MIN_SCORE
-  ) {
-
-    return null;
-  }
-
-  if (
-    edge <
-    MIN_EDGE
-  ) {
-
-    return null;
-  }
-
-  return {
-
-    inst,
-
-    seriesId,
-
-    coin,
-
-    underlying,
-
-    direction,
-
-    modelDirection,
-
-    side,
-
-    entryPx,
-
-    modelProb,
-
-    marketProb,
-
-    edge,
-
-    score:
-      model.score,
-
-    reasons:
-      model.reasons,
-
-    strikePx,
-
-    underlyingPrice,
-
-    expiry:
-      getExpiry(
-        inst
-      ),
-
-    minutesToExpiry:
-      minutesToExpiry(
-        inst
-      ),
-
-    yesAsk:
-      executableYesAsk,
-
-    yesBid:
-      executableYesBid,
-
-    noAsk,
-
-    noBid
-  };
-}
-
-/* =========================================================
-   SCAN
+   FIND EVENT CANDIDATES
 ========================================================= */
 
 async function scanCandidates() {
 
-  const series =
-    await discoverEventSeries();
-
-  const candidates =
-    [];
+  const instruments =
+    await discoverEventInstruments();
 
   console.log(
-    `[EVENT] Checking ${series.length} series`
+    `[EVENT] Instruments found: ${instruments.length}`
   );
 
-  for (
-    const seriesId of
-      series
+  if (
+    !instruments.length
   ) {
 
-    let instruments;
+    return [];
+  }
+
+  /*
+    只保留：
+      BTC / ETH / SOL
+      UPDOWN
+      live
+      1~20 min expiry
+  */
+  const filtered =
+    instruments.filter(
+      inst => {
+
+        const coin =
+          getBaseAsset(
+            inst
+          );
+
+        if (
+          !coin
+        ) {
+
+          return false;
+        }
+
+        if (
+          !isUpDown(
+            inst
+          )
+        ) {
+
+          return false;
+        }
+
+        if (
+          inst.state &&
+          String(
+            inst.state
+          ).toLowerCase() !==
+            'live'
+        ) {
+
+          return false;
+        }
+
+        return allowedExpiry(
+          inst
+        );
+      }
+    );
+
+  console.log(
+    `[EVENT] Valid UPDOWN contracts: ${filtered.length}`
+  );
+
+  const candidates = [];
+
+  /*
+    技術資料快取。
+    同一個幣不要重複抓 5m / 15m。
+  */
+  const marketCache =
+    {};
+
+  for (
+    const inst of filtered
+  ) {
 
     try {
 
-      instruments =
-        await getEventInstruments(
-          seriesId
+      const coin =
+        getBaseAsset(
+          inst
         );
+
+      const underlying =
+        UNDERLYING_MAP[
+          coin
+        ];
+
+      if (
+        !marketCache[
+          coin
+        ]
+      ) {
+
+        const [
+          c5,
+          c15
+        ] =
+          await Promise.all([
+
+            getCandles(
+              underlying,
+              '5m',
+              100
+            ),
+
+            getCandles(
+              underlying,
+              '15m',
+              100
+            )
+
+          ]);
+
+        marketCache[
+          coin
+        ] = {
+          c5,
+          c15
+        };
+      }
+
+      const {
+        c5,
+        c15
+      } =
+        marketCache[
+          coin
+        ];
+
+      if (
+        !c5.length ||
+        !c15.length
+      ) {
+
+        continue;
+      }
+
+      /*
+        EVENT ticker
+      */
+      const ticker =
+        await getTicker(
+          inst.instId,
+          'EVENTS'
+        );
+
+      const yesAsk =
+        Number(
+          ticker?.askPx ||
+          ticker?.last
+        );
+
+      const yesBid =
+        Number(
+          ticker?.bidPx ||
+          ticker?.last
+        );
+
+      if (
+        !(
+          yesAsk > 0 &&
+          yesBid > 0
+        )
+      ) {
+
+        continue;
+      }
+
+      if (
+        yesAsk >= 1 ||
+        yesBid <= 0
+      ) {
+
+        continue;
+      }
+
+      const underlyingPrice =
+        Number(
+          c5[
+            c5.length - 1
+          ][4]
+        );
+
+      if (
+        !Number.isFinite(
+          underlyingPrice
+        )
+      ) {
+
+        continue;
+      }
+
+      const strikePx =
+        getStrike(
+          inst
+        );
+
+      const model =
+        modelProbability(
+          underlyingPrice,
+          strikePx,
+          c5,
+          c15
+        );
+
+      /*
+        YES = UP
+        NO = DOWN
+      */
+
+      const yesModel =
+        model.upProbability;
+
+      const noModel =
+        model.downProbability;
+
+      /*
+        YES executable price
+        = ask
+
+        NO executable approximation
+        = 1 - YES bid
+      */
+      const yesEntry =
+        yesAsk;
+
+      const noEntry =
+        1 -
+        yesBid;
+
+      if (
+        !validPrice(
+          yesEntry
+        )
+      ) {
+
+        continue;
+      }
+
+      if (
+        !validPrice(
+          noEntry
+        )
+      ) {
+
+        continue;
+      }
+
+      const yesMarket =
+        yesEntry;
+
+      const noMarket =
+        noEntry;
+
+      const yesEdge =
+        yesModel -
+        yesMarket;
+
+      const noEdge =
+        noModel -
+        noMarket;
+
+      let side;
+      let entryPx;
+      let modelProb;
+      let marketProb;
+      let edge;
+
+      if (
+        yesEdge >=
+        noEdge
+      ) {
+
+        side =
+          'yes';
+
+        entryPx =
+          yesEntry;
+
+        modelProb =
+          yesModel;
+
+        marketProb =
+          yesMarket;
+
+        edge =
+          yesEdge;
+
+      } else {
+
+        side =
+          'no';
+
+        entryPx =
+          noEntry;
+
+        modelProb =
+          noModel;
+
+        marketProb =
+          noMarket;
+
+        edge =
+          noEdge;
+      }
+
+      /*
+        Filters
+      */
+      if (
+        model.score <
+        MIN_SCORE
+      ) {
+
+        continue;
+      }
+
+      if (
+        edge <
+        MIN_EDGE
+      ) {
+
+        continue;
+      }
+
+      candidates.push({
+
+        inst,
+
+        seriesId:
+          inst.seriesId,
+
+        coin,
+
+        underlying,
+
+        side,
+
+        entryPx,
+
+        modelProb,
+
+        marketProb,
+
+        edge,
+
+        score:
+          model.score,
+
+        reasons:
+          model.reasons,
+
+        strikePx,
+
+        underlyingPrice,
+
+        expiry:
+          getExpiry(
+            inst
+          ),
+
+        minutesToExpiry:
+          minutesToExpiry(
+            inst
+          )
+      });
 
     } catch (err) {
 
       console.error(
-        `[EVENT] ${seriesId}:`,
+        `[EVENT CANDIDATE ERROR] ${inst.instId}:`,
         err.message
       );
-
-      continue;
-    }
-
-    if (
-      !Array.isArray(
-        instruments
-      )
-    ) {
-
-      continue;
-    }
-
-    for (
-      const inst of
-        instruments
-    ) {
-
-      try {
-
-        const candidate =
-          await buildCandidate(
-            inst,
-            seriesId
-          );
-
-        if (
-          candidate
-        ) {
-
-          candidates.push(
-            candidate
-          );
-        }
-
-      } catch (err) {
-
-        console.error(
-          `[EVENT] Candidate ${inst.instId}:`,
-          err.message
-        );
-      }
     }
   }
 
   return candidates.sort(
     (a, b) =>
       b.edge -
-        a.edge ||
+      a.edge ||
       b.score -
-        a.score
-  );
-}
-
-/* =========================================================
-   GET CURRENT EXECUTABLE PRICE
-========================================================= */
-
-async function getExecutablePrice(
-  position
-) {
-
-  const ticker =
-    await getEventTicker(
-      position.inst.instId
-    );
-
-  const yesAsk =
-    Number(
-      ticker?.askPx
-    );
-
-  const yesBid =
-    Number(
-      ticker?.bidPx
-    );
-
-  const yesLast =
-    Number(
-      ticker?.last
-    );
-
-  const ask =
-    Number.isFinite(
-      yesAsk
-    ) &&
-    yesAsk > 0
-      ? yesAsk
-      : yesLast;
-
-  const bid =
-    Number.isFinite(
-      yesBid
-    ) &&
-    yesBid > 0
-      ? yesBid
-      : yesLast;
-
-  if (
-    !(
-      ask > 0 &&
-      bid > 0
-    )
-  ) {
-
-    return null;
-  }
-
-  /*
-    To SELL:
-
-    YES position:
-      sell into YES bid
-
-    NO position:
-      sell into NO bid
-      = 1 - YES ask
-  */
-
-  if (
-    position.side ===
-    'yes'
-  ) {
-
-    return bid;
-  }
-
-  return (
-    1 - ask
+      a.score
   );
 }
 
@@ -2593,197 +2532,136 @@ async function placeEventOrder(
     candidate.inst;
 
   /*
-    Re-read ticker immediately
-    before sending the order.
+    官方 EVENTS：
+      tdMode = isolated
   */
 
-  const ticker =
-    await getEventTicker(
-      inst.instId
-    );
-
-  const yesAsk =
-    Number(
-      ticker?.askPx
-    );
-
-  const yesBid =
-    Number(
-      ticker?.bidPx
-    );
-
-  const yesLast =
-    Number(
-      ticker?.last
-    );
-
-  const latestYesAsk =
-    Number.isFinite(
-      yesAsk
-    ) &&
-    yesAsk > 0
-      ? yesAsk
-      : yesLast;
-
-  const latestYesBid =
-    Number.isFinite(
-      yesBid
-    ) &&
-    yesBid > 0
-      ? yesBid
-      : yesLast;
-
-  if (
-    !(
-      latestYesAsk > 0 &&
-      latestYesBid > 0
-    )
-  ) {
-
-    throw new Error(
-      'EVENT ticker has no executable price'
-    );
-  }
-
-  /*
-    Refresh entry.
-
-    YES:
-      ask
-
-    NO:
-      1 - YES bid
-  */
-
-  const liveEntry =
-    candidate.side ===
-      'yes'
-      ? latestYesAsk
-      : 1 -
-        latestYesBid;
-
-  if (
-    !validPrice(
-      liveEntry
-    )
-  ) {
-
-    throw new Error(
-      `Invalid live entry price: ${liveEntry}`
-    );
-  }
-
-  /*
-    Event contract quantity:
-      stake / price
-  */
+  const tdMode =
+    'isolated';
 
   const lotSz =
     Number(
       inst.lotSz ||
-        0.1
+      0.1
     );
 
   const minSz =
     Number(
       inst.minSz ||
-        lotSz
+      lotSz
     );
+
+  const tickSz =
+    Number(
+      inst.tickSz ||
+      0.001
+    );
+
+  if (
+    !(
+      candidate.entryPx >
+      0 &&
+      candidate.entryPx <
+      1
+    )
+  ) {
+
+    throw new Error(
+      `Invalid event price: ${candidate.entryPx}`
+    );
+  }
+
+  /*
+    contracts =
+      stake / price
+  */
+  const rawSz =
+    stake /
+    candidate.entryPx;
 
   let sz =
     roundDown(
-      stake /
-        liveEntry,
+      rawSz,
       lotSz
     );
 
   if (
-    sz < minSz
+    sz <
+    minSz
   ) {
 
     sz =
       minSz;
   }
 
+  const px =
+    roundToTick(
+      candidate.entryPx,
+      tickSz
+    );
+
+  const requestedNotional =
+    px *
+    sz;
+
+  console.log(
+    '[EVENT ORDER CALC]',
+    JSON.stringify({
+
+      stake,
+
+      entryPx:
+        candidate.entryPx,
+
+      price:
+        px,
+
+      lotSz,
+
+      minSz,
+
+      rawSz,
+
+      contracts:
+        sz,
+
+      requestedNotional
+    })
+  );
+
   /*
-    Actual notional.
+    防止最小 lotSz 導致超過 stake 太多
   */
-
-  const notional =
-    sz *
-    liveEntry;
-
-  /*
-    Protect against oversized order.
-  */
-
   if (
-    notional >
-    stake *
-      1.03
+    requestedNotional >
+    stake * 1.05
   ) {
 
     throw new Error(
       `Order exceeds stake: ` +
       `stake=${stake.toFixed(4)} ` +
-      `notional=${notional.toFixed(4)}`
+      `notional=${requestedNotional.toFixed(4)}`
     );
   }
 
   /*
-    Tick size.
+    OKX EVENTS
+    tdMode = isolated
+    outcome = yes/no
 
-    OKX currently states EVENTS tick size
-    should be validated against tick bands.
-    Instrument tickSz is used here as
-    the minimum tick available from the
-    instrument response.
+    speedBump 不再送。
   */
-
-  const tickSz =
-    Number(
-      inst.tickSz ||
-        0.001
-    );
-
-  let px =
-    roundToTick(
-      liveEntry,
-      tickSz
-    );
-
-  /*
-    IMPORTANT:
-
-    For BUY:
-      YES -> don't intentionally bid below ask
-      NO  -> don't intentionally bid below NO ask
-
-    IOC is used instead of FOK.
-  */
-
   const body = {
 
     instId:
       inst.instId,
 
-    /*
-      Official EVENTS:
-        isolated
-    */
     tdMode:
-      'isolated',
+      tdMode,
 
     side:
       'buy',
 
-    /*
-      FOK caused your latest
-      "NO FILL".
-
-      IOC allows available liquidity
-      to execute immediately.
-    */
     ordType:
       'ioc',
 
@@ -2795,13 +2673,6 @@ async function placeEventOrder(
 
     outcome:
       candidate.side,
-
-    /*
-      Required for non-post-only
-      EVENTS orders.
-    */
-    speedBump:
-      '1',
 
     clOrdId:
       `snr${Date.now().toString(36)}`
@@ -2821,7 +2692,6 @@ async function placeEventOrder(
   /*
     PAPER
   */
-
   if (
     !LIVE_TRADING
   ) {
@@ -2850,7 +2720,6 @@ async function placeEventOrder(
   /*
     LIVE
   */
-
   const rows =
     await privateRequest(
       'POST',
@@ -2861,16 +2730,15 @@ async function placeEventOrder(
   const result =
     rows?.[0];
 
-  if (
-    !result
-  ) {
-
-    throw new Error(
-      'Empty OKX order response'
-    );
-  }
+  console.log(
+    '[EVENT ORDER RESPONSE]',
+    JSON.stringify(
+      result
+    )
+  );
 
   if (
+    !result ||
     String(
       result.sCode
     ) !== '0'
@@ -2885,11 +2753,43 @@ async function placeEventOrder(
     );
   }
 
+  /*
+    等待成交資料
+  */
+  if (
+    result.ordId
+  ) {
+
+    await sleep(
+      500
+    );
+
+    const filled =
+      await getOrder(
+        inst.instId,
+        result.ordId
+      );
+
+    console.log(
+      '[EVENT ORDER FILLED]',
+      JSON.stringify(
+        filled
+      )
+    );
+
+    return {
+
+      ...result,
+
+      ...filled
+    };
+  }
+
   return result;
 }
 
 /* =========================================================
-   ORDER QUERY
+   GET ORDER
 ========================================================= */
 
 async function getOrder(
@@ -2900,8 +2800,11 @@ async function getOrder(
   const requestPath =
     `/api/v5/trade/order?` +
     q({
+
       instId,
+
       ordId
+
     });
 
   const rows =
@@ -2931,24 +2834,33 @@ async function closePosition(
   const tickSz =
     Number(
       inst.tickSz ||
-        0.001
+      0.001
     );
 
-  let px =
+  const px =
     roundToTick(
       currentPx,
       tickSz
     );
 
+  const sz =
+    Number(
+      position.sz
+    );
+
+  if (
+    !(sz > 0)
+  ) {
+
+    throw new Error(
+      `Invalid close size: ${sz}`
+    );
+  }
+
   /*
-    SELL side:
-      YES -> sell at YES bid
-      NO  -> sell at NO bid
-
-    IOC means:
-      immediately execute available liquidity.
+    EVENTS：
+      tdMode = isolated
   */
-
   const body = {
 
     instId:
@@ -2967,15 +2879,10 @@ async function closePosition(
       px.toFixed(6),
 
     sz:
-      String(
-        position.sz
-      ),
+      String(sz),
 
     outcome:
       position.side,
-
-    speedBump:
-      '1',
 
     clOrdId:
       `exit${Date.now().toString(36)}`
@@ -2986,7 +2893,7 @@ async function closePosition(
   };
 
   console.log(
-    '[EVENT EXIT]',
+    '[EVENT EXIT ORDER]',
     JSON.stringify(
       body
     )
@@ -2995,19 +2902,16 @@ async function closePosition(
   /*
     PAPER
   */
-
   if (
     !LIVE_TRADING
   ) {
 
     const pnl =
       (
-        Number(
-          currentPx
-        ) -
+        px -
         position.entryPx
       ) *
-      position.sz;
+      sz;
 
     return {
 
@@ -3015,10 +2919,10 @@ async function closePosition(
         'filled',
 
       avgPx:
-        currentPx,
+        px,
 
       accFillSz:
-        position.sz,
+        sz,
 
       pnl,
 
@@ -3030,7 +2934,6 @@ async function closePosition(
   /*
     LIVE
   */
-
   const rows =
     await privateRequest(
       'POST',
@@ -3041,16 +2944,15 @@ async function closePosition(
   const result =
     rows?.[0];
 
-  if (
-    !result
-  ) {
-
-    throw new Error(
-      'Empty OKX exit response'
-    );
-  }
+  console.log(
+    '[EVENT EXIT RESPONSE]',
+    JSON.stringify(
+      result
+    )
+  );
 
   if (
+    !result ||
     String(
       result.sCode
     ) !== '0'
@@ -3065,6 +2967,35 @@ async function closePosition(
     );
   }
 
+  if (
+    result.ordId
+  ) {
+
+    await sleep(
+      500
+    );
+
+    const filled =
+      await getOrder(
+        inst.instId,
+        result.ordId
+      );
+
+    console.log(
+      '[EVENT EXIT FILLED]',
+      JSON.stringify(
+        filled
+      )
+    );
+
+    return {
+
+      ...result,
+
+      ...filled
+    };
+  }
+
   return result;
 }
 
@@ -3077,6 +3008,7 @@ async function managePosition() {
   if (
     !state.position
   ) {
+
     return;
   }
 
@@ -3085,17 +3017,63 @@ async function managePosition() {
 
   try {
 
-    const currentPx =
-      await getExecutablePrice(
-        position
+    const ticker =
+      await getTicker(
+        position.inst.instId,
+        'EVENTS'
+      );
+
+    const yesBid =
+      Number(
+        ticker?.bidPx ||
+        ticker?.last
+      );
+
+    const yesAsk =
+      Number(
+        ticker?.askPx ||
+        ticker?.last
       );
 
     if (
-      !Number.isFinite(
-        currentPx
+      !(
+        yesBid > 0
       )
     ) {
+
       return;
+    }
+
+    /*
+      YES：
+        exit reference = YES bid
+
+      NO：
+        exit reference =
+          1 - YES ask
+
+      用 ask 評估 NO 賣出，
+      避免拿錯邊價格。
+    */
+    let currentPx;
+
+    if (
+      position.side ===
+      'yes'
+    ) {
+
+      currentPx =
+        yesBid;
+
+    } else {
+
+      currentPx =
+        1 -
+        (
+          yesAsk > 0
+            ? yesAsk
+            : yesBid
+        );
     }
 
     if (
@@ -3104,6 +3082,7 @@ async function managePosition() {
         currentPx < 1
       )
     ) {
+
       return;
     }
 
@@ -3114,10 +3093,33 @@ async function managePosition() {
       ) /
       position.entryPx;
 
-    /*
-      Take profit
-    */
+    console.log(
+      '[EVENT POSITION]',
+      JSON.stringify({
 
+        instId:
+          position.inst.instId,
+
+        side:
+          position.side,
+
+        entry:
+          position.entryPx,
+
+        current:
+          currentPx,
+
+        change:
+          (
+            change * 100
+          ).toFixed(2) +
+          '%'
+      })
+    );
+
+    /*
+      TAKE PROFIT
+    */
     if (
       change >=
       EARLY_TP_PCT
@@ -3133,9 +3135,8 @@ async function managePosition() {
     }
 
     /*
-      Stop loss
+      STOP LOSS
     */
-
     if (
       change <=
       -EARLY_SL_PCT
@@ -3146,22 +3147,12 @@ async function managePosition() {
         currentPx,
         'SL'
       );
-
-      return;
     }
-
-    /*
-      Expiry protection.
-
-      If contract is close to expiry,
-      allow settlement instead of forcing
-      an artificial exit unless TP/SL hit.
-    */
 
   } catch (err) {
 
     console.error(
-      'Position manager:',
+      '[EVENT POSITION MANAGER]',
       err.message
     );
   }
@@ -3186,36 +3177,20 @@ async function exitPosition(
   const exitPx =
     Number(
       result?.avgPx ||
-        result?.fillPx ||
-        currentPx
+      result?.fillPx ||
+      currentPx
     );
 
-  const fillSz =
-    Number(
-      result?.accFillSz ||
-        result?.fillSz ||
-        position.sz
-    );
-
-  if (
-    !(
-      fillSz > 0
-    )
-  ) {
-
-    console.log(
-      '[EVENT EXIT] NO FILL'
-    );
-
-    return;
-  }
-
+  /*
+    EVENTS position PnL
+    = price difference × contracts
+  */
   const pnl =
     (
       exitPx -
       position.entryPx
     ) *
-    fillSz;
+    position.sz;
 
   state.realizedPnl +=
     pnl;
@@ -3226,12 +3201,14 @@ async function exitPosition(
 
     state.paperEquity =
       Math.max(
+
         0,
+
         Number(
           state.paperEquity ||
-            START_CAPITAL
+          START_CAPITAL
         ) +
-          pnl
+        pnl
       );
   }
 
@@ -3250,7 +3227,8 @@ async function exitPosition(
   state.trades.push({
 
     at:
-      new Date().toISOString(),
+      new Date()
+        .toISOString(),
 
     instId:
       position.inst.instId,
@@ -3264,7 +3242,7 @@ async function exitPosition(
     exitPx,
 
     sz:
-      fillSz,
+      position.sz,
 
     pnl,
 
@@ -3312,14 +3290,18 @@ async function exitPosition(
     }\n` +
 
     `Contracts ${
-      fillSz
+      position.sz
     }\n` +
 
     `PnL ${
       pnl >= 0 ? '+' : ''
     }${pnl.toFixed(4)}U\n` +
 
-    `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
+    `${
+      LIVE_TRADING
+        ? 'LIVE'
+        : 'PAPER'
+    }`
   );
 }
 
@@ -3332,12 +3314,17 @@ async function maybeTrade() {
   if (
     riskBlocked()
   ) {
+
     return;
   }
 
+  /*
+    一次只允許一個事件倉位
+  */
   if (
     state.position
   ) {
+
     return;
   }
 
@@ -3351,7 +3338,7 @@ async function maybeTrade() {
   } catch (err) {
 
     console.error(
-      'Equity:',
+      '[EVENT EQUITY]',
       err.message
     );
 
@@ -3369,9 +3356,8 @@ async function maybeTrade() {
   }
 
   /*
-    Daily loss protection
+    Daily loss
   */
-
   const dailyLossLimit =
     equity *
     DAILY_LOSS_PCT;
@@ -3389,9 +3375,7 @@ async function maybeTrade() {
     await notify(
       `⛔ EVENT BOT DAILY LOSS LOCK\n` +
       `PnL ${
-        state.realizedPnl.toFixed(
-          4
-        )
+        state.realizedPnl.toFixed(4)
       }U`
     );
 
@@ -3408,7 +3392,7 @@ async function maybeTrade() {
   } catch (err) {
 
     console.error(
-      'Scan:',
+      '[EVENT SCAN]',
       err.message
     );
 
@@ -3418,32 +3402,29 @@ async function maybeTrade() {
   if (
     !candidates.length
   ) {
+
     return;
   }
 
   const candidate =
     candidates[0];
 
-  const calculatedStake =
+  /*
+    Stake
+  */
+  const stake =
     stakeForEquity(
       equity
     );
 
-  const stake =
-    Math.min(
-      calculatedStake,
-      equity
-    );
-
   if (
-    stake <= 0
+    !(
+      stake > 0
+    )
   ) {
+
     return;
   }
-
-  console.log(
-    '----------------------------------------'
-  );
 
   console.log(
     '[EVENT CANDIDATE]',
@@ -3485,13 +3466,6 @@ async function maybeTrade() {
     stake
   );
 
-  console.log(
-    '[EVENT REASONS]',
-    candidate.reasons.join(
-      ', '
-    )
-  );
-
   try {
 
     const order =
@@ -3500,22 +3474,15 @@ async function maybeTrade() {
         stake
       );
 
-    /*
-      PAPER order
-    */
-
     let filled =
       order;
 
     /*
-      LIVE:
-      Wait briefly and retrieve actual
-      exchange fill information.
+      LIVE 再讀一次 order
     */
-
     if (
       LIVE_TRADING &&
-      order.ordId
+      order?.ordId
     ) {
 
       await sleep(
@@ -3529,34 +3496,26 @@ async function maybeTrade() {
         );
     }
 
-    const orderState =
-      String(
-        filled?.state ||
-          ''
-      ).toLowerCase();
-
     /*
-      Actual cumulative fill.
+      真正成交數量
     */
-
     const fillSz =
       Number(
         filled?.accFillSz ||
-          filled?.fillSz ||
-          0
+        filled?.fillSz ||
+        0
       );
 
     const avgPx =
       Number(
         filled?.avgPx ||
-          filled?.fillPx ||
-          candidate.entryPx
+        filled?.fillPx ||
+        candidate.entryPx
       );
 
     /*
-      NO FILL
+      IOC 完全沒成交
     */
-
     if (
       !(
         fillSz > 0
@@ -3567,30 +3526,154 @@ async function maybeTrade() {
         '[EVENT] NO FILL'
       );
 
-      console.log(
-        '[EVENT] Order state:',
-        orderState ||
-          'unknown'
-      );
-
       return;
     }
-
-    /*
-      Actual money committed.
-    */
 
     const actualStake =
       avgPx *
       fillSz;
 
-    /*
-      IMPORTANT:
-      Use actual exchange fill.
-      Never use requested stake as
-      actual position size.
-    */
+    console.log(
+      '[EVENT ACTUAL FILL]',
+      JSON.stringify({
 
+        requestedStake:
+          stake,
+
+        fillSz,
+
+        avgPx,
+
+        actualStake
+      })
+    );
+
+    /*
+      如果成交量小於要求的 80%，
+      不把它當正常倉位。
+
+      這是針對你之前：
+
+        Requested 4.964U
+        Actual 0.041U
+
+      的保護。
+    */
+    const minimumFill =
+      stake * 0.80;
+
+    if (
+      actualStake <
+      minimumFill
+    ) {
+
+      console.error(
+        `[EVENT] FILL TOO SMALL ` +
+        `requested=${stake.toFixed(4)} ` +
+        `actual=${actualStake.toFixed(4)}`
+      );
+
+      /*
+        LIVE：
+        嘗試立即平掉異常小倉位。
+      */
+      if (
+        LIVE_TRADING
+      ) {
+
+        try {
+
+          await closePosition(
+
+            {
+              inst:
+                candidate.inst,
+
+              side:
+                candidate.side,
+
+              sz:
+                fillSz,
+
+              entryPx:
+                avgPx
+            },
+
+            avgPx
+          );
+
+          console.log(
+            '[EVENT] Small fill closed'
+          );
+
+        } catch (closeErr) {
+
+          console.error(
+            '[EVENT] Emergency close:',
+            closeErr.message
+          );
+
+          /*
+            如果平不掉，
+            仍然記錄實際倉位，
+            避免機器人遺失倉位。
+          */
+
+          state.position = {
+
+            inst:
+              candidate.inst,
+
+            seriesId:
+              candidate.seriesId,
+
+            coin:
+              candidate.coin,
+
+            side:
+              candidate.side,
+
+            sz:
+              fillSz,
+
+            entryPx:
+              avgPx,
+
+            stake:
+              actualStake,
+
+            requestedStake:
+              stake,
+
+            score:
+              candidate.score,
+
+            edge:
+              candidate.edge,
+
+            modelProb:
+              candidate.modelProb,
+
+            marketProb:
+              candidate.marketProb,
+
+            underlyingPrice:
+              candidate.underlyingPrice,
+
+            openedAt:
+              Date.now()
+          };
+
+          saveState();
+        }
+      }
+
+      return;
+    }
+
+    /*
+      正常成交
+    */
     state.position = {
 
       inst:
@@ -3641,20 +3724,9 @@ async function maybeTrade() {
 
     saveState();
 
-    console.log(
-      '[EVENT] FILLED'
-    );
-
-    console.log(
-      '[EVENT] Actual contracts:',
-      fillSz
-    );
-
-    console.log(
-      '[EVENT] Actual stake:',
-      actualStake
-    );
-
+    /*
+      Telegram
+    */
     await notify(
 
       `🟡 EVENT ENTRY\n` +
@@ -3710,33 +3782,24 @@ async function maybeTrade() {
         )
       }\n` +
 
-      `${LIVE_TRADING ? 'LIVE' : 'PAPER'}`
+      `${
+        LIVE_TRADING
+          ? 'LIVE'
+          : 'PAPER'
+      }`
     );
 
   } catch (err) {
 
     console.error(
       '🔴 EVENT ORDER ERROR',
-      candidate.inst.instId
-    );
-
-    console.error(
       err.message
-    );
-
-    await notify(
-
-      `🔴 EVENT ORDER ERROR\n` +
-
-      `${candidate.inst.instId}\n` +
-
-      `${err.message}`
     );
   }
 }
 
 /* =========================================================
-   HTTP ROOT
+   HTTP
 ========================================================= */
 
 app.get(
@@ -3760,8 +3823,8 @@ app.get(
       baseUrl:
         BASE_URL,
 
-      series:
-        CONFIGURED_SERIES,
+      tdMode:
+        'isolated',
 
       position:
         state.position
@@ -3803,16 +3866,9 @@ app.get(
   }
 );
 
-/* =========================================================
-   HEALTH
-========================================================= */
-
 app.get(
   '/health',
-  async (
-    req,
-    res
-  ) => {
+  async (req, res) => {
 
     res.json({
 
@@ -3826,21 +3882,15 @@ app.get(
         'EVENTS',
 
       time:
-        new Date().toISOString()
+        new Date()
+          .toISOString()
     });
   }
 );
 
-/* =========================================================
-   STATUS
-========================================================= */
-
 app.get(
   '/status',
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
 
     res.json({
 
@@ -3853,11 +3903,8 @@ app.get(
       product:
         'EVENTS',
 
-      baseUrl:
-        BASE_URL,
-
-      series:
-        CONFIGURED_SERIES,
+      tdMode:
+        'isolated',
 
       riskPct:
         RISK_PCT,
@@ -3898,98 +3945,62 @@ app.get(
 
 app.get(
   '/event-discovery',
-  async (
-    req,
-    res
-  ) => {
+  async (req, res) => {
 
     try {
 
-      const series =
-        await discoverEventSeries();
-
-      const result =
-        [];
-
-      for (
-        const seriesId of
-          series
-      ) {
-
-        try {
-
-          const instruments =
-            await getEventInstruments(
-              seriesId
-            );
-
-          result.push({
-
-            seriesId,
-
-            count:
-              Array.isArray(
-                instruments
-              )
-                ? instruments.length
-                : 0,
-
-            instruments:
-              Array.isArray(
-                instruments
-              )
-                ? instruments
-                    .slice(
-                      0,
-                      30
-                    )
-                    .map(
-                      x => ({
-                        instId:
-                          x.instId,
-
-                        seriesId:
-                          x.seriesId,
-
-                        state:
-                          x.state,
-
-                        expTime:
-                          x.expTime,
-
-                        lotSz:
-                          x.lotSz,
-
-                        minSz:
-                          x.minSz,
-
-                        tickSz:
-                          x.tickSz
-                      })
-                    )
-                : []
-          });
-
-        } catch (err) {
-
-          result.push({
-
-            seriesId,
-
-            error:
-              err.message
-          });
-        }
-      }
+      const instruments =
+        await discoverEventInstruments();
 
       res.json({
 
         ok:
           true,
 
-        series,
+        count:
+          instruments.length,
 
-        result
+        instruments:
+          instruments
+            .slice(
+              0,
+              100
+            )
+            .map(
+              inst => ({
+
+                instId:
+                  inst.instId,
+
+                seriesId:
+                  inst.seriesId,
+
+                state:
+                  inst.state,
+
+                expTime:
+                  inst.expTime,
+
+                parsedExpiry:
+                  getExpiry(
+                    inst
+                  ),
+
+                minutesToExpiry:
+                  minutesToExpiry(
+                    inst
+                  ),
+
+                tickSz:
+                  inst.tickSz,
+
+                lotSz:
+                  inst.lotSz,
+
+                minSz:
+                  inst.minSz
+              })
+            )
       });
 
     } catch (err) {
@@ -4009,20 +4020,17 @@ app.get(
 );
 
 /* =========================================================
-   MANUAL SCAN ENDPOINT
+   MANUAL TEST DISCOVERY
 ========================================================= */
 
 app.get(
-  '/scan',
-  async (
-    req,
-    res
-  ) => {
+  '/event-test',
+  async (req, res) => {
 
     try {
 
-      const candidates =
-        await scanCandidates();
+      const instruments =
+        await discoverEventInstruments();
 
       res.json({
 
@@ -4030,46 +4038,37 @@ app.get(
           true,
 
         count:
-          candidates.length,
+          instruments.length,
 
-        candidates:
-          candidates
+        sample:
+          instruments
             .slice(
               0,
               20
             )
             .map(
-              c => ({
+              x => ({
 
                 instId:
-                  c.inst.instId,
+                  x.instId,
 
                 seriesId:
-                  c.seriesId,
+                  x.seriesId,
 
-                side:
-                  c.side,
+                state:
+                  x.state,
 
-                entry:
-                  c.entryPx,
+                expTime:
+                  x.expTime,
 
-                score:
-                  c.score,
+                tickSz:
+                  x.tickSz,
 
-                model:
-                  c.modelProb,
+                lotSz:
+                  x.lotSz,
 
-                market:
-                  c.marketProb,
-
-                edge:
-                  c.edge,
-
-                minutesToExpiry:
-                  c.minutesToExpiry,
-
-                reasons:
-                  c.reasons
+                minSz:
+                  x.minSz
               })
             )
       });
@@ -4094,11 +4093,28 @@ app.get(
    MAIN LOOP
 ========================================================= */
 
+let loopRunning =
+  false;
+
 async function mainLoop() {
 
-  resetDaily();
+  if (
+    loopRunning
+  ) {
+
+    console.log(
+      '[EVENT] Previous loop still running'
+    );
+
+    return;
+  }
+
+  loopRunning =
+    true;
 
   try {
+
+    resetDaily();
 
     await managePosition();
 
@@ -4112,15 +4128,20 @@ async function mainLoop() {
   } catch (err) {
 
     console.error(
-      'MAIN LOOP:',
+      '[EVENT MAIN LOOP]',
       err.message ||
-        err
+      err
     );
+
+  } finally {
+
+    loopRunning =
+      false;
   }
 }
 
 /* =========================================================
-   START SERVER
+   START
 ========================================================= */
 
 app.listen(
@@ -4152,9 +4173,15 @@ app.listen(
     );
 
     console.log(
-      `EVENT_SERIES=${CONFIGURED_SERIES.join(
-        ','
-      )}`
+      `PRODUCT=EVENTS`
+    );
+
+    console.log(
+      `TD_MODE=isolated`
+    );
+
+    console.log(
+      `AUTO_DISCOVER_SERIES=${AUTO_DISCOVER_SERIES}`
     );
 
     console.log(
@@ -4197,14 +4224,14 @@ app.listen(
       );
     }
 
-    console.log(
-      '[EVENT] Runner ready.'
-    );
+    /*
+      不自動發 Telegram 測試訊息。
+    */
   }
 );
 
 /* =========================================================
-   LOOPS
+   INTERVALS
 ========================================================= */
 
 setInterval(
@@ -4218,13 +4245,14 @@ setInterval(
 );
 
 /* =========================================================
-   INITIAL
+   INITIAL RUN
 ========================================================= */
 
-mainLoop().catch(
-  err =>
-    console.error(
-      'Initial loop:',
-      err
-    )
-);
+mainLoop()
+  .catch(
+    err =>
+      console.error(
+        '[EVENT INITIAL LOOP]',
+        err
+      )
+  );
