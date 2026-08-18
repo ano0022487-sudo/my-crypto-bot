@@ -2,7 +2,7 @@
 
 /*
 ===========================================================
- OKX EVENT CONTRACT SNR ROLLING BOT (FIXED)
+ OKX EVENT CONTRACT SNR ROLLING BOT (STAKE 3U FIXED)
 ===========================================================
 */
 
@@ -446,26 +446,6 @@ async function privateRequest(
   )
     ? response.data.data
     : [];
-}
-
-async function getServerTime() {
-
-  try {
-
-    const rows =
-      await publicGet(
-        '/api/v5/public/time'
-      );
-
-    return Number(
-      rows?.[0]?.ts ||
-      Date.now()
-    );
-
-  } catch (_) {
-
-    return Date.now();
-  }
 }
 
 /* =========================================================
@@ -1715,7 +1695,7 @@ function modelProbability(
 }
 
 /* =========================================================
-   EQUITY & STAKE
+   EQUITY & STAKE (3U FIXED)
 ========================================================= */
 
 async function getEquity() {
@@ -1787,11 +1767,11 @@ function stakeForEquity(
   equity
 ) {
   /*
-    強制鎖定單筆最大資金為 5 枚 USDT
+    強制鎖定單筆最大資金為 3 枚 USDT
   */
   return Math.min(
     equity,
-    5
+    3
   );
 }
 
@@ -2148,7 +2128,7 @@ async function scanCandidates() {
 }
 
 /* =========================================================
-   ORDER EXECUTION & QUANTITY FIX
+   ORDER EXECUTION
 ========================================================= */
 
 async function placeEventOrder(
@@ -2194,9 +2174,6 @@ async function placeEventOrder(
     );
   }
 
-  /*
-    計算原始張數並強制對齊 lotSz，避免位數錯誤觸發 IOC 取消
-  */
   const rawSz =
     stake /
     candidate.entryPx;
