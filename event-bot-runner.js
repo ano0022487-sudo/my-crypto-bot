@@ -1,12 +1,9 @@
 'use strict';
 
-// Production runner for event-bot.js.
-// OKX currently requires Event Contract orders to use tdMode=isolated.
-
 const fs = require('fs');
 const path = require('path');
 
-// 關鍵修復：把專案根目錄的 node_modules 加入模組搜尋路徑中
+// 強制將專案原本的 node_modules 加入 Node.js 搜尋路徑
 module.paths.push(path.join(__dirname, 'node_modules'));
 
 const source = path.join(__dirname, 'event-bot.js');
