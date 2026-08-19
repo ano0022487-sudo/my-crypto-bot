@@ -9,6 +9,7 @@
     replacements before compiling it.
   - No Telegram message/template rewriting is performed here.
   - Telegram polling is disabled because Telegram is notification-only.
+  - OKX private API requests are forced into Demo Trading mode.
 */
 
 const fs = require('fs');
@@ -46,6 +47,19 @@ try {
   } catch (err) {
     console.error('[Runner Telegram Patch Error]', err.message || err);
   }
+
+  /* =========================================================
+     OKX DEMO TRADING
+     Force the required Demo Trading header on every private
+     OKX API request made by event-bot.js.
+  ========================================================= */
+
+  code = replaceOrThrow(
+    code,
+    `'Content-Type':\n      'application/json'`,
+    `'Content-Type':\n      'application/json',\n\n    'x-simulated-trading':\n      '1'`,
+    'OKX Demo Trading header'
+  );
 
   /* =========================================================
      EVENT CONTRACT SETTINGS
@@ -223,6 +237,7 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
     /console\.log\(`OKX EVENT CONTRACT BOT RUNNING ON PORT \$\{PORT\}`\);/,
     `console.log(\`OKX EVENT CONTRACT BOT RUNNING ON PORT \${PORT}\`);
     console.log(\`[CONFIG] TARGET=\${ROLL_BASE_STAKE}U ROLL=+50% MIN_SCORE=\${MIN_SCORE} MIN_EDGE=\${MIN_EDGE} MIN_MODEL=\${MIN_COMPOSITE_PROB}\`);
+    console.log('[OKX] Demo Trading forced: x-simulated-trading=1');
     console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');`
   );
 
