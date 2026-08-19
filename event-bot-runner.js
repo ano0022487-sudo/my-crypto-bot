@@ -5,23 +5,29 @@ const fs = require('fs');
 const path = require('path');
 const Module = require('module');
 
-// Telegram is notification-only. Do not start getUpdates polling on Render.
-try {
-  const TelegramBot = require('node-telegram-bot-api');
-  TelegramBot.prototype.startPolling = async function () {
-    console.log('[Telegram] polling disabled; notification-only mode');
-    return this;
-  };
-} catch (err) {
-  console.error('[Runner Telegram Patch Error]', err.message || err);
-}
-
 const source = path.join(__dirname, 'event-bot.js');
 
 try {
   if (!fs.existsSync(source)) throw new Error(`找不到 event-bot.js: ${source}`);
 
   let code = fs.readFileSync(source, 'utf8');
+
+  // ===== Telegram: notification-only. NEVER start getUpdates polling. =====
+  // Force the source itself to use polling:false. This is more robust than
+  // monkey-patching startPolling and prevents Telegram 409 conflicts.
+  code = code.replace(/polling\s*:\s*true/g, 'polling: false');
+
+  // If a Telegram constructor is ever created with a different polling form,
+  // disable polling at runtime as an additional safeguard.
+  try {
+    const TelegramBot = require('node-telegram-bot-api');
+    TelegramBot.prototype.startPolling = async function () {
+      console.log('[Telegram] polling disabled; notification-only mode');
+      return this;
+    };
+  } catch (err) {
+    console.error('[Runner Telegram Patch Error]', err.message || err);
+  }
 
   // ===== High-confidence Event Contract rules =====
   code = code.replace(
@@ -81,7 +87,7 @@ try {
 
   code = code.replace(
     "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);",
-    "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);\n    console.log(`[CONFIG] BASE=${ROLL_BASE_STAKE}U ROLL=+50% AFTER WIN RESET=${ROLL_RESET_LOSSES} LOSSES MIN_SCORE=${MIN_SCORE} MIN_EDGE=${MIN_EDGE} MIN_MODEL=${MIN_COMPOSITE_PROB}`);"
+    "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);\n    console.log(`[CONFIG] BASE=${ROLL_BASE_STAKE}U ROLL=+50% AFTER WIN RESET=${ROLL_RESET_LOSSES} LOSSES MIN_SCORE=${MIN_SCORE} MIN_EDGE=${MIN_EDGE} MIN_MODEL=${MIN_COMPOSITE_PROB}`);\n    console.log('[Telegram] polling forced OFF; sendMessage notifications remain enabled');"
   );
 
   const runtimeModule = new Module(source, module);
