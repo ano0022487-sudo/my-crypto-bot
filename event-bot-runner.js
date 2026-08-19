@@ -231,14 +231,17 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
 
   /* =========================================================
      STARTUP DIAGNOSTICS
+     Keep this section free of nested template literals so the
+     generated runtime source cannot produce the previous
+     "Actual ${...}" syntax error.
   ========================================================= */
 
   code = code.replace(
     /console\.log\(`OKX EVENT CONTRACT BOT RUNNING ON PORT \$\{PORT\}`\);/,
-    `console.log(\`OKX EVENT CONTRACT BOT RUNNING ON PORT \${PORT}\`);
-    console.log(\`[CONFIG] TARGET=\${ROLL_BASE_STAKE}U ROLL=+50% MIN_SCORE=\${MIN_SCORE} MIN_EDGE=\${MIN_EDGE} MIN_MODEL=\${MIN_COMPOSITE_PROB}\`);
-    console.log('[OKX] Demo Trading forced: x-simulated-trading=1');
-    console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');`
+    "console.log('OKX EVENT CONTRACT BOT RUNNING ON PORT ' + PORT);\n" +
+    "    console.log('[CONFIG] TARGET=' + ROLL_BASE_STAKE + 'U ROLL=+50% MIN_SCORE=' + MIN_SCORE + ' MIN_EDGE=' + MIN_EDGE + ' MIN_MODEL=' + MIN_COMPOSITE_PROB);\n" +
+    "    console.log('[OKX] Demo Trading forced: x-simulated-trading=1');\n" +
+    "    console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');"
   );
 
   /* =========================================================
