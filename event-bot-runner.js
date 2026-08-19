@@ -1,6 +1,7 @@
 'use strict';
 
 // Stable launcher for the OKX Event Contract bot.
+// Telegram is notification-only; polling is forcibly disabled.
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
@@ -12,7 +13,7 @@ try {
 
   let code = fs.readFileSync(source, 'utf8');
 
-  // ===== Telegram: notification-only. NEVER start getUpdates polling. =====
+  // Never allow Telegram getUpdates polling in this service.
   code = code.replace(/polling\s*:\s*true/g, 'polling: false');
 
   try {
@@ -25,7 +26,7 @@ try {
     console.error('[Runner Telegram Patch Error]', err.message || err);
   }
 
-  // ===== High-confidence Event Contract rules =====
+  // ===== Event Contract configuration =====
   code = code.replace(
     'const ORDER_SIZE_FIXED = 5;',
     `const TARGET_STAKE_USDT = Number(process.env.TARGET_STAKE_USDT || 5);\nconst MIN_COMPOSITE_PROB = Number(process.env.MIN_COMPOSITE_PROB || 0.70);\nconst ROLL_BASE_STAKE = TARGET_STAKE_USDT;\nconst ROLL_MULTIPLIER = 1.5;\nconst ROLL_RESET_LOSSES = 6;`
@@ -44,7 +45,7 @@ try {
     "Number(\n    process.env.MAX_CONSECUTIVE_LOSSES || 999999\n  );"
   );
 
-  // Rolling stake: each win increases the next stake by 50%.
+  // ===== Rolling stake state =====
   code = code.replace(
     `trades:\n      []`,
     `trades:\n      [],\n\n    rollStake:\n      ROLL_BASE_STAKE,\n\n    rollStep:\n      0`
@@ -56,18 +57,17 @@ try {
   );
 
   // ===== Correct Event Contract quantity =====
-  // Event-contract sz is the number of shares/contracts, not USDT.
-  // Target stake = price * contracts. Round UP to the instrument lot size
-  // so the requested stake is reached rather than silently under-sizing.
+  // sz is contract/share quantity, not USDT. Target stake = entry price * sz.
+  // Round UP to the instrument lot size so the target stake is reached.
   code = code.replace(
     'const sz = ORDER_SIZE_FIXED;',
-    `const currentRollStake = Math.max(ROLL_BASE_STAKE, Number(state.rollStake || ROLL_BASE_STAKE));\n  const lotSz = Math.max(0.00000001, Number(candidate.inst.lotSz || candidate.inst.minSz || 0.1));\n  const minSz = Math.max(lotSz, Number(candidate.inst.minSz || lotSz));\n  const rawSz = currentRollStake / candidate.entryPx;\n  const roundedSz = Math.ceil(rawSz / lotSz - 1e-12) * lotSz;\n  const sz = Math.max(minSz, roundedSz);`
+    `const currentRollStake = Math.max(ROLL_BASE_STAKE, Number(state.rollStake || ROLL_BASE_STAKE));\n  const lotSz = Math.max(0.00000001, Number(candidate.inst.lotSz || candidate.inst.minSz || 0.1));\n  const minSz = Math.max(lotSz, Number(candidate.inst.minSz || lotSz));\n  const rawSz = currentRollStake / candidate.entryPx;\n  const roundedSz = Math.ceil(rawSz / lotSz - 1e-12) * lotSz;\n  const sz = Math.max(minSz, Number(roundedSz.toFixed(8)));`
   );
 
-  // Add a safety log immediately before placing the order.
+  // Log the exact order-size calculation immediately before placing the order.
   code = code.replace(
     `const body = {\n\n    instId:`,
-    `const actualTargetStake = px * sz;\n\n  console.log(\n    '[ORDER SIZE]',\n    JSON.stringify({\n      targetStake: currentRollStake,\n      entryPx: px,\n      lotSz,\n      minSz,\n      contracts: sz,\n      actualStake: actualTargetStake\n    })\n  );\n\n  const body = {\n\n    instId:`
+    `const actualTargetStake = px * sz;\n\n  console.log('[ORDER SIZE]', JSON.stringify({\n    targetStake: currentRollStake,\n    entryPx: px,\n    lotSz,\n    minSz,\n    contracts: sz,\n    actualStake: actualTargetStake\n  }));\n\n  const body = {\n\n    instId:`
   );
 
   // High-confidence candidate confirmation.
@@ -76,36 +76,24 @@ try {
     `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }\n\n      if (modelProb < MIN_COMPOSITE_PROB) {\n        continue;\n      }\n\n      const requiredConfirmations = ['5m trend', '15m trend', 'RSI', 'volume'];\n      if (!requiredConfirmations.every(x => model.reasons.includes(x))) {\n        continue;\n      }`
   );
 
-  // OKX EVENTS non-post-only order parameter.
+  // Event Contract entry: require the full requested quantity to fill.
   code = code.replace(
-    `outcome:\n      candidate.side,\n\n    clOrdId:`,
-    `outcome:\n      candidate.side,\n\n    speedBump:\n      '1',\n\n    clOrdId:`
-  );
-  code = code.replace(
-    `outcome:\n      position.side,\n\n    clOrdId:`,
-    `outcome:\n      position.side,\n\n    speedBump:\n      '1',\n\n    clOrdId:`
+    `ordType:\n      'ioc',`,
+    `ordType:\n      'fok',`
   );
 
-  // After each result: win => +50% next stake; 6 losses => reset to base.
-  code = code.replace(
-    `if (\n    pnl < 0\n  ) {\n\n    state.consecutiveLosses++;\n\n  } else {\n\n    state.consecutiveLosses =\n      0;\n  }`,
-    `if (pnl < 0) {\n    state.consecutiveLosses++;\n\n    if (state.consecutiveLosses >= ROLL_RESET_LOSSES) {\n      state.rollStep = 0;\n      state.rollStake = ROLL_BASE_STAKE;\n      state.consecutiveLosses = 0;\n      state.halted = false;\n      console.log('[ROLLING] consecutive-loss reset -> base stake');\n    }\n  } else {\n    state.consecutiveLosses = 0;\n    state.rollStep = Number(state.rollStep || 0) + 1;\n    state.rollStake = ROLL_BASE_STAKE * Math.pow(ROLL_MULTIPLIER, state.rollStep);\n  }`
-  );
+  // Keep close orders IOC so exits can fill immediately.
+  // The replacement above intentionally only changes the first matching entry order.
 
   // Show target and actual stake in Telegram entry notification.
   code = code.replace(
-    `await notify(\n\n      \`🟡 EVENT ENTRY\\n\` +`,
-    `await notify(\n\n      \`🟡 EVENT ENTRY\\n\` +`
-  );
-
-  code = code.replace(
-    `\`Actual ${\n        actualStake.toFixed(4)\n      }U\\n\` +`,
-    `\`Target ${\n        (state.rollStake || ROLL_BASE_STAKE).toFixed(4)\n      }U\\n\` +\n\n      \`Actual ${\n        actualStake.toFixed(4)\n      }U\\n\` +`
+    '`Actual ${actualStake.toFixed(4)}U\\n` +',
+    '`Target ${(currentRollStake || ROLL_BASE_STAKE).toFixed(4)}U\\n` +\n\n      `Actual ${actualStake.toFixed(4)}U\\n` +'
   );
 
   code = code.replace(
     "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);",
-    "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);\n    console.log(`[CONFIG] BASE=${ROLL_BASE_STAKE}U ROLL=+50% AFTER WIN RESET=${ROLL_RESET_LOSSES} LOSSES MIN_SCORE=${MIN_SCORE} MIN_EDGE=${MIN_EDGE} MIN_MODEL=${MIN_COMPOSITE_PROB}`);\n    console.log('[Telegram] polling forced OFF; sendMessage notifications remain enabled');"
+    "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);\n    console.log(`[CONFIG] BASE=${ROLL_BASE_STAKE}U ROLL=+50% AFTER WIN RESET=${ROLL_RESET_LOSSES} LOSSES MIN_SCORE=${MIN_SCORE} MIN_EDGE=${MIN_EDGE} MIN_MODEL=${MIN_COMPOSITE_PROB}`);\n    console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');"
   );
 
   const runtimeModule = new Module(source, module);
