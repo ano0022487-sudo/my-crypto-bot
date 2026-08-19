@@ -75,8 +75,8 @@ app.get('/stats', (req, res) => {
   }
 
   // Telegram command handler.
-  // IMPORTANT: the generated source must not contain a single-quoted string
-  // spanning physical lines. Build help text as an array and join with '\\n'.
+  // Newline handling uses String.fromCharCode(10) so the generated source
+  // cannot accidentally send literal "\\n" text to Telegram.
   if (!code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
     const handler = `
 /* [Telegram COMMAND HANDLER INSTALLED] */
@@ -112,7 +112,7 @@ if (bot) {
         '持倉：' + (state.position ? state.position.inst.instId : '無'),
         '',
         '模式：PAPER'
-      ].join('\\\\n');
+      ].join(String.fromCharCode(10));
 
       await bot.sendMessage(chatId, text);
       console.log('[Telegram COMMAND] /stats replied to ' + chatId);
@@ -141,7 +141,7 @@ if (bot) {
         '/統計',
         '',
         '查詢目前模擬交易統計。'
-      ].join('\\\\n');
+      ].join(String.fromCharCode(10));
       await bot.sendMessage(chatId, helpText);
       console.log('[Telegram COMMAND] /start or /help replied to ' + chatId);
     } catch (err) {
