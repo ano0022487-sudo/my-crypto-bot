@@ -9,7 +9,6 @@ const source = path.join(__dirname, 'event-bot.js');
 
 try {
   if (!fs.existsSync(source)) throw new Error('找不到 event-bot.js: ' + source);
-
   let code = fs.readFileSync(source, 'utf8');
 
   process.env.LIVE_TRADING = 'false';
@@ -19,7 +18,6 @@ try {
 
   // Only this runner instance owns Telegram polling.
   code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
-  // Prevent any second TelegramBot construction from starting another polling loop.
   const telegramConstructPattern = /new\s+TelegramBot\s*\(\s*([^,]+),\s*\{\s*polling\s*:\s*true\s*\}\s*\)/g;
   let telegramConstructCount = 0;
   code = code.replace(telegramConstructPattern, (full, tokenExpr) => {
@@ -31,7 +29,7 @@ try {
 
   const forcedConfig = `
 // [RUNNER FORCED CONFIG]
-const TARGET_STAKE=2;
+const TARGET_STAKE=1;
 const MIN_EDGE=0.15;
 const MIN_SCORE=90;
 const MIN_MODEL_PROB=0.75;
@@ -111,7 +109,7 @@ if (bot) {
       const equity=Number(state.paperEquity||0);
       const start=Number(state.startEquity||0);
       const nl=String.fromCharCode(10);
-      const text=['📊 PAPER 統計','','交易筆數：'+trades.length,'勝場：'+wins,'敗場：'+losses,'勝率：'+winRate.toFixed(1)+'%','累計 PnL：'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U','起始資金：'+start.toFixed(2)+'U','目前資金：'+equity.toFixed(4)+'U','總獲利：+'+grossWin.toFixed(4)+'U','總虧損：'+grossLoss.toFixed(4)+'U','平均獲利：+'+(wins?(grossWin/wins).toFixed(4):'0.0000')+'U','平均虧損：'+(losses?(grossLoss/losses).toFixed(4):'0.0000')+'U','目前連敗：'+Number(state.consecutiveLosses||0),'停機鎖定：'+(state.halted?'是':'否'),'持倉：'+(state.position?state.position.inst.instId:'無'),'','模式：PAPER','','策略：2U / Score≥90 / Model≥75% / Edge≥15% / Entry 0.25-0.75'].join(nl);
+      const text=['📊 PAPER 統計','','交易筆數：'+trades.length,'勝場：'+wins,'敗場：'+losses,'勝率：'+winRate.toFixed(1)+'%','累計 PnL：'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U','起始資金：'+start.toFixed(2)+'U','目前資金：'+equity.toFixed(4)+'U','總獲利：+'+grossWin.toFixed(4)+'U','總虧損：'+grossLoss.toFixed(4)+'U','平均獲利：+'+(wins?(grossWin/wins).toFixed(4):'0.0000')+'U','平均虧損：'+(losses?(grossLoss/losses).toFixed(4):'0.0000')+'U','目前連敗：'+Number(state.consecutiveLosses||0),'停機鎖定：'+(state.halted?'是':'否'),'持倉：'+(state.position?state.position.inst.instId:'無'),'','模式：PAPER','','策略：1U / Score≥90 / Model≥75% / Edge≥15% / Entry 0.25-0.75'].join(nl);
       await bot.sendMessage(chatId,text);
     } catch(err) { console.error('[Telegram COMMAND ERROR]',err.message||err); }
   };
@@ -128,7 +126,7 @@ if (bot) {
   }
 
   console.log('[Runner] PAPER-ONLY mode forced: LIVE_TRADING=false');
-  console.log('[Runner] Strategy forced: 2U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.75');
+  console.log('[Runner] Strategy forced: 1U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.75');
   console.log('[Runner] Risk forced: daily loss 10% / max consecutive losses 2');
   console.log('[Runner] Event expiry forced: 2-20 minutes');
   console.log('[Runner] FINAL PRE-ORDER GATE: score/model/edge/entry checked immediately before placeEventOrder');
