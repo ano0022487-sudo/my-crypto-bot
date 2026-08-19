@@ -40,7 +40,7 @@ const EARLY_SL_PCT=0.25;
 const MIN_MINUTES_TO_EXPIRY=2;
 const MAX_MINUTES_TO_EXPIRY=20;
 const DAILY_LOSS_PCT=0.10;
-const MAX_CONSECUTIVE_LOSSES=2;
+const MAX_CONSECUTIVE_LOSSES=3;
 `;
   const cfgMarker = 'const TARGET_STAKE=';
   const cfgStart = code.indexOf(cfgMarker);
@@ -127,7 +127,7 @@ if (bot) {
 
   console.log('[Runner] PAPER-ONLY mode forced: LIVE_TRADING=false');
   console.log('[Runner] Strategy forced: 1U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.45');
-  console.log('[Runner] Risk forced: daily loss 10% / max consecutive losses 2');
+  console.log('[Runner] Risk forced: daily loss 10% / max consecutive losses 3 / cooldown 30 minutes');
   console.log('[Runner] Event expiry forced: 2-20 minutes');
   console.log('[Runner] FINAL PRE-ORDER GATE: score/model/edge/entry checked immediately before placeEventOrder');
   console.log('[Runner] Telegram command handlers installed: /stats /stat /統計 /start /help');
