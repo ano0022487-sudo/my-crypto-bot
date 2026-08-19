@@ -13,13 +13,14 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 const DRY_RUN = String(process.env.DRY_RUN ?? 'false').toLowerCase() !== 'false';
-const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/["']+/g, '');
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/['\"]+/g, '');
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const API_KEY = String(process.env.OK_ACCESS_KEY || '').trim();
 const SECRET_KEY = String(process.env.OK_ACCESS_SECRET || '').trim();
@@ -28,21 +29,21 @@ const BASE_URL = String(process.env.OKX_BASE_URL || 'https://www.okx.com').repla
 
 const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 15000);
 const POSITION_SYNC_INTERVAL = Number(process.env.POSITION_SYNC_INTERVAL || 60000);
-const LEVERAGE = 10;
-const MARGIN_PER_TRADE = 4;
-const MAX_CONCURRENT = 8;
-const STOP_LOSS_PCT = 0.01;
-const TAKE_PROFIT_PCT = 0.03;
+const DEFAULT_LEVERAGE = Number(process.env.DEFAULT_LEVERAGE || 10);
+const DEFAULT_MARGIN_PER_TRADE = Number(process.env.DEFAULT_MARGIN_PER_TRADE || 4);
+const DEFAULT_MAX_CONCURRENT = Number(process.env.DEFAULT_MAX_CONCURRENT || 8);
+const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.01);
+const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.03);
 const POS_MODE = String(process.env.POS_MODE || 'net').toLowerCase();
 const BREAKOUT_BUFFER = Number(process.env.BREAKOUT_BUFFER || 0.001);
-const EMA_PERIOD = 20;
-const VOLUME_LOOKBACK = 20;
+const EMA_PERIOD = Number(process.env.EMA_PERIOD || 20);
+const VOLUME_LOOKBACK = Number(process.env.VOLUME_LOOKBACK || 20);
 const MIN_VOLUME_MULTIPLIER = Number(process.env.MIN_VOLUME_MULTIPLIER || 1.2);
-const ATR_PERIOD = 14;
+const ATR_PERIOD = Number(process.env.ATR_PERIOD || 14);
 const MIN_ATR_PCT = Number(process.env.MIN_ATR_PCT || 0.0015);
 const MAX_ATR_PCT = Number(process.env.MAX_ATR_PCT || 0.02);
 const SNR_PROXIMITY = Number(process.env.SNR_PROXIMITY || 0.006);
-const PIVOT_LOOKBACK = 3;
+const PIVOT_LOOKBACK = Number(process.env.PIVOT_LOOKBACK || 3);
 const MAX_DAILY_LOSS_U = Number(process.env.MAX_DAILY_LOSS_U || 8);
 const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 3);
 const MAX_CONSECUTIVE_API_FAILURES = Number(process.env.MAX_CONSECUTIVE_API_FAILURES || 3);
@@ -50,12 +51,14 @@ const PROTECTION_VERIFY_ATTEMPTS = Number(process.env.PROTECTION_VERIFY_ATTEMPTS
 const PROTECTION_VERIFY_DELAY = Number(process.env.PROTECTION_VERIFY_DELAY || 1000);
 const BOT_STATE_FILE = process.env.BOT_STATE_FILE || path.join(__dirname, 'okx-swap-bot-state.json');
 const CONTROL_TOKEN = String(process.env.CONTROL_TOKEN || '').trim();
+const WHITELIST_SYMBOLS = (process.env.WHITELIST_SYMBOLS || '').split(',').map(s => s.trim()).filter(Boolean);
+const STARTUP_SAFE_MODE = String(process.env.STARTUP_SAFE_MODE || 'true').toLowerCase() === 'true';
 
 // Single axios instance with baseURL
 const http = axios.create({ baseURL: BASE_URL, timeout: 15000 });
 http.interceptors.response.use(resp => resp, err => Promise.reject(err));
 
-const SYMBOLS = [
+let SYMBOLS = [
   ['ETH','ETH-USDT-SWAP'], ['SOL','SOL-USDT-SWAP'], ['XRP','XRP-USDT-SWAP'],
   ['DOGE','DOGE-USDT-SWAP'], ['ADA','ADA-USDT-SWAP'], ['AVAX','AVAX-USDT-SWAP'],
   ['LINK','LINK-USDT-SWAP'], ['DOT','DOT-USDT-SWAP'], ['LTC','LTC-USDT-SWAP'],
@@ -65,12 +68,18 @@ const SYMBOLS = [
   ['OP','OP-USDT-SWAP'], ['TRX','TRX-USDT-SWAP']
 ].map(([label, swap]) => ({ label, swap, base: swap.replace(/-SWAP$/, '') }));
 
+// If whitelist provided, filter symbols to only those
+if (WHITELIST_SYMBOLS.length) {
+  const wl = new Set(WHITELIST_SYMBOLS.map(s => s.toUpperCase()));
+  SYMBOLS = SYMBOLS.filter(s => wl.has(s.label.toUpperCase()) || wl.has(s.swap.toUpperCase()));
+}
+
 let bot = { sendMessage: async () => {} };
 if (TELEGRAM_BOT_TOKEN) {
   bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
   bot.onText(/^\/start(?:\s|$)/, msg => {
     bot.sendMessage(msg.chat.id,
-      `OKX 永續機器人\n模式：${DRY_RUN ? '模擬' : '實盤'}\n策略：4H SNR + 15m Breakout\n保證金：${MARGIN_PER_TRADE}U\n槓桿：${LEVERAGE}x\n最多：${MAX_CONCURRENT} 倉\nTP/SL：[...]`
+      `OKX 永續機器人\n模式：${DRY_RUN ? '模擬' : '實盤'}\n策略：4H SNR + 15m Breakout\n保證金：${DEFAULT_MARGIN_PER_TRADE}U\n槓桿：${DEFAULT_LEVERAGE}x\n最多：${DEFAULT_MAX_CONCURRENT} 倉\nTP/SL：[...]`
     ).catch(() => {});
   });
 }
@@ -110,9 +119,19 @@ function loadState() {
 const botState = loadState();
 function persistState() {
   try {
+    const data = JSON.stringify(botState, null, 2);
     const tmp = BOT_STATE_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(botState, null, 2), 'utf8');
+    const fd = fs.openSync(tmp, 'w');
+    fs.writeSync(fd, data, null, 'utf8');
+    fs.fdatasyncSync(fd);
+    fs.closeSync(fd);
     fs.renameSync(tmp, BOT_STATE_FILE);
+    // try to fsync directory to ensure rename persisted (best-effort)
+    try {
+      const dirFd = fs.openSync(path.dirname(BOT_STATE_FILE), 'r');
+      fs.fsyncSync(dirFd);
+      fs.closeSync(dirFd);
+    } catch (_) {}
   }
   catch (e) { console.error('State save failed:', e.message || e); }
 }
@@ -136,6 +155,17 @@ function resetDailyRiskIfNeeded() {
 function riskBlocked() {
   resetDailyRiskIfNeeded();
   return botState.risk.halted || botState.risk.dailyRealizedPnl <= -Math.abs(MAX_DAILY_LOSS_U) || botState.risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES;
+}
+
+// Runtime effective trading parameters (can be overridden via env)
+let EFFECTIVE_LEVERAGE = Number(process.env.LEVERAGE || DEFAULT_LEVERAGE);
+let EFFECTIVE_MARGIN_PER_TRADE = Number(process.env.MARGIN_PER_TRADE || DEFAULT_MARGIN_PER_TRADE);
+let EFFECTIVE_MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || DEFAULT_MAX_CONCURRENT);
+if (STARTUP_SAFE_MODE) {
+  // Enforce conservative limits on startup to avoid large unexpected exposure
+  EFFECTIVE_MARGIN_PER_TRADE = Math.min(EFFECTIVE_MARGIN_PER_TRADE, 1);
+  EFFECTIVE_MAX_CONCURRENT = Math.min(EFFECTIVE_MAX_CONCURRENT, 1);
+  EFFECTIVE_LEVERAGE = Math.min(EFFECTIVE_LEVERAGE, 2);
 }
 
 async function axiosWithRetry(config, retries = 4, baseDelay = 800) {
@@ -244,7 +274,7 @@ function roundDown(value, step) {
 }
 async function setLeverage(instId) {
   if (DRY_RUN) return;
-  await privateRequest('POST', '/api/v5/account/set-leverage', { instId, lever:String(LEVERAGE), mgnMode:'cross' });
+  await privateRequest('POST', '/api/v5/account/set-leverage', { instId, lever:String(EFFECTIVE_LEVERAGE), mgnMode:'cross' });
 }
 function clientId(prefix='snr') { return `${prefix}${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`.slice(0,32); }
 
@@ -267,9 +297,9 @@ async function placeOrder({ sym, direction }) {
   const minSz = Number(meta?.minSz);
   if (!(price > 0) || !(ctVal > 0) || !(lotSz > 0)) throw new Error(`Invalid instrument metadata for ${sym.swap}`);
 
-  const rawContracts = (MARGIN_PER_TRADE * LEVERAGE) / (price * ctVal);
+  const rawContracts = (EFFECTIVE_MARGIN_PER_TRADE * EFFECTIVE_LEVERAGE) / (price * ctVal);
   const sz = roundDown(rawContracts, lotSz);
-  if (!(sz > 0) || (minSz > 0 && sz < minSz)) throw new Error(`4U order below minimum: ${sz} contracts; min=${minSz}`);
+  if (!(sz > 0) || (minSz > 0 && sz < minSz)) throw new Error(`Order below minimum: ${sz} contracts; min=${minSz}`);
 
   const side = direction === 'UP' ? 'buy' : 'sell';
   const tp = direction === 'UP' ? price * (1 + TAKE_PROFIT_PCT) : price * (1 - TAKE_PROFIT_PCT);
@@ -303,6 +333,8 @@ async function placeOrder({ sym, direction }) {
       if (!p2) throw new Error(`Order ${ordId} filled but attached TP/SL could not be verified`);
     }
   }
+  audit('order_placed', { instId: sym.swap, ordId, side, sz, tp, sl });
+  await notifyTelegram(`🟢 LIVE 進場\n${sym.label} ${direction}\nord:${ordId}\nsz:${sz}\navgPx:${orderInfo.avgPx || 'n/a'}\nTP:${(TAKE_PROFIT_PCT*100).toFixed(2)}% SL:${(STOP_LOSS_PCT*100).toFixed(2)}%`);
   return { success:true, id:ordId, avgPx:Number(orderInfo.avgPx || price), sz, tp, sl, orderInfo };
 }
 
@@ -459,14 +491,14 @@ async function processSymbol(sym) {
     if (!signal) return;
     if (!DRY_RUN && !(await syncTradingState())) return;
     if (active.has(sym.swap)) return;
-    if (active.size >= MAX_CONCURRENT) return;
+    if (active.size >= EFFECTIVE_MAX_CONCURRENT) return;
     if (riskBlocked()) return;
 
     const result = await placeOrder({ sym, direction:signal.direction });
     active.set(sym.swap, { kind:'bot-order', data:result });
     if (DRY_RUN) setTimeout(() => { active.delete(sym.swap); }, 4 * 60 * 60 * 1000);
-    audit('entry', { symbol:sym.label, instId:sym.swap, direction:signal.direction, margin:MARGIN_PER_TRADE, leverage:LEVERAGE, orderId:result.id, signal });
-    await notifyTelegram(`✅ ${DRY_RUN ? 'SIM' : 'LIVE'} 進場\n${sym.label} ${signal.direction}\n保證金 ${MARGIN_PER_TRADE}U × ${LEVERAGE}x\nTP ${TAKE_PROFIT_PCT*100}% / SL ${STOP_LOSS_PCT*100}% [...]`);
+    audit('entry', { symbol:sym.label, instId:sym.swap, direction:signal.direction, margin:EFFECTIVE_MARGIN_PER_TRADE, leverage:EFFECTIVE_LEVERAGE, orderId:result.id, signal });
+    await notifyTelegram(`✅ ${DRY_RUN ? 'SIM' : 'LIVE'} 進場\n${sym.label} ${signal.direction}\n保證金 ${EFFECTIVE_MARGIN_PER_TRADE}U × ${EFFECTIVE_LEVERAGE}x\nTP ${(TAKE_PROFIT_PCT*100).toFixed(2)}% / SL ${(STOP_LOSS_PCT*100).toFixed(2)}%`);
   } catch (e) {
     console.error(`${sym.label}:`, e.message || e);
     audit('process_error', { symbol:sym.label, error:e.message || String(e) });
@@ -490,23 +522,26 @@ async function runLoop() {
 }
 
 function controlToken(req) { return req.header('x-control-token') || req.query.token || ''; }
+
+// Rate limiter for control endpoints to avoid abuse
+const controlLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 app.get('/health', (req,res) => res.json({
   ok:true, mode:DRY_RUN?'DRY_RUN':'LIVE', paused, halted:botState.risk.halted,
   dailyRealizedPnl:botState.risk.dailyRealizedPnl, consecutiveLosses:botState.risk.consecutiveLosses,
-  openPositions:active.size, maxPositions:MAX_CONCURRENT, marginPerTrade:MARGIN_PER_TRADE, leverage:LEVERAGE,
+  openPositions:active.size, maxPositions:EFFECTIVE_MAX_CONCURRENT, marginPerTrade:EFFECTIVE_MARGIN_PER_TRADE, leverage:EFFECTIVE_LEVERAGE,
   tp:TAKE_PROFIT_PCT, sl:STOP_LOSS_PCT, now:new Date().toISOString()
 }));
-app.post('/pause', (req,res) => {
+app.post('/pause', controlLimiter, (req,res) => {
   if (!CONTROL_TOKEN || controlToken(req) !== CONTROL_TOKEN) return res.status(401).json({ok:false,msg:'unauthorized'});
   paused = true; void notifyTelegram('⏸️ Bot 已手動暫停'); res.json({ok:true,paused});
 });
-app.post('/resume', (req,res) => {
+app.post('/resume', controlLimiter, (req,res) => {
   if (!CONTROL_TOKEN || controlToken(req) !== CONTROL_TOKEN) return res.status(401).json({ok:false,msg:'unauthorized'});
   resetDailyRiskIfNeeded();
   if (botState.risk.halted) return res.status(409).json({ok:false,msg:'risk lock active; wait for next UTC day'});
   paused = false; apiFailureStreak = 0; void notifyTelegram('▶️ Bot 已恢復'); res.json({ok:true,paused});
 });
-app.get('/', (req,res) => res.send(`OKX Perpetual SNR Bot | ${DRY_RUN?'DRY_RUN':'LIVE'} | 4U × ${LEVERAGE}x | max ${MAX_CONCURRENT} positions`));
+app.get('/', (req,res) => res.send(`OKX Perpetual SNR Bot | ${DRY_RUN?'DRY_RUN':'LIVE'} | ${EFFECTIVE_MARGIN_PER_TRADE}U × ${EFFECTIVE_LEVERAGE}x | max ${EFFECTIVE_MAX_CONCURRENT} positions`));
 
 function validateEnv() {
   if (!DRY_RUN && (!API_KEY || !SECRET_KEY || !PASSPHRASE)) {
@@ -517,19 +552,31 @@ function validateEnv() {
     console.error('BOT_STATE_FILE not set');
     process.exit(1);
   }
+  if (!CONTROL_TOKEN) console.warn('CONTROL_TOKEN not set — /pause and /resume endpoints are unauthenticated');
 }
 
 validateEnv();
 
+// Ensure we persist state on unexpected errors
+process.on('uncaughtException', err => {
+  console.error('Uncaught exception:', err);
+  try { audit('uncaughtException', { message: String(err) }); } catch (_) {}
+  try { persistState(); } catch (_) {}
+  process.exit(1);
+});
+process.on('unhandledRejection', e => {
+  console.error('Unhandled rejection:', e);
+  try { audit('unhandledRejection', { message: String(e) }); } catch (_) {}
+});
+
 const server = app.listen(PORT, () => {
-  console.log(`Bot listening on ${PORT}; mode=${DRY_RUN?'DRY_RUN':'LIVE'}; margin=${MARGIN_PER_TRADE}U; leverage=${LEVERAGE}x; max=${MAX_CONCURRENT}`);
-  void notifyTelegram(`Bot 啟動\n模式：${DRY_RUN?'模擬':'實盤'}\n4U × ${LEVERAGE}x\n最多 ${MAX_CONCURRENT} 倉\nTP/SL 3%/1%`);
+  console.log(`Bot listening on ${PORT}; mode=${DRY_RUN?'DRY_RUN':'LIVE'}; margin=${EFFECTIVE_MARGIN_PER_TRADE}U; leverage=${EFFECTIVE_LEVERAGE}x; max=${EFFECTIVE_MAX_CONCURRENT}`);
+  void notifyTelegram(`Bot 啟動\n模式：${DRY_RUN?'模擬':'實盤'}\n${EFFECTIVE_MARGIN_PER_TRADE}U × ${EFFECTIVE_LEVERAGE}x\n最多 ${EFFECTIVE_MAX_CONCURRENT} 倉\nTP/SL ${(TAKE_PROFIT_PCT*100).toFixed(2)}%/${(STOP_LOSS_PCT*100).toFixed(2)}%`);
 });
 
 setInterval(() => { void runLoop(); }, CHECK_INTERVAL);
 if (!DRY_RUN) setInterval(() => { void syncTradingState(); void updateDailyPnL(); }, POSITION_SYNC_INTERVAL);
 void runLoop();
 
-process.on('SIGINT', () => server.close(() => process.exit(0)));
-process.on('SIGTERM', () => server.close(() => process.exit(0)));
-process.on('unhandledRejection', e => console.error('Unhandled rejection:', e));
+process.on('SIGINT', () => { try { persistState(); } catch (_) {} server.close(() => process.exit(0)); });
+process.on('SIGTERM', () => { try { persistState(); } catch (_) {} server.close(() => process.exit(0)); });
