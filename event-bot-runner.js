@@ -1,8 +1,6 @@
 'use strict';
 
 // Stable launcher for the OKX Event Contract bot.
-// Keeps event-bot.js as the strategy source, while applying the live
-// Event-Contract execution/risk rules below before compiling it.
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
@@ -21,64 +19,75 @@ try {
 const source = path.join(__dirname, 'event-bot.js');
 
 try {
-  if (!fs.existsSync(source)) {
-    throw new Error(`找不到 event-bot.js: ${source}`);
-  }
+  if (!fs.existsSync(source)) throw new Error(`找不到 event-bot.js: ${source}`);
 
   let code = fs.readFileSync(source, 'utf8');
 
-  // ===== Event Contract live rules =====
-  // One trade targets 5 USDT of stake. Because EVENTS quantity is in contracts,
-  // quantity is calculated from price and floored so the stake never exceeds 5U.
+  // ===== High-confidence Event Contract rules =====
   code = code.replace(
     'const ORDER_SIZE_FIXED = 5;',
-    `const TARGET_STAKE_USDT = Number(process.env.TARGET_STAKE_USDT || 5);\nconst MIN_COMPOSITE_PROB = Number(process.env.MIN_COMPOSITE_PROB || 0.70);`
+    `const TARGET_STAKE_USDT = Number(process.env.TARGET_STAKE_USDT || 5);\nconst MIN_COMPOSITE_PROB = Number(process.env.MIN_COMPOSITE_PROB || 0.70);\nconst ROLL_BASE_STAKE = TARGET_STAKE_USDT;\nconst ROLL_MULTIPLIER = 1.5;\nconst ROLL_RESET_LOSSES = 6;`
   );
 
   code = code.replace(
     "Number(\n    process.env.MIN_EDGE || 0.075\n  );",
     "Number(\n    process.env.MIN_EDGE || 0.10\n  );"
   );
-
   code = code.replace(
     "Number(\n    process.env.MIN_SCORE || 78\n  );",
     "Number(\n    process.env.MIN_SCORE || 85\n  );"
   );
+  code = code.replace(
+    "Number(\n    process.env.MAX_CONSECUTIVE_LOSSES || 3\n  );",
+    "Number(\n    process.env.MAX_CONSECUTIVE_LOSSES || 999999\n  );"
+  );
+
+  // Rolling stake: each win increases the next stake by 50%.
+  code = code.replace(
+    `trades:\n      []`,
+    `trades:\n      [],\n\n    rollStake:\n      ROLL_BASE_STAKE,\n\n    rollStep:\n      0`
+  );
+
+  code = code.replace(
+    `const state =\n  loadState();`,
+    `const state =\n  loadState();\n\nif (!Number.isFinite(Number(state.rollStake)) || Number(state.rollStake) < ROLL_BASE_STAKE) {\n  state.rollStake = ROLL_BASE_STAKE;\n}\nif (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {\n  state.rollStep = 0;\n}`
+  );
 
   code = code.replace(
     'const sz = ORDER_SIZE_FIXED;',
-    'const sz = Math.max(1, Math.floor(TARGET_STAKE_USDT / candidate.entryPx));'
+    `const currentRollStake = Math.max(ROLL_BASE_STAKE, Number(state.rollStake || ROLL_BASE_STAKE));\n  const sz = Math.max(1, Math.floor(currentRollStake / candidate.entryPx));`
   );
 
-  // Only accept signals where the selected direction itself has >=70% model
-  // probability and all four core confirmations are present.
   code = code.replace(
     `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }`,
-    `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }\n\n      if (modelProb < MIN_COMPOSITE_PROB) {\n        continue;\n      }\n\n      const requiredConfirmations = [\n        '5m trend',\n        '15m trend',\n        'RSI',\n        'volume'\n      ];\n\n      if (!requiredConfirmations.every(x => model.reasons.includes(x))) {\n        continue;\n      }`
+    `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }\n\n      if (modelProb < MIN_COMPOSITE_PROB) {\n        continue;\n      }\n\n      const requiredConfirmations = ['5m trend', '15m trend', 'RSI', 'volume'];\n      if (!requiredConfirmations.every(x => model.reasons.includes(x))) {\n        continue;\n      }`
   );
 
-  // Current OKX EVENTS API requires speedBump=1 for non-post-only orders.
+  // OKX EVENTS non-post-only order parameter.
   code = code.replace(
     `outcome:\n      candidate.side,\n\n    clOrdId:`,
     `outcome:\n      candidate.side,\n\n    speedBump:\n      '1',\n\n    clOrdId:`
   );
-
   code = code.replace(
     `outcome:\n      position.side,\n\n    clOrdId:`,
     `outcome:\n      position.side,\n\n    speedBump:\n      '1',\n\n    clOrdId:`
   );
 
-  // Add visible startup configuration.
+  // After each result: win => +50% next stake; 6 losses => reset to 5U.
   code = code.replace(
-    "console.log(\n      `OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`\n    );",
-    "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);\n    console.log(`[CONFIG] TARGET_STAKE=${TARGET_STAKE_USDT}U MIN_SCORE=${MIN_SCORE} MIN_EDGE=${MIN_EDGE} MIN_MODEL=${MIN_COMPOSITE_PROB}`);"
+    `if (\n    pnl < 0\n  ) {\n\n    state.consecutiveLosses++;\n\n  } else {\n\n    state.consecutiveLosses =\n      0;\n  }`,
+    `if (pnl < 0) {\n    state.consecutiveLosses++;\n\n    if (state.consecutiveLosses >= ROLL_RESET_LOSSES) {\n      state.rollStep = 0;\n      state.rollStake = ROLL_BASE_STAKE;\n      state.consecutiveLosses = 0;\n      state.halted = false;\n      console.log('[ROLLING] 6 consecutive losses -> reset to 5U');\n    }\n  } else {\n    state.consecutiveLosses = 0;\n    state.rollStep = Number(state.rollStep || 0) + 1;\n    state.rollStake = ROLL_BASE_STAKE * Math.pow(ROLL_MULTIPLIER, state.rollStep);\n  }`
+  );
+
+  code = code.replace(
+    "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);",
+    "console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`);\n    console.log(`[CONFIG] BASE=${ROLL_BASE_STAKE}U ROLL=+50% AFTER WIN RESET=${ROLL_RESET_LOSSES} LOSSES MIN_SCORE=${MIN_SCORE} MIN_EDGE=${MIN_EDGE} MIN_MODEL=${MIN_COMPOSITE_PROB}`);"
   );
 
   const runtimeModule = new Module(source, module);
   runtimeModule.filename = source;
   runtimeModule.paths = Module._nodeModulePaths(__dirname);
   runtimeModule._compile(code, source);
-
 } catch (err) {
   console.error('[Runner Error]', err);
   process.exitCode = 1;
