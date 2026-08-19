@@ -13,12 +13,8 @@ try {
   let code = fs.readFileSync(source, 'utf8');
 
   // ===== Telegram: notification-only. NEVER start getUpdates polling. =====
-  // Force the source itself to use polling:false. This is more robust than
-  // monkey-patching startPolling and prevents Telegram 409 conflicts.
   code = code.replace(/polling\s*:\s*true/g, 'polling: false');
 
-  // If a Telegram constructor is ever created with a different polling form,
-  // disable polling at runtime as an additional safeguard.
   try {
     const TelegramBot = require('node-telegram-bot-api');
     TelegramBot.prototype.startPolling = async function () {
@@ -59,11 +55,22 @@ try {
     `const state =\n  loadState();\n\nif (!Number.isFinite(Number(state.rollStake)) || Number(state.rollStake) < ROLL_BASE_STAKE) {\n  state.rollStake = ROLL_BASE_STAKE;\n}\nif (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {\n  state.rollStep = 0;\n}`
   );
 
+  // ===== Correct Event Contract quantity =====
+  // Event-contract sz is the number of shares/contracts, not USDT.
+  // Target stake = price * contracts. Round UP to the instrument lot size
+  // so the requested stake is reached rather than silently under-sizing.
   code = code.replace(
     'const sz = ORDER_SIZE_FIXED;',
-    `const currentRollStake = Math.max(ROLL_BASE_STAKE, Number(state.rollStake || ROLL_BASE_STAKE));\n  const sz = Math.max(1, Math.floor(currentRollStake / candidate.entryPx));`
+    `const currentRollStake = Math.max(ROLL_BASE_STAKE, Number(state.rollStake || ROLL_BASE_STAKE));\n  const lotSz = Math.max(0.00000001, Number(candidate.inst.lotSz || candidate.inst.minSz || 0.1));\n  const minSz = Math.max(lotSz, Number(candidate.inst.minSz || lotSz));\n  const rawSz = currentRollStake / candidate.entryPx;\n  const roundedSz = Math.ceil(rawSz / lotSz - 1e-12) * lotSz;\n  const sz = Math.max(minSz, roundedSz);`
   );
 
+  // Add a safety log immediately before placing the order.
+  code = code.replace(
+    `const body = {\n\n    instId:`,
+    `const actualTargetStake = px * sz;\n\n  console.log(\n    '[ORDER SIZE]',\n    JSON.stringify({\n      targetStake: currentRollStake,\n      entryPx: px,\n      lotSz,\n      minSz,\n      contracts: sz,\n      actualStake: actualTargetStake\n    })\n  );\n\n  const body = {\n\n    instId:`
+  );
+
+  // High-confidence candidate confirmation.
   code = code.replace(
     `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }`,
     `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }\n\n      if (modelProb < MIN_COMPOSITE_PROB) {\n        continue;\n      }\n\n      const requiredConfirmations = ['5m trend', '15m trend', 'RSI', 'volume'];\n      if (!requiredConfirmations.every(x => model.reasons.includes(x))) {\n        continue;\n      }`
@@ -79,10 +86,21 @@ try {
     `outcome:\n      position.side,\n\n    speedBump:\n      '1',\n\n    clOrdId:`
   );
 
-  // After each result: win => +50% next stake; 6 losses => reset to 5U.
+  // After each result: win => +50% next stake; 6 losses => reset to base.
   code = code.replace(
     `if (\n    pnl < 0\n  ) {\n\n    state.consecutiveLosses++;\n\n  } else {\n\n    state.consecutiveLosses =\n      0;\n  }`,
-    `if (pnl < 0) {\n    state.consecutiveLosses++;\n\n    if (state.consecutiveLosses >= ROLL_RESET_LOSSES) {\n      state.rollStep = 0;\n      state.rollStake = ROLL_BASE_STAKE;\n      state.consecutiveLosses = 0;\n      state.halted = false;\n      console.log('[ROLLING] 6 consecutive losses -> reset to 5U');\n    }\n  } else {\n    state.consecutiveLosses = 0;\n    state.rollStep = Number(state.rollStep || 0) + 1;\n    state.rollStake = ROLL_BASE_STAKE * Math.pow(ROLL_MULTIPLIER, state.rollStep);\n  }`
+    `if (pnl < 0) {\n    state.consecutiveLosses++;\n\n    if (state.consecutiveLosses >= ROLL_RESET_LOSSES) {\n      state.rollStep = 0;\n      state.rollStake = ROLL_BASE_STAKE;\n      state.consecutiveLosses = 0;\n      state.halted = false;\n      console.log('[ROLLING] consecutive-loss reset -> base stake');\n    }\n  } else {\n    state.consecutiveLosses = 0;\n    state.rollStep = Number(state.rollStep || 0) + 1;\n    state.rollStake = ROLL_BASE_STAKE * Math.pow(ROLL_MULTIPLIER, state.rollStep);\n  }`
+  );
+
+  // Show target and actual stake in Telegram entry notification.
+  code = code.replace(
+    `await notify(\n\n      \`🟡 EVENT ENTRY\\n\` +`,
+    `await notify(\n\n      \`🟡 EVENT ENTRY\\n\` +`
+  );
+
+  code = code.replace(
+    `\`Actual ${\n        actualStake.toFixed(4)\n      }U\\n\` +`,
+    `\`Target ${\n        (state.rollStake || ROLL_BASE_STAKE).toFixed(4)\n      }U\\n\` +\n\n      \`Actual ${\n        actualStake.toFixed(4)\n      }U\\n\` +`
   );
 
   code = code.replace(
