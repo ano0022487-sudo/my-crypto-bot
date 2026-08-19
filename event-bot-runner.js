@@ -12,16 +12,23 @@ try {
 
   let code = fs.readFileSync(source, 'utf8');
 
-  // HARD SAFETY: runner can never start live trading.
   process.env.LIVE_TRADING = 'false';
   const livePattern = /const\s+LIVE_TRADING\s*=\s*[^;]+;/;
   if (!livePattern.test(code)) throw new Error('[Runner] LIVE_TRADING declaration not found');
   code = code.replace(livePattern, 'const LIVE_TRADING = false;');
 
-  // Force Telegram polling.
+  // Only this runner instance owns Telegram polling.
   code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
+  // Prevent any second TelegramBot construction from starting another polling loop.
+  const telegramConstructPattern = /new\s+TelegramBot\s*\(\s*([^,]+),\s*\{\s*polling\s*:\s*true\s*\}\s*\)/g;
+  let telegramConstructCount = 0;
+  code = code.replace(telegramConstructPattern, (full, tokenExpr) => {
+    telegramConstructCount += 1;
+    return telegramConstructCount === 1
+      ? `new TelegramBot(${tokenExpr}, { polling: true })`
+      : `new TelegramBot(${tokenExpr}, { polling: false })`;
+  });
 
-  // Preserve the complete strategy/risk configuration while forcing the safety values.
   const forcedConfig = `
 // [RUNNER FORCED CONFIG]
 const TARGET_STAKE=2;
@@ -44,7 +51,6 @@ const MAX_CONSECUTIVE_LOSSES=2;
   if (cfgEnd < 0) throw new Error('[Runner] strategy config boundary not found');
   code = code.slice(0, cfgStart) + forcedConfig.trim() + code.slice(cfgEnd + 1);
 
-  // Final hard gate immediately before the order function can be called.
   const orderMarker = 'const order=await placeEventOrder(c,equity);';
   if (!code.includes(orderMarker)) throw new Error('[Runner] placeEventOrder call not found');
   const finalGate = `
@@ -66,7 +72,6 @@ console.log('[EVENT FINAL PASS]', JSON.stringify({instId:c&&c.inst&&c.inst.instI
 `;
   code = code.replace(orderMarker, finalGate + '\n' + orderMarker);
 
-  // Read-only /stats endpoint.
   if (!code.includes("app.get('/stats'")) {
     const statsRoute = `
 app.get('/stats', (req, res) => {
@@ -90,7 +95,6 @@ app.get('/stats', (req, res) => {
     }
   }
 
-  // Telegram commands.
   if (!code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
     const handler = `
 /* [Telegram COMMAND HANDLER INSTALLED] */
