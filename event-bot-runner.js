@@ -35,6 +35,7 @@ try {
 
   let code = fs.readFileSync(source, 'utf8');
 
+  /* Telegram is notification-only. Never start getUpdates polling. */
   code = code.replace(/polling\s*:\s*true/g, 'polling: false');
 
   try {
@@ -47,6 +48,7 @@ try {
     console.error('[Runner Telegram Patch Error]', err.message || err);
   }
 
+  /* Event contract configuration. */
   code = replaceOrThrow(
     code,
     'const ORDER_SIZE_FIXED = 5;',
@@ -73,6 +75,7 @@ const ROLL_RESET_LOSSES = 6;`,
     `const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 999999);`
   );
 
+  /* Persistent rolling stake state. */
   code = replaceOrThrow(
     code,
     `trades:\n      []`,
@@ -112,6 +115,7 @@ if (state.usedEventIds.length > 500) {
     'state initialization'
   );
 
+  /* Convert 5 USDT target stake into event-contract quantity. */
   code = replaceOrThrow(
     code,
     'const sz = ORDER_SIZE_FIXED;',
@@ -139,6 +143,7 @@ if (state.usedEventIds.length > 500) {
     'order quantity'
   );
 
+  /* Refresh quote immediately before live entry. */
   code = replaceOrThrow(
     code,
     `const inst =\n    candidate.inst;`,
@@ -177,6 +182,7 @@ if (state.usedEventIds.length > 500) {
     'fresh quote protection'
   );
 
+  /* FOK: either the requested quantity fills or the order is cancelled. */
   code = replaceOrThrow(
     code,
     `ordType:\n      'ioc',`,
@@ -185,6 +191,7 @@ if (state.usedEventIds.length > 500) {
     'entry order type'
   );
 
+  /* High-confidence filter. */
   code = replaceOrThrow(
     code,
     `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }`,
@@ -215,6 +222,7 @@ if (state.usedEventIds.length > 500) {
     'high-confidence filter'
   );
 
+  /* Same event contract: only one confirmed entry. */
   code = replaceOrThrow(
     code,
     `const candidate =\n    candidates[0];`,
@@ -233,6 +241,7 @@ if (state.usedEventIds.length > 500) {
     'same event entry lock'
   );
 
+  /* Order-size diagnostics. */
   code = replaceOrThrow(
     code,
     `const body = {\n\n    instId:`,
@@ -253,6 +262,7 @@ if (state.usedEventIds.length > 500) {
     'order-size diagnostic'
   );
 
+  /* Always log the API response. */
   code = replaceOrThrow(
     code,
     `const result =\n    rows?.[0];`,
@@ -263,6 +273,7 @@ if (state.usedEventIds.length > 500) {
     'entry order response logging'
   );
 
+  /* Query the final order state before creating any local position. */
   code = replaceOrThrow(
     code,
     `const filled =\n      await getOrder(\n        inst.instId,\n        result.ordId\n      );`,
@@ -286,6 +297,7 @@ if (state.usedEventIds.length > 500) {
     'entry order state logging'
   );
 
+  /* Never fall back to the requested size. Only actual OKX fills count. */
   code = replaceOrThrow(
     code,
     `const fillSz =\n      Number(\n        filled?.accFillSz ||\n        filled?.fillSz ||\n        ORDER_SIZE_FIXED\n      );`,
@@ -305,6 +317,11 @@ if (state.usedEventIds.length > 500) {
     'strict fill quantity'
   );
 
+  /*
+     FOK is considered successful only when the exchange reports filled
+     and the actual cumulative fill is positive. Never reference an
+     undefined local variable in this error path.
+  */
   code = replaceOrThrow(
     code,
     `if (\n      !(\n        fillSz > 0\n      )\n    ) {\n\n      return;\n    }`,
@@ -315,11 +332,12 @@ if (state.usedEventIds.length > 500) {
       console.warn(
         '[ENTRY NOT FILLED]',
         JSON.stringify({
-          ordId: order?.ordId || null,
+          ordId: result?.ordId || null,
           state: filled?.state || null,
           filledContracts: fillSz,
           cancelSource: filled?.cancelSource || null,
-          sMsg: order?.sMsg || null
+          sCode: result?.sCode || null,
+          sMsg: result?.sMsg || null
         })
       );
       return;
@@ -327,6 +345,7 @@ if (state.usedEventIds.length > 500) {
     'strict filled state'
   );
 
+  /* Mark the event used only after a confirmed fill. */
   code = replaceOrThrow(
     code,
     `state.lastTradeAt =\n      Date.now();\n\n    saveState();`,
@@ -347,6 +366,7 @@ if (state.usedEventIds.length > 500) {
     'mark event used after entry'
   );
 
+  /* Startup diagnostics. */
   code = code.replace(
     /console\.log\(`OKX EVENT CONTRACT BOT RUNNING ON PORT \$\{PORT\}`\);/,
     "console.log('OKX EVENT CONTRACT BOT RUNNING ON PORT ' + PORT);\n" +
