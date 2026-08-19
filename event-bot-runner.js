@@ -21,7 +21,7 @@ try {
   // Force Telegram polling on so commands can be received.
   code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
 
-  // Read-only statistics endpoint. Do not require /health to exist.
+  // Read-only statistics endpoint.
   if (!code.includes("app.get('/stats'")) {
     const statsRoute = `
 app.get('/stats', (req, res) => {
@@ -60,7 +60,7 @@ app.get('/stats', (req, res) => {
     }
   }
 
-  // Telegram commands: locate the bot declaration by its start/end boundaries.
+  // Telegram commands. This handler intentionally contains NO nested template literals.
   if (!code.includes('[Telegram COMMAND]')) {
     const handler = `
 if (bot) {
@@ -86,23 +86,26 @@ if (bot) {
       const start = Number(state.startEquity || 0);
 
       const text = [
-        '📊 PAPER 統計', '',
-        `交易筆數：${trades.length}`,
-        `勝場：${wins}`,
-        `敗場：${losses}`,
-        `勝率：${winRate.toFixed(1)}%`,
-        `累計 PnL：${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}U`,
-        `起始資金：${start.toFixed(2)}U`,
-        `目前資金：${equity.toFixed(4)}U`,
-        `總獲利：+${grossWin.toFixed(4)}U`,
-        `總虧損：${grossLoss.toFixed(4)}U`,
-        `平均獲利：+${wins ? (grossWin / wins).toFixed(4) : '0.0000'}U`,
-        `平均虧損：${losses ? (grossLoss / losses).toFixed(4) : '0.0000'}U`,
-        `目前連敗：${Number(state.consecutiveLosses || 0)}`,
-        `停機鎖定：${state.halted ? '是' : '否'}`,
-        `持倉：${state.position ? state.position.inst.instId : '無'}`, '',
+        '📊 PAPER 統計',
+        '',
+        '交易筆數：' + trades.length,
+        '勝場：' + wins,
+        '敗場：' + losses,
+        '勝率：' + winRate.toFixed(1) + '%',
+        '累計 PnL：' + (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + 'U',
+        '起始資金：' + start.toFixed(2) + 'U',
+        '目前資金：' + equity.toFixed(4) + 'U',
+        '總獲利：+' + grossWin.toFixed(4) + 'U',
+        '總虧損：' + grossLoss.toFixed(4) + 'U',
+        '平均獲利：+' + (wins ? (grossWin / wins).toFixed(4) : '0.0000') + 'U',
+        '平均虧損：' + (losses ? (grossLoss / losses).toFixed(4) : '0.0000') + 'U',
+        '目前連敗：' + Number(state.consecutiveLosses || 0),
+        '停機鎖定：' + (state.halted ? '是' : '否'),
+        '持倉：' + (state.position ? state.position.inst.instId : '無'),
+        '',
         '模式：PAPER'
       ].join('\\n');
+
       await bot.sendMessage(chatId, text);
     } catch (err) {
       console.error('[Telegram COMMAND ERROR]', err.message || err);
