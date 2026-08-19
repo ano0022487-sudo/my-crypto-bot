@@ -17,6 +17,16 @@ fs.readFileSync = function(file, encoding, ...rest) {
   if (typeof file === 'string' && /event-bot\.js$/.test(file) && typeof result === 'string') {
     let code = result;
 
+    // Allow both 5m and 15m UPDOWN event series, even when EVENT_SERIES is configured.
+    code = code.replace(
+      /function getConfiguredSeries\(\)\{return EVENT_SERIES\.split\(', '\).map\(x=>x\.trim\(\)\)\.filter\(Boolean\);\}/,
+      "function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}"
+    );
+    code = code.replace(
+      /function getConfiguredSeries\(\)\{return EVENT_SERIES\.split\(', '\).map\(x=>x\.trim\(\)\)\.filter\(Boolean\);\}/,
+      "function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}"
+    );
+
     // Allow both 5m and 15m UPDOWN event series when auto-discovering.
     code = code.replace(
       /function generatedSeries\(\)\{return ASSETS\.map\(c=>`\$\{c\}-UPDOWN-15MIN`\);\}/,
@@ -42,7 +52,7 @@ fs.readFileSync = function(file, encoding, ...rest) {
     if (start >= 0 && end > start) {
       const replacement = `function modelProbability(price,strike,c5,c15){
   const cl5=closes(c5),cl15=closes(c15);
-  const instKey=Object.keys(__TF4H).find(k=>__TF4H[k]===c15)||Object.keys(__TF4H).find(k=>__TF4H[k]&&__TF4H[k].length===c15.length);
+  const instKey=Object.keys(__TF4H).find(k=>__TF4H[k]===c15);
   const c4=instKey?__TF4H[instKey]:null;
   const cl4=c4?closes(c4):[];
   const e20_4=ema(cl4,20),e50_4=ema(cl4,50);
@@ -73,7 +83,7 @@ fs.readFileSync = function(file, encoding, ...rest) {
   const confidenceGap=Math.max(0,best-opposing);
   const score=Math.round(Math.min(100,45+best*0.95+Math.min(10,confidenceGap*0.10)));
   const probUp=Math.min(0.94,Math.max(0.06,0.50+(up-down)*0.008));
-  return {score,upProbability:probUp,downProbability:1-probUp,reasons:direction==='UP'?upReasons:downReasons,signals,direction,atr:a,volumeRatio:1,confirmation:{score,bestWeight:best,confidenceGap,optionalMissing:c4?'[]':['4H data']}};
+  return {score,upProbability:probUp,downProbability:1-probUp,reasons:direction==='UP'?upReasons:downReasons,signals,direction,atr:a,volumeRatio:1,confirmation:{score,bestWeight:best,confidenceGap,optionalMissing:c4?[]:['4H data']}};
 }
 `;
       code = code.slice(0,start)+replacement+code.slice(end);
