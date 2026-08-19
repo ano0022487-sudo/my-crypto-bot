@@ -3,18 +3,16 @@
 /*
   OKX Event Contract launcher
 
-  IMPORTANT:
   - index.js starts this file.
-  - This runner loads event-bot.js and applies ONLY safe configuration
-    replacements before compiling it.
-  - No Telegram message/template rewriting is performed here.
-  - Telegram polling is disabled because Telegram is notification-only.
-  - OKX requests are NOT forced into Demo Trading mode. LIVE_TRADING
-    is controlled by the Render environment variable.
-  - The same event contract is allowed to enter only once. After an
-    entry is successfully recorded, that instId remains blocked until
-    the state file is reset/cleared, preventing SL/TP re-entry on the
-    same event window.
+  - Loads event-bot.js and applies controlled runtime patches.
+  - Telegram polling is disabled; Telegram is notification-only.
+  - OKX live/demo mode is controlled by LIVE_TRADING.
+  - Target stake is calculated in USDT and converted to contract quantity.
+  - Same event contract can enter only once after a confirmed fill.
+  - Entry uses FOK so a position is never created from a partial fill.
+  - The entry price is refreshed immediately before the order to avoid
+    submitting a stale quote from a slow multi-instrument scan.
+  - Order state/fill information is logged explicitly for diagnosis.
 */
 
 const fs = require('fs');
@@ -116,8 +114,6 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
 
 /* =========================================================
    SAME EVENT = ONE ENTRY ONLY
-   Persist instIds so an SL/TP exit cannot immediately re-enter
-   the same 15-minute event contract.
 ========================================================= */
 if (!Array.isArray(state.usedEventIds)) {
   state.usedEventIds = [];
@@ -160,6 +156,48 @@ if (state.usedEventIds.length > 500) {
     Number(roundedSz.toFixed(8))
   );`,
     'order quantity'
+  );
+
+  /* =========================================================
+     FRESH QUOTE + STALE-SIGNAL PROTECTION
+  ========================================================= */
+
+  code = replaceOrThrow(
+    code,
+    `const inst =\n    candidate.inst;`,
+    `const inst =
+    candidate.inst;
+
+  if (LIVE_TRADING) {
+    const freshTicker = await getTicker(inst.instId, 'EVENTS');
+    const freshYesAsk = Number(freshTicker?.askPx || freshTicker?.last);
+    const freshYesBid = Number(freshTicker?.bidPx || freshTicker?.last);
+    const freshEntryPx = candidate.side === 'yes'
+      ? freshYesAsk
+      : 1 - freshYesBid;
+
+    if (!(freshEntryPx > 0 && freshEntryPx < 1)) {
+      throw new Error('[ENTRY SKIP] fresh event quote unavailable');
+    }
+
+    if (!validPrice(freshEntryPx)) {
+      throw new Error('[ENTRY SKIP] fresh event price outside configured range');
+    }
+
+    const freshEdge = candidate.modelProb - freshEntryPx;
+    if (freshEdge < MIN_EDGE) {
+      throw new Error(
+        '[ENTRY SKIP] stale signal: freshEdge=' +
+        freshEdge.toFixed(4) +
+        ' required=' +
+        MIN_EDGE.toFixed(4)
+      );
+    }
+
+    candidate.entryPx = freshEntryPx;
+    candidate.edge = freshEdge;
+  }`,
+    'fresh quote protection'
   );
 
   /* =========================================================
@@ -231,7 +269,7 @@ if (state.usedEventIds.length > 500) {
   );
 
   /* =========================================================
-     DIAGNOSTIC LOGGING
+     DIAGNOSTIC ORDER SIZE
   ========================================================= */
 
   code = replaceOrThrow(
@@ -255,8 +293,55 @@ if (state.usedEventIds.length > 500) {
   );
 
   /* =========================================================
-     MARK EVENT AS USED ONLY AFTER A SUCCESSFUL FILLED ENTRY
+     DIAGNOSTIC ORDER RESPONSE + STRICT FILL CHECK
   ========================================================= */
+
+  code = replaceOrThrow(
+    code,
+    `const result =\n    rows?.[0];`,
+    `const result =
+    rows?.[0];
+
+  console.log('[ENTRY ORDER RESPONSE]', JSON.stringify(result || null));`,
+    'entry order response logging'
+  );
+
+  code = replaceOrThrow(
+    code,
+    `const filled =\n      await getOrder(\n        inst.instId,\n        result.ordId\n      );`,
+    `const filled =
+      await getOrder(
+        inst.instId,
+        result.ordId
+      );
+
+    console.log('[ENTRY ORDER STATE]', JSON.stringify({
+      ordId: result.ordId,
+      state: filled?.state,
+      accFillSz: filled?.accFillSz,
+      avgPx: filled?.avgPx,
+      fillPx: filled?.fillPx,
+      fillSz: filled?.fillSz,
+      cancelSource: filled?.cancelSource,
+      sCode: result.sCode,
+      sMsg: result.sMsg
+    }));`,
+    'entry order state logging'
+  );
+
+  /* =========================================================
+     MARK EVENT USED ONLY AFTER CONFIRMED FILLED ENTRY
+  ========================================================= */
+
+  code = replaceOrThrow(
+    code,
+    `state.lastTradeAt =\n      Date.now();\n\n    const usedEventId =`,
+    `state.lastTradeAt =
+      Date.now();
+
+    const usedEventId =`,
+    'event lock anchor'
+  );
 
   code = replaceOrThrow(
     code,
@@ -288,6 +373,7 @@ if (state.usedEventIds.length > 500) {
     "    console.log('[CONFIG] TARGET=' + ROLL_BASE_STAKE + 'U ROLL=+50% MIN_SCORE=' + MIN_SCORE + ' MIN_EDGE=' + MIN_EDGE + ' MIN_MODEL=' + MIN_COMPOSITE_PROB);\n" +
     "    console.log('[OKX] Live/Demo mode controlled by LIVE_TRADING environment variable');\n" +
     "    console.log('[EVENT LOCK] Same event contract can enter only once');\n" +
+    "    console.log('[ENTRY] FOK + fresh quote + strict fill verification');\n" +
     "    console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');"
   );
 
