@@ -2,17 +2,13 @@
 
 /*
   OKX Event Contract launcher
-
   - index.js starts this file.
   - Loads event-bot.js and applies controlled runtime patches.
-  - Telegram polling is disabled; Telegram is notification-only.
-  - OKX live/demo mode is controlled by LIVE_TRADING.
-  - Target stake is calculated in USDT and converted to contract quantity.
-  - Same event contract can enter only once after a confirmed fill.
-  - Entry uses FOK so a position is never created from a partial fill.
-  - The entry price is refreshed immediately before the order to avoid
-    submitting a stale quote from a slow multi-instrument scan.
-  - Order state/fill information is logged explicitly for diagnosis.
+  - Telegram polling is disabled.
+  - LIVE_TRADING controls live/demo mode.
+  - Target stake is converted from USDT to contract quantity.
+  - Same event can enter only once after confirmed fill.
+  - Entry uses FOK and requires a confirmed filled state.
 */
 
 const fs = require('fs');
@@ -35,7 +31,7 @@ try {
 
   let code = fs.readFileSync(source, 'utf8');
 
-  /* Telegram is notification-only. Never start getUpdates polling. */
+  /* Telegram notification-only mode. */
   code = code.replace(/polling\s*:\s*true/g, 'polling: false');
 
   try {
@@ -48,7 +44,7 @@ try {
     console.error('[Runner Telegram Patch Error]', err.message || err);
   }
 
-  /* Event contract configuration. */
+  /* Configuration. */
   code = replaceOrThrow(
     code,
     'const ORDER_SIZE_FIXED = 5;',
@@ -62,20 +58,18 @@ const ROLL_RESET_LOSSES = 6;`,
 
   code = code.replace(
     /const MIN_EDGE =\s*Number\(\s*process\.env\.MIN_EDGE \|\| 0\.075\s*\);/s,
-    `const MIN_EDGE = Number(process.env.MIN_EDGE || 0.10);`
+    'const MIN_EDGE = Number(process.env.MIN_EDGE || 0.10);'
   );
-
   code = code.replace(
     /const MIN_SCORE =\s*Number\(\s*process\.env\.MIN_SCORE \|\| 78\s*\);/s,
-    `const MIN_SCORE = Number(process.env.MIN_SCORE || 85);`
+    'const MIN_SCORE = Number(process.env.MIN_SCORE || 85);'
   );
-
   code = code.replace(
     /const MAX_CONSECUTIVE_LOSSES =\s*Number\(\s*process\.env\.MAX_CONSECUTIVE_LOSSES \|\| 3\s*\);/s,
-    `const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 999999);`
+    'const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 999999);'
   );
 
-  /* Persistent rolling stake state. */
+  /* Persistent stake and event lock state. */
   code = replaceOrThrow(
     code,
     `trades:\n      []`,
@@ -102,24 +96,26 @@ if (!Number.isFinite(Number(state.rollStake)) || Number(state.rollStake) < ROLL_
 if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
   state.rollStep = 0;
 }
-
 if (!Array.isArray(state.usedEventIds)) {
   state.usedEventIds = [];
 }
-state.usedEventIds = state.usedEventIds
-  .map(x => String(x || '').trim())
-  .filter(Boolean);
-if (state.usedEventIds.length > 500) {
-  state.usedEventIds = state.usedEventIds.slice(-500);
-}`,
+state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(Boolean).slice(-500);`,
     'state initialization'
   );
 
-  /* Convert 5 USDT target stake into event-contract quantity. */
+  /*
+    IMPORTANT SCOPE FIX:
+    The generated entry code can reference the order quantity from an
+    error/logging path outside the local block where it is calculated.
+    Keep a function-scoped `var sz` so that path can never throw
+    "sz is not defined". The value is overwritten before every order.
+  */
   code = replaceOrThrow(
     code,
     'const sz = ORDER_SIZE_FIXED;',
-    `const currentRollStake = Math.max(
+    `var sz = 0;
+
+  const currentRollStake = Math.max(
     ROLL_BASE_STAKE,
     Number(state.rollStake || ROLL_BASE_STAKE)
   );
@@ -136,14 +132,14 @@ if (state.usedEventIds.length > 500) {
 
   const rawSz = currentRollStake / candidate.entryPx;
   const roundedSz = Math.ceil(rawSz / lotSz - 1e-12) * lotSz;
-  const sz = Math.max(
+  sz = Math.max(
     minSz,
     Number(roundedSz.toFixed(8))
   );`,
     'order quantity'
   );
 
-  /* Refresh quote immediately before live entry. */
+  /* Refresh quote immediately before a live order. */
   code = replaceOrThrow(
     code,
     `const inst =\n    candidate.inst;`,
@@ -161,7 +157,6 @@ if (state.usedEventIds.length > 500) {
     if (!(freshEntryPx > 0 && freshEntryPx < 1)) {
       throw new Error('[ENTRY SKIP] fresh event quote unavailable');
     }
-
     if (!validPrice(freshEntryPx)) {
       throw new Error('[ENTRY SKIP] fresh event price outside configured range');
     }
@@ -182,7 +177,7 @@ if (state.usedEventIds.length > 500) {
     'fresh quote protection'
   );
 
-  /* FOK: either the requested quantity fills or the order is cancelled. */
+  /* FOK: full fill or cancellation. */
   code = replaceOrThrow(
     code,
     `ordType:\n      'ioc',`,
@@ -199,7 +194,6 @@ if (state.usedEventIds.length > 500) {
         model.score <
         MIN_SCORE
       ) {
-
         continue;
       }
 
@@ -207,41 +201,30 @@ if (state.usedEventIds.length > 500) {
         continue;
       }
 
-      const requiredConfirmations = [
-        '5m trend',
-        '15m trend',
-        'RSI',
-        'volume'
-      ];
-
-      if (!requiredConfirmations.every(
-        reason => model.reasons.includes(reason)
-      )) {
+      const requiredConfirmations = ['5m trend', '15m trend', 'RSI', 'volume'];
+      if (!requiredConfirmations.every(reason => model.reasons.includes(reason))) {
         continue;
       }`,
     'high-confidence filter'
   );
 
-  /* Same event contract: only one confirmed entry. */
+  /* Same event lock. */
   code = replaceOrThrow(
     code,
     `const candidate =\n    candidates[0];`,
-    `const availableCandidates = candidates.filter(
-    item => !state.usedEventIds.includes(
-      String(item.inst?.instId || '')
-    )
+    `const availableCandidates = candidates.filter(item =>
+    !state.usedEventIds.includes(String(item.inst?.instId || ''))
   );
 
   if (!availableCandidates.length) {
     return;
   }
 
-  const candidate =
-    availableCandidates[0];`,
+  const candidate = availableCandidates[0];`,
     'same event entry lock'
   );
 
-  /* Order-size diagnostics. */
+  /* Order size diagnostics. */
   code = replaceOrThrow(
     code,
     `const body = {\n\n    instId:`,
@@ -262,7 +245,7 @@ if (state.usedEventIds.length > 500) {
     'order-size diagnostic'
   );
 
-  /* Always log the API response. */
+  /* Order response/state diagnostics. */
   code = replaceOrThrow(
     code,
     `const result =\n    rows?.[0];`,
@@ -273,7 +256,6 @@ if (state.usedEventIds.length > 500) {
     'entry order response logging'
   );
 
-  /* Query the final order state before creating any local position. */
   code = replaceOrThrow(
     code,
     `const filled =\n      await getOrder(\n        inst.instId,\n        result.ordId\n      );`,
@@ -297,7 +279,6 @@ if (state.usedEventIds.length > 500) {
     'entry order state logging'
   );
 
-  /* Never fall back to the requested size. Only actual OKX fills count. */
   code = replaceOrThrow(
     code,
     `const fillSz =\n      Number(\n        filled?.accFillSz ||\n        filled?.fillSz ||\n        ORDER_SIZE_FIXED\n      );`,
@@ -317,11 +298,6 @@ if (state.usedEventIds.length > 500) {
     'strict fill quantity'
   );
 
-  /*
-     FOK is considered successful only when the exchange reports filled
-     and the actual cumulative fill is positive. Never reference an
-     undefined local variable in this error path.
-  */
   code = replaceOrThrow(
     code,
     `if (\n      !(\n        fillSz > 0\n      )\n    ) {\n\n      return;\n    }`,
@@ -329,37 +305,31 @@ if (state.usedEventIds.length > 500) {
       !(fillSz > 0) ||
       (LIVE_TRADING && String(filled?.state || '').toLowerCase() !== 'filled')
     ) {
-      console.warn(
-        '[ENTRY NOT FILLED]',
-        JSON.stringify({
-          ordId: result?.ordId || null,
-          state: filled?.state || null,
-          filledContracts: fillSz,
-          cancelSource: filled?.cancelSource || null,
-          sCode: result?.sCode || null,
-          sMsg: result?.sMsg || null
-        })
-      );
+      console.warn('[ENTRY NOT FILLED]', JSON.stringify({
+        ordId: result?.ordId || null,
+        state: filled?.state || null,
+        requestedContracts: sz,
+        filledContracts: fillSz,
+        cancelSource: filled?.cancelSource || null,
+        sCode: result?.sCode || null,
+        sMsg: result?.sMsg || null
+      }));
       return;
     }`,
     'strict filled state'
   );
 
-  /* Mark the event used only after a confirmed fill. */
+  /* Lock event only after confirmed fill. */
   code = replaceOrThrow(
     code,
     `state.lastTradeAt =\n      Date.now();\n\n    saveState();`,
     `state.lastTradeAt =
       Date.now();
 
-    const usedEventId =
-      String(candidate.inst.instId || '').trim();
-
+    const usedEventId = String(candidate.inst.instId || '').trim();
     if (usedEventId && !state.usedEventIds.includes(usedEventId)) {
       state.usedEventIds.push(usedEventId);
-      if (state.usedEventIds.length > 500) {
-        state.usedEventIds.shift();
-      }
+      if (state.usedEventIds.length > 500) state.usedEventIds.shift();
     }
 
     saveState();`,
@@ -370,11 +340,11 @@ if (state.usedEventIds.length > 500) {
   code = code.replace(
     /console\.log\(`OKX EVENT CONTRACT BOT RUNNING ON PORT \$\{PORT\}`\);/,
     "console.log('OKX EVENT CONTRACT BOT RUNNING ON PORT ' + PORT);\n" +
-    "    console.log('[CONFIG] TARGET=' + ROLL_BASE_STAKE + 'U ROLL=+50% MIN_SCORE=' + MIN_SCORE + ' MIN_EDGE=' + MIN_EDGE + ' MIN_MODEL=' + MIN_COMPOSITE_PROB);\n" +
-    "    console.log('[OKX] Live/Demo mode controlled by LIVE_TRADING environment variable');\n" +
-    "    console.log('[EVENT LOCK] Same event contract can enter only once');\n" +
-    "    console.log('[ENTRY] FOK + fresh quote + strict fill verification');\n" +
-    "    console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');"
+    "console.log('[CONFIG] TARGET=' + ROLL_BASE_STAKE + 'U MIN_SCORE=' + MIN_SCORE + ' MIN_EDGE=' + MIN_EDGE + ' MIN_MODEL=' + MIN_COMPOSITE_PROB);\n" +
+    "console.log('[OKX] Live/Demo mode controlled by LIVE_TRADING environment variable');\n" +
+    "console.log('[EVENT LOCK] Same event contract can enter only once');\n" +
+    "console.log('[ENTRY] FOK + fresh quote + strict fill verification');\n" +
+    "console.log('[Telegram] polling forced OFF');"
   );
 
   const runtimeModule = new Module(source, module);
