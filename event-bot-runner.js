@@ -11,6 +11,10 @@
   - Telegram polling is disabled because Telegram is notification-only.
   - OKX requests are NOT forced into Demo Trading mode. LIVE_TRADING
     is controlled by the Render environment variable.
+  - The same event contract is allowed to enter only once. After an
+    entry is successfully recorded, that instId remains blocked until
+    the state file is reset/cleared, preventing SL/TP re-entry on the
+    same event window.
 */
 
 const fs = require('fs');
@@ -108,6 +112,21 @@ if (!Number.isFinite(Number(state.rollStake)) || Number(state.rollStake) < ROLL_
 }
 if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
   state.rollStep = 0;
+}
+
+/* =========================================================
+   SAME EVENT = ONE ENTRY ONLY
+   Persist instIds so an SL/TP exit cannot immediately re-enter
+   the same 15-minute event contract.
+========================================================= */
+if (!Array.isArray(state.usedEventIds)) {
+  state.usedEventIds = [];
+}
+state.usedEventIds = state.usedEventIds
+  .map(x => String(x || '').trim())
+  .filter(Boolean);
+if (state.usedEventIds.length > 500) {
+  state.usedEventIds = state.usedEventIds.slice(-500);
 }`,
     'state initialization'
   );
@@ -190,6 +209,28 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
   );
 
   /* =========================================================
+     SAME EVENT FILTER
+  ========================================================= */
+
+  code = replaceOrThrow(
+    code,
+    `const candidate =\n    candidates[0];`,
+    `const availableCandidates = candidates.filter(
+    item => !state.usedEventIds.includes(
+      String(item.inst?.instId || '')
+    )
+  );
+
+  if (!availableCandidates.length) {
+    return;
+  }
+
+  const candidate =
+    availableCandidates[0];`,
+    'same event entry lock'
+  );
+
+  /* =========================================================
      DIAGNOSTIC LOGGING
   ========================================================= */
 
@@ -214,6 +255,30 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
   );
 
   /* =========================================================
+     MARK EVENT AS USED ONLY AFTER A SUCCESSFUL FILLED ENTRY
+  ========================================================= */
+
+  code = replaceOrThrow(
+    code,
+    `state.lastTradeAt =\n      Date.now();\n\n    saveState();`,
+    `state.lastTradeAt =
+      Date.now();
+
+    const usedEventId =
+      String(candidate.inst.instId || '').trim();
+
+    if (usedEventId && !state.usedEventIds.includes(usedEventId)) {
+      state.usedEventIds.push(usedEventId);
+      if (state.usedEventIds.length > 500) {
+        state.usedEventIds.shift();
+      }
+    }
+
+    saveState();`,
+    'mark event used after entry'
+  );
+
+  /* =========================================================
      STARTUP DIAGNOSTICS
   ========================================================= */
 
@@ -222,6 +287,7 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
     "console.log('OKX EVENT CONTRACT BOT RUNNING ON PORT ' + PORT);\n" +
     "    console.log('[CONFIG] TARGET=' + ROLL_BASE_STAKE + 'U ROLL=+50% MIN_SCORE=' + MIN_SCORE + ' MIN_EDGE=' + MIN_EDGE + ' MIN_MODEL=' + MIN_COMPOSITE_PROB);\n" +
     "    console.log('[OKX] Live/Demo mode controlled by LIVE_TRADING environment variable');\n" +
+    "    console.log('[EVENT LOCK] Same event contract can enter only once');\n" +
     "    console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');"
   );
 
