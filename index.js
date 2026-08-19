@@ -51,6 +51,10 @@ const PROTECTION_VERIFY_DELAY = Number(process.env.PROTECTION_VERIFY_DELAY || 10
 const BOT_STATE_FILE = process.env.BOT_STATE_FILE || path.join(__dirname, 'okx-swap-bot-state.json');
 const CONTROL_TOKEN = String(process.env.CONTROL_TOKEN || '').trim();
 
+// Single axios instance with baseURL
+const http = axios.create({ baseURL: BASE_URL, timeout: 15000 });
+http.interceptors.response.use(resp => resp, err => Promise.reject(err));
+
 const SYMBOLS = [
   ['ETH','ETH-USDT-SWAP'], ['SOL','SOL-USDT-SWAP'], ['XRP','XRP-USDT-SWAP'],
   ['DOGE','DOGE-USDT-SWAP'], ['ADA','ADA-USDT-SWAP'], ['AVAX','AVAX-USDT-SWAP'],
@@ -66,7 +70,7 @@ if (TELEGRAM_BOT_TOKEN) {
   bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
   bot.onText(/^\/start(?:\s|$)/, msg => {
     bot.sendMessage(msg.chat.id,
-      `OKX 永續機器人\n模式：${DRY_RUN ? '模擬' : '實盤'}\n策略：4H SNR + 15m Breakout\n保證金：${MARGIN_PER_TRADE}U\n槓桿：${LEVERAGE}x\n最多：${MAX_CONCURRENT} 倉\nTP/SL：3% / 1%`
+      `OKX 永續機器人\n模式：${DRY_RUN ? '模擬' : '實盤'}\n策略：4H SNR + 15m Breakout\n保證金：${MARGIN_PER_TRADE}U\n槓桿：${LEVERAGE}x\n最多：${MAX_CONCURRENT} 倉\nTP/SL：[...]`
     ).catch(() => {});
   });
 }
@@ -105,7 +109,11 @@ function loadState() {
 }
 const botState = loadState();
 function persistState() {
-  try { fs.writeFileSync(BOT_STATE_FILE, JSON.stringify(botState, null, 2), 'utf8'); }
+  try {
+    const tmp = BOT_STATE_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(botState, null, 2), 'utf8');
+    fs.renameSync(tmp, BOT_STATE_FILE);
+  }
   catch (e) { console.error('State save failed:', e.message || e); }
 }
 function audit(event, details = {}) {
@@ -130,11 +138,27 @@ function riskBlocked() {
   return botState.risk.halted || botState.risk.dailyRealizedPnl <= -Math.abs(MAX_DAILY_LOSS_U) || botState.risk.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES;
 }
 
-async function axiosWithRetry(config, retries = 3, delay = 800) {
+async function axiosWithRetry(config, retries = 4, baseDelay = 800) {
   let last;
   for (let i = 0; i < retries; i++) {
-    try { return await axios(config); }
-    catch (e) { last = e; if (i < retries - 1) await new Promise(r => setTimeout(r, delay * (i + 1))); }
+    try {
+      const response = await http.request(config);
+      return response;
+    } catch (e) {
+      last = e;
+      const status = e.response?.status;
+      if (status === 429 || status === 503) {
+        const ra = e.response?.headers?.['retry-after'];
+        const raMs = ra ? Number(ra) * 1000 : null;
+        const wait = raMs || Math.min(60000, baseDelay * Math.pow(2, i));
+        const jitter = Math.floor(Math.random() * 300);
+        await new Promise(r => setTimeout(r, wait + jitter));
+      } else if (i < retries - 1) {
+        const wait = Math.min(60000, baseDelay * Math.pow(2, i));
+        const jitter = Math.floor(Math.random() * 200);
+        await new Promise(r => setTimeout(r, wait + jitter));
+      }
+    }
   }
   throw last;
 }
@@ -154,14 +178,14 @@ async function privateRequest(method, requestPath, bodyObj = null) {
     'OK-ACCESS-PASSPHRASE': PASSPHRASE
   };
   if (body) headers['Content-Type'] = 'application/json';
-  const response = await axiosWithRetry({ method, url: `${BASE_URL}${requestPath}`, data: body || undefined, headers, timeout: 15000 });
+  const response = await axiosWithRetry({ method, url: requestPath, data: body || undefined, headers, timeout: 15000 });
   if (!response.data || String(response.data.code) !== '0') throw new Error(`OKX ${method} failed: ${JSON.stringify(response.data)}`);
-  return Array.isArray(response.data.data) ? response.data.data : [];
+  return Array.isArray(response.data.data) ? response.data.data : response.data.data;
 }
 async function publicGet(requestPath) {
-  const response = await axiosWithRetry({ method: 'GET', url: `${BASE_URL}${requestPath}`, timeout: 12000 });
+  const response = await axiosWithRetry({ method: 'GET', url: requestPath, timeout: 12000 });
   if (!response.data || String(response.data.code) !== '0') throw new Error(`OKX public request failed: ${JSON.stringify(response.data)}`);
-  return Array.isArray(response.data.data) ? response.data.data : [];
+  return Array.isArray(response.data.data) ? response.data.data : response.data.data;
 }
 function qs(params) { return Object.entries(params).filter(([,v]) => v !== undefined && v !== null && v !== '').map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&'); }
 
@@ -302,6 +326,7 @@ async function syncTradingState() {
     for (const o of pending) {
       if (monitored.has(o.instId)) next.set(o.instId, { kind:'pending', data:o });
     }
+    // Replace active atomically
     active.clear();
     for (const [k,v] of next) active.set(k,v);
     apiFailureStreak = 0;
@@ -441,7 +466,7 @@ async function processSymbol(sym) {
     active.set(sym.swap, { kind:'bot-order', data:result });
     if (DRY_RUN) setTimeout(() => { active.delete(sym.swap); }, 4 * 60 * 60 * 1000);
     audit('entry', { symbol:sym.label, instId:sym.swap, direction:signal.direction, margin:MARGIN_PER_TRADE, leverage:LEVERAGE, orderId:result.id, signal });
-    await notifyTelegram(`✅ ${DRY_RUN ? 'SIM' : 'LIVE'} 進場\n${sym.label} ${signal.direction}\n保證金 ${MARGIN_PER_TRADE}U × ${LEVERAGE}x\nTP ${TAKE_PROFIT_PCT*100}% / SL ${STOP_LOSS_PCT*100}%\n目前持倉 ${active.size}/${MAX_CONCURRENT}\nOrder: ${result.id}`);
+    await notifyTelegram(`✅ ${DRY_RUN ? 'SIM' : 'LIVE'} 進場\n${sym.label} ${signal.direction}\n保證金 ${MARGIN_PER_TRADE}U × ${LEVERAGE}x\nTP ${TAKE_PROFIT_PCT*100}% / SL ${STOP_LOSS_PCT[...]
   } catch (e) {
     console.error(`${sym.label}:`, e.message || e);
     audit('process_error', { symbol:sym.label, error:e.message || String(e) });
@@ -482,6 +507,19 @@ app.post('/resume', (req,res) => {
   paused = false; apiFailureStreak = 0; void notifyTelegram('▶️ Bot 已恢復'); res.json({ok:true,paused});
 });
 app.get('/', (req,res) => res.send(`OKX Perpetual SNR Bot | ${DRY_RUN?'DRY_RUN':'LIVE'} | 4U × ${LEVERAGE}x | max ${MAX_CONCURRENT} positions`));
+
+function validateEnv() {
+  if (!DRY_RUN && (!API_KEY || !SECRET_KEY || !PASSPHRASE)) {
+    console.error('Missing OKX credentials. Set OK_ACCESS_KEY, OK_ACCESS_SECRET and OKX_PASSPHRASE (or run in DRY_RUN).');
+    process.exit(1);
+  }
+  if (!BOT_STATE_FILE) {
+    console.error('BOT_STATE_FILE not set');
+    process.exit(1);
+  }
+}
+
+validateEnv();
 
 const server = app.listen(PORT, () => {
   console.log(`Bot listening on ${PORT}; mode=${DRY_RUN?'DRY_RUN':'LIVE'}; margin=${MARGIN_PER_TRADE}U; leverage=${LEVERAGE}x; max=${MAX_CONCURRENT}`);
