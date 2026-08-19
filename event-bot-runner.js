@@ -1,14 +1,6 @@
 'use strict';
 
-/*
-  OKX Event Contract launcher.
-
-  PAPER-ONLY SAFETY MODE:
-  - LIVE_TRADING is forcibly disabled at runtime.
-  - Telegram polling is enabled so commands such as /stats can be received.
-  - /stats is read-only and only answers the configured TELEGRAM_CHAT_ID.
-*/
-
+/* OKX Event Contract launcher - PAPER ONLY */
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
@@ -16,111 +8,109 @@ const Module = require('module');
 const source = path.join(__dirname, 'event-bot.js');
 
 try {
-  if (!fs.existsSync(source)) {
-    throw new Error(`找不到 event-bot.js: ${source}`);
-  }
+  if (!fs.existsSync(source)) throw new Error(`找不到 event-bot.js: ${source}`);
 
   let code = fs.readFileSync(source, 'utf8');
 
-  /* HARD FORCE PAPER MODE. */
+  // HARD SAFETY: this runner can never start live trading.
   process.env.LIVE_TRADING = 'false';
-
   const livePattern = /const LIVE_TRADING\s*=\s*[^;]+;/;
-  if (livePattern.test(code)) {
-    code = code.replace(livePattern, 'const LIVE_TRADING=false;');
-  } else {
-    throw new Error('[Runner] LIVE_TRADING declaration not found; refusing to start');
+  if (!livePattern.test(code)) throw new Error('[Runner] LIVE_TRADING declaration not found');
+  code = code.replace(livePattern, 'const LIVE_TRADING=false;');
+
+  // Force Telegram polling on.
+  code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
+
+  // Read-only HTTP statistics endpoint.
+  const statsRoute = `
+app.get('/stats',(req,res)=>{try{
+ const trades=Array.isArray(state.trades)?state.trades:[];
+ const wins=trades.filter(t=>Number(t.pnl)>0).length;
+ const losses=trades.filter(t=>Number(t.pnl)<0).length;
+ const pnl=trades.reduce((s,t)=>s+Number(t.pnl||0),0);
+ const grossWin=trades.filter(t=>Number(t.pnl)>0).reduce((s,t)=>s+Number(t.pnl),0);
+ const grossLoss=trades.filter(t=>Number(t.pnl)<0).reduce((s,t)=>s+Number(t.pnl),0);
+ res.json({ok:true,mode:'PAPER',day:state.day,startCapital:Number(state.startEquity||0),paperEquity:Number(state.paperEquity||0),realizedPnl:Number(state.realizedPnl||pnl),tradeCount:trades.length,wins,losses,winRate:trades.length?wins/trades.length*100:0,grossWin,grossLoss,avgWin:wins?grossWin/wins:0,avgLoss:losses?grossLoss/losses:0,consecutiveLosses:Number(state.consecutiveLosses||0),halted:Boolean(state.halted),openPosition:Boolean(state.position),trades});
+}catch(e){res.status(500).json({ok:false,error:e.message});}});
+`;
+
+  if (!code.includes("app.get('/stats'")) {
+    const marker = "app.get('/health'";
+    if (!code.includes(marker)) throw new Error('[Runner] /health route not found');
+    code = code.replace(marker, statsRoute + marker);
   }
 
-  /* Keep Telegram polling enabled so the bot can receive commands. */
-  code = code.replace(/polling\s*:\s*false/g, 'polling: true');
-  code = code.replace(/polling\s*:\s*true/g, 'polling: true');
-
-  /* Read-only paper statistics HTTP endpoint. */
-  const statsRoute = "app.get('/stats',(req,res)=>{try{const trades=Array.isArray(state.trades)?state.trades:[];const wins=trades.filter(t=>Number(t.pnl)>0).length;const losses=trades.filter(t=>Number(t.pnl)<0).length;const pnl=trades.reduce((s,t)=>s+Number(t.pnl||0),0);const grossWin=trades.filter(t=>Number(t.pnl)>0).reduce((s,t)=>s+Number(t.pnl),0);const grossLoss=trades.filter(t=>Number(t.pnl)<0).reduce((s,t)=>s+Number(t.pnl),0);res.json({ok:true,mode:'PAPER',day:state.day,startCapital:Number(state.startEquity||0),paperEquity:Number(state.paperEquity||0),realizedPnl:Number(state.realizedPnl||pnl),tradeCount:trades.length,wins,losses,winRate:trades.length?wins/trades.length:0,grossWin,grossLoss,avgWin:wins?grossWin/wins:0,avgLoss:losses?grossLoss/losses:0,consecutiveLosses:Number(state.consecutiveLosses||0),halted:Boolean(state.halted),openPosition:Boolean(state.position),trades});}catch(e){res.status(500).json({ok:false,error:e.message});}});";
-
-  const healthPattern = /app\.get\('\/health'/;
-  if (healthPattern.test(code)) {
-    code = code.replace(healthPattern, statsRoute + "app.get('/health'");
-  } else {
-    throw new Error('[Runner] /health route not found; refusing to inject /stats');
-  }
-
-  /* Telegram stats command. Use message events rather than onText so command
-     handling remains reliable with the current bot implementation. */
-  const telegramStatsHandler = `
+  // Install Telegram command handler directly after bot creation.
+  // Do not depend on onText; message events are more reliable for this bot.
+  const handler = `
 if (bot) {
   bot.on('message', async (msg) => {
     try {
-      const raw = String(msg.text || '').trim();
+      const raw = String(msg && msg.text || '').trim();
       const command = raw.split(/\\s+/)[0].split('@')[0].toLowerCase();
-      if (command !== '/stats') return;
+      if (command !== '/stats' && command !== '/stat' && command !== '/統計') return;
 
+      const chatId = String(msg && msg.chat && msg.chat.id || '').trim();
       const configuredChat = String(process.env.TELEGRAM_CHAT_ID || '').trim();
-      const chatId = String(msg.chat && msg.chat.id || '').trim();
+      console.log('[Telegram COMMAND]', JSON.stringify({command,chatId,configuredChat}));
 
-      console.log('[Telegram /stats] received chat=' + chatId + ' configured=' + configuredChat);
-
-      if (!configuredChat || chatId !== configuredChat) {
-        console.log('[Telegram /stats] ignored: chat id not authorized');
+      if (!chatId) return;
+      if (configuredChat && chatId !== configuredChat) {
+        console.log('[Telegram COMMAND] ignored: unauthorized chat');
         return;
       }
 
       const trades = Array.isArray(state.trades) ? state.trades : [];
       const wins = trades.filter(t => Number(t.pnl) > 0).length;
       const losses = trades.filter(t => Number(t.pnl) < 0).length;
-      const pnl = trades.reduce((sum, t) => sum + Number(t.pnl || 0), 0);
-      const grossWin = trades.filter(t => Number(t.pnl) > 0).reduce((sum, t) => sum + Number(t.pnl), 0);
-      const grossLoss = trades.filter(t => Number(t.pnl) < 0).reduce((sum, t) => sum + Number(t.pnl), 0);
+      const pnl = trades.reduce((s,t) => s + Number(t.pnl || 0), 0);
+      const grossWin = trades.filter(t => Number(t.pnl) > 0).reduce((s,t) => s + Number(t.pnl), 0);
+      const grossLoss = trades.filter(t => Number(t.pnl) < 0).reduce((s,t) => s + Number(t.pnl), 0);
       const winRate = trades.length ? wins / trades.length * 100 : 0;
-      const avgWin = wins ? grossWin / wins : 0;
-      const avgLoss = losses ? grossLoss / losses : 0;
       const equity = Number(state.paperEquity || 0);
       const start = Number(state.startEquity || 0);
 
-      const text =
-        '📊 PAPER 統計\\n\\n' +
-        '交易筆數：' + trades.length + '\\n' +
-        '勝場：' + wins + '\\n' +
-        '敗場：' + losses + '\\n' +
-        '勝率：' + winRate.toFixed(1) + '%\\n' +
-        '累計 PnL：' + (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + 'U\\n' +
-        '起始資金：' + start.toFixed(2) + 'U\\n' +
-        '目前資金：' + equity.toFixed(4) + 'U\\n' +
-        '總獲利：+' + grossWin.toFixed(4) + 'U\\n' +
-        '總虧損：' + grossLoss.toFixed(4) + 'U\\n' +
-        '平均獲利：+' + avgWin.toFixed(4) + 'U\\n' +
-        '平均虧損：' + avgLoss.toFixed(4) + 'U\\n' +
-        '目前連敗：' + Number(state.consecutiveLosses || 0) + '\\n' +
-        '停機鎖定：' + (state.halted ? '是' : '否') + '\\n' +
-        '持倉：' + (state.position ? state.position.inst.instId : '無') + '\\n\\n' +
-        '模式：PAPER';
+      const text = [
+        '📊 PAPER 統計',
+        '',
+        `交易筆數：${trades.length}`,
+        `勝場：${wins}`,
+        `敗場：${losses}`,
+        `勝率：${winRate.toFixed(1)}%`,
+        `累計 PnL：${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}U`,
+        `起始資金：${start.toFixed(2)}U`,
+        `目前資金：${equity.toFixed(4)}U`,
+        `總獲利：+${grossWin.toFixed(4)}U`,
+        `總虧損：${grossLoss.toFixed(4)}U`,
+        `平均獲利：+${wins ? (grossWin/wins).toFixed(4) : '0.0000'}U`,
+        `平均虧損：${losses ? (grossLoss/losses).toFixed(4) : '0.0000'}U`,
+        `目前連敗：${Number(state.consecutiveLosses || 0)}`,
+        `停機鎖定：${state.halted ? '是' : '否'}`,
+        `持倉：${state.position ? state.position.inst.instId : '無'}`,
+        '',
+        '模式：PAPER'
+      ].join('\\n');
 
       await bot.sendMessage(chatId, text);
     } catch (err) {
-      console.error('[Telegram /stats]', err.message || err);
+      console.error('[Telegram COMMAND ERROR]', err.message || err);
     }
   });
 }
 `;
 
-  const telegramMarker = /if\(bot\)bot\.on\('polling_error',[\s\S]*?\);/;
-  if (telegramMarker.test(code)) {
-    code = code.replace(telegramMarker, match => match + telegramStatsHandler);
-  } else {
-    throw new Error('[Runner] Telegram polling_error handler not found; refusing to inject /stats command');
+  // Inject exactly once, immediately after the bot declaration.
+  const botMarker = /const bot=.*?;\n/;
+  if (!botMarker.test(code)) throw new Error('[Runner] bot declaration not found');
+  if (!code.includes("[Telegram COMMAND]")) {
+    code = code.replace(botMarker, match => match + handler);
   }
 
-  const versionMatch = code.match(/OKX EVENT CONTRACT SNR BOT - ([^*\n]+)/);
-  console.log(`[Runner] event-bot source loaded: ${versionMatch ? versionMatch[1].trim() : 'unknown-version'}`);
   console.log('[Runner] PAPER-ONLY mode forced: LIVE_TRADING=false');
-  console.log('[Runner] Telegram polling enabled for /stats command');
-  console.log('[Runner] /stats handler installed');
-  console.log('[Runner] /stats endpoint injected for paper-trade analysis');
+  console.log('[Runner] Telegram /stats,/stat,/統計 handler installed');
+  console.log('[Runner] /stats HTTP endpoint installed');
 
-  if (!code.includes('const LIVE_TRADING=false;')) {
-    throw new Error('[Runner] PAPER-ONLY guard failed');
-  }
+  if (!code.includes('const LIVE_TRADING=false;')) throw new Error('[Runner] PAPER guard failed');
 
   const runtimeModule = new Module(source, module);
   runtimeModule.filename = source;
