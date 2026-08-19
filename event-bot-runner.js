@@ -75,8 +75,8 @@ app.get('/stats', (req, res) => {
   }
 
   // Telegram command handler.
-  // Use onText instead of a generic message listener so Telegram slash commands
-  // are matched directly. No chat-id restriction: /stats is read-only.
+  // IMPORTANT: the generated source must not contain a single-quoted string
+  // spanning physical lines. Build help text as an array and join with '\\n'.
   if (!code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
     const handler = `
 /* [Telegram COMMAND HANDLER INSTALLED] */
@@ -112,7 +112,7 @@ if (bot) {
         '持倉：' + (state.position ? state.position.inst.instId : '無'),
         '',
         '模式：PAPER'
-      ].join('\\n');
+      ].join('\\\\n');
 
       await bot.sendMessage(chatId, text);
       console.log('[Telegram COMMAND] /stats replied to ' + chatId);
@@ -130,7 +130,19 @@ if (bot) {
     const chatId = String(msg && msg.chat && msg.chat.id || '').trim();
     if (!chatId) return;
     try {
-      await bot.sendMessage(chatId, 'OKX Event Bot\n\n模式：PAPER（模擬盤）\n\n可用指令：\n/stats\n/stat\n/統計\n\n查詢目前模擬交易統計。');
+      const helpText = [
+        'OKX Event Bot',
+        '',
+        '模式：PAPER（模擬盤）',
+        '',
+        '可用指令：',
+        '/stats',
+        '/stat',
+        '/統計',
+        '',
+        '查詢目前模擬交易統計。'
+      ].join('\\\\n');
+      await bot.sendMessage(chatId, helpText);
       console.log('[Telegram COMMAND] /start or /help replied to ' + chatId);
     } catch (err) {
       console.error('[Telegram COMMAND ERROR]', err.message || err);
