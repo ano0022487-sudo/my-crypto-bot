@@ -5,9 +5,8 @@
 
   PAPER-ONLY SAFETY MODE:
   - LIVE_TRADING is forcibly disabled at runtime.
-  - Telegram polling is enabled only for commands/notifications.
-  - Only the configured TELEGRAM_CHAT_ID may use /stats.
-  - Adds a read-only /stats endpoint for paper-trade statistics.
+  - Telegram polling is enabled so commands such as /stats can be received.
+  - /stats is read-only and only answers the configured TELEGRAM_CHAT_ID.
 */
 
 const fs = require('fs');
@@ -23,8 +22,7 @@ try {
 
   let code = fs.readFileSync(source, 'utf8');
 
-  /* HARD FORCE PAPER MODE.
-     This takes precedence over Render's LIVE_TRADING environment variable. */
+  /* HARD FORCE PAPER MODE. */
   process.env.LIVE_TRADING = 'false';
 
   const livePattern = /const LIVE_TRADING\s*=\s*[^;]+;/;
@@ -34,11 +32,13 @@ try {
     throw new Error('[Runner] LIVE_TRADING declaration not found; refusing to start');
   }
 
-  /* Enable Telegram polling so the bot can receive /stats commands. */
+  /* Keep Telegram polling enabled so the bot can receive commands. */
+  code = code.replace(/polling\s*:\s*false/g, 'polling: true');
   code = code.replace(/polling\s*:\s*true/g, 'polling: true');
 
-  /* Read-only paper statistics endpoint. */
+  /* Read-only paper statistics HTTP endpoint. */
   const statsRoute = "app.get('/stats',(req,res)=>{try{const trades=Array.isArray(state.trades)?state.trades:[];const wins=trades.filter(t=>Number(t.pnl)>0).length;const losses=trades.filter(t=>Number(t.pnl)<0).length;const pnl=trades.reduce((s,t)=>s+Number(t.pnl||0),0);const grossWin=trades.filter(t=>Number(t.pnl)>0).reduce((s,t)=>s+Number(t.pnl),0);const grossLoss=trades.filter(t=>Number(t.pnl)<0).reduce((s,t)=>s+Number(t.pnl),0);res.json({ok:true,mode:'PAPER',day:state.day,startCapital:Number(state.startEquity||0),paperEquity:Number(state.paperEquity||0),realizedPnl:Number(state.realizedPnl||pnl),tradeCount:trades.length,wins,losses,winRate:trades.length?wins/trades.length:0,grossWin,grossLoss,avgWin:wins?grossWin/wins:0,avgLoss:losses?grossLoss/losses:0,consecutiveLosses:Number(state.consecutiveLosses||0),halted:Boolean(state.halted),openPosition:Boolean(state.position),trades});}catch(e){res.status(500).json({ok:false,error:e.message});}});";
+
   const healthPattern = /app\.get\('\/health'/;
   if (healthPattern.test(code)) {
     code = code.replace(healthPattern, statsRoute + "app.get('/health'");
@@ -46,14 +46,25 @@ try {
     throw new Error('[Runner] /health route not found; refusing to inject /stats');
   }
 
-  /* Telegram /stats command. Read-only: it cannot place or cancel orders. */
+  /* Telegram stats command. Use message events rather than onText so command
+     handling remains reliable with the current bot implementation. */
   const telegramStatsHandler = `
 if (bot) {
-  bot.onText(/^\\/stats(?:@\\w+)?$/i, async (msg) => {
+  bot.on('message', async (msg) => {
     try {
+      const raw = String(msg.text || '').trim();
+      const command = raw.split(/\\s+/)[0].split('@')[0].toLowerCase();
+      if (command !== '/stats') return;
+
       const configuredChat = String(process.env.TELEGRAM_CHAT_ID || '').trim();
-      const chatId = String(msg.chat.id);
-      if (!configuredChat || chatId !== configuredChat) return;
+      const chatId = String(msg.chat && msg.chat.id || '').trim();
+
+      console.log('[Telegram /stats] received chat=' + chatId + ' configured=' + configuredChat);
+
+      if (!configuredChat || chatId !== configuredChat) {
+        console.log('[Telegram /stats] ignored: chat id not authorized');
+        return;
+      }
 
       const trades = Array.isArray(state.trades) ? state.trades : [];
       const wins = trades.filter(t => Number(t.pnl) > 0).length;
@@ -104,9 +115,9 @@ if (bot) {
   console.log(`[Runner] event-bot source loaded: ${versionMatch ? versionMatch[1].trim() : 'unknown-version'}`);
   console.log('[Runner] PAPER-ONLY mode forced: LIVE_TRADING=false');
   console.log('[Runner] Telegram polling enabled for /stats command');
+  console.log('[Runner] /stats handler installed');
   console.log('[Runner] /stats endpoint injected for paper-trade analysis');
 
-  /* Final safety assertion before compiling the bot. */
   if (!code.includes('const LIVE_TRADING=false;')) {
     throw new Error('[Runner] PAPER-ONLY guard failed');
   }
