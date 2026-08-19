@@ -1,6 +1,6 @@
 'use strict';
 
-/* OKX Event Contract launcher - PAPER ONLY */
+/* OKX Event Contract launcher - PAPER ONLY / STRICT FILTERS */
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
@@ -8,24 +8,36 @@ const Module = require('module');
 const source = path.join(__dirname, 'event-bot.js');
 
 try {
-  if (!fs.existsSync(source)) {
-    throw new Error('找不到 event-bot.js: ' + source);
-  }
+  if (!fs.existsSync(source)) throw new Error('找不到 event-bot.js: ' + source);
 
   let code = fs.readFileSync(source, 'utf8');
 
-  // HARD SAFETY: this runner can never start live trading.
+  // HARD SAFETY: runner can never start live trading.
   process.env.LIVE_TRADING = 'false';
   const livePattern = /const\s+LIVE_TRADING\s*=\s*[^;]+;/;
-  if (!livePattern.test(code)) {
-    throw new Error('[Runner] LIVE_TRADING declaration not found');
-  }
+  if (!livePattern.test(code)) throw new Error('[Runner] LIVE_TRADING declaration not found');
   code = code.replace(livePattern, 'const LIVE_TRADING = false;');
 
-  // Force Telegram polling on so commands can be received.
+  // Strategy/risk profile for PAPER validation.
+  const replacements = [
+    ['const TARGET_STAKE=5;', 'const TARGET_STAKE=2;'],
+    ["process.env.MIN_EDGE||0.10", "process.env.MIN_EDGE||0.15"],
+    ["process.env.MIN_SCORE||85", "process.env.MIN_SCORE||90"],
+    ["process.env.MIN_MODEL_PROB||0.70", "process.env.MIN_MODEL_PROB||0.75"],
+    ["process.env.MIN_ENTRY_PRICE||0.15", "process.env.MIN_ENTRY_PRICE||0.25"],
+    ["process.env.MAX_ENTRY_PRICE||0.90", "process.env.MAX_ENTRY_PRICE||0.75"],
+    ["process.env.DAILY_LOSS_PCT||0.20", "process.env.DAILY_LOSS_PCT||0.10"],
+    ["process.env.MAX_CONSECUTIVE_LOSSES||3", "process.env.MAX_CONSECUTIVE_LOSSES||2"]
+  ];
+  for (const [from, to] of replacements) {
+    if (!code.includes(from)) throw new Error('[Runner] Strategy pattern not found: ' + from);
+    code = code.split(from).join(to);
+  }
+
+  // Force Telegram polling on.
   code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
 
-  // Read-only HTTP statistics endpoint.
+  // Read-only PAPER statistics endpoint.
   if (!code.includes("app.get('/stats'")) {
     const statsRoute = `
 app.get('/stats', (req, res) => {
@@ -61,22 +73,16 @@ app.get('/stats', (req, res) => {
   }
 });
 `;
-
-    const healthMarker = "app.get('/health'";
-    if (code.includes(healthMarker)) {
-      code = code.replace(healthMarker, statsRoute + healthMarker);
+    if (code.includes("app.get('/health'")) {
+      code = code.replace("app.get('/health'", statsRoute + "app.get('/health'");
+    } else if (code.includes('app.listen(')) {
+      code = code.replace('app.listen(', statsRoute + '\napp.listen(');
     } else {
-      const listenMarker = 'app.listen(';
-      if (!code.includes(listenMarker)) {
-        throw new Error('[Runner] app.listen route marker not found');
-      }
-      code = code.replace(listenMarker, statsRoute + '\n' + listenMarker);
+      throw new Error('[Runner] HTTP route insertion point not found');
     }
   }
 
-  // Telegram command handler.
-  // Newline handling uses String.fromCharCode(10) so the generated source
-  // cannot accidentally send literal "\\n" text to Telegram.
+  // Telegram command handler. Use a real newline character at runtime.
   if (!code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
     const handler = `
 /* [Telegram COMMAND HANDLER INSTALLED] */
@@ -92,10 +98,9 @@ if (bot) {
       const winRate = trades.length ? wins / trades.length * 100 : 0;
       const equity = Number(state.paperEquity || 0);
       const start = Number(state.startEquity || 0);
-
+      const nl = String.fromCharCode(10);
       const text = [
-        '📊 PAPER 統計',
-        '',
+        '📊 PAPER 統計', '',
         '交易筆數：' + trades.length,
         '勝場：' + wins,
         '敗場：' + losses,
@@ -109,11 +114,10 @@ if (bot) {
         '平均虧損：' + (losses ? (grossLoss / losses).toFixed(4) : '0.0000') + 'U',
         '目前連敗：' + Number(state.consecutiveLosses || 0),
         '停機鎖定：' + (state.halted ? '是' : '否'),
-        '持倉：' + (state.position ? state.position.inst.instId : '無'),
-        '',
-        '模式：PAPER'
-      ].join(String.fromCharCode(10));
-
+        '持倉：' + (state.position ? state.position.inst.instId : '無'), '',
+        '模式：PAPER', '',
+        '策略：2U / Score≥90 / Model≥75% / Edge≥15% / Entry 0.25-0.75'
+      ].join(nl);
       await bot.sendMessage(chatId, text);
       console.log('[Telegram COMMAND] /stats replied to ' + chatId);
     } catch (err) {
@@ -130,18 +134,20 @@ if (bot) {
     const chatId = String(msg && msg.chat && msg.chat.id || '').trim();
     if (!chatId) return;
     try {
+      const nl = String.fromCharCode(10);
       const helpText = [
-        'OKX Event Bot',
+        'OKX Event Bot', '',
+        '模式：PAPER（模擬盤）', '',
+        '目前策略：',
+        '單筆 2U',
+        'Score ≥ 90',
+        'Model ≥ 75%',
+        'Edge ≥ 15%',
+        'Entry 0.25～0.75',
         '',
-        '模式：PAPER（模擬盤）',
-        '',
-        '可用指令：',
-        '/stats',
-        '/stat',
-        '/統計',
-        '',
+        '可用指令：', '/stats', '/stat', '/統計', '',
         '查詢目前模擬交易統計。'
-      ].join(String.fromCharCode(10));
+      ].join(nl);
       await bot.sendMessage(chatId, helpText);
       console.log('[Telegram COMMAND] /start or /help replied to ' + chatId);
     } catch (err) {
@@ -154,25 +160,21 @@ if (bot) {
   });
 }
 `;
-
     const botStart = code.indexOf('const bot=');
-    if (botStart < 0) {
-      throw new Error('[Runner] bot declaration not found');
-    }
+    if (botStart < 0) throw new Error('[Runner] bot declaration not found');
     const botEnd = code.indexOf('\n', botStart);
-    if (botEnd < 0) {
-      throw new Error('[Runner] bot declaration boundary not found');
-    }
+    if (botEnd < 0) throw new Error('[Runner] bot declaration boundary not found');
     code = code.slice(0, botEnd + 1) + handler + code.slice(botEnd + 1);
   }
 
   console.log('[Runner] PAPER-ONLY mode forced: LIVE_TRADING=false');
+  console.log('[Runner] Strategy forced: 2U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.75');
+  console.log('[Runner] Risk forced: daily loss 10% / max consecutive losses 2');
   console.log('[Runner] Telegram command handlers installed: /stats /stat /統計 /start /help');
   console.log('[Runner] /stats HTTP endpoint installed');
 
-  if (!code.includes('const LIVE_TRADING = false;')) {
-    throw new Error('[Runner] PAPER guard failed');
-  }
+  if (!code.includes('const LIVE_TRADING = false;')) throw new Error('[Runner] PAPER guard failed');
+  if (!code.includes('const TARGET_STAKE=2;')) throw new Error('[Runner] stake guard failed');
 
   const runtimeModule = new Module(source, module);
   runtimeModule.filename = source;
