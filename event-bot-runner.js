@@ -1,6 +1,6 @@
 'use strict';
 
-/* OKX Event Contract launcher - controlled runtime patch */
+/* OKX Event Contract launcher - controlled runtime patch + scan diagnostics */
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
@@ -31,7 +31,6 @@ const MIN_COMPOSITE_PROB = Number(process.env.MIN_COMPOSITE_PROB || 0.70);
 const ROLL_BASE_STAKE = TARGET_STAKE_USDT;
 const ROLL_MULTIPLIER = 1.5;
 const ROLL_RESET_LOSSES = 6;`, 'ORDER_SIZE_FIXED');
-
   code = code.replace(/const MIN_EDGE =\s*Number\(\s*process\.env\.MIN_EDGE \|\| 0\.075\s*\);/s, 'const MIN_EDGE = Number(process.env.MIN_EDGE || 0.10);');
   code = code.replace(/const MIN_SCORE =\s*Number\(\s*process\.env\.MIN_SCORE \|\| 78\s*\);/s, 'const MIN_SCORE = Number(process.env.MIN_SCORE || 85);');
   code = code.replace(/const MAX_CONSECUTIVE_LOSSES =\s*Number\(\s*process\.env\.MAX_CONSECUTIVE_LOSSES \|\| 3\s*\);/s, 'const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 999999);');
@@ -44,7 +43,6 @@ const ROLL_RESET_LOSSES = 6;`, 'ORDER_SIZE_FIXED');
 
     rollStep:
       0`, 'state.trades');
-
   code = replaceOrThrow(code, `const state =\n  loadState();`, `const state =
   loadState();
 
@@ -81,18 +79,105 @@ state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(
   code = replaceOrThrow(code, `ordType:\n      'ioc',`, `ordType:
       'fok',`, 'entry order type');
 
+  /* Per-candidate rejection diagnostics. We intentionally log reasons without changing thresholds. */
+  code = code.replace(/const candidates = \[\];/, `const candidates = [];
+  const scanStats = { filtered: filtered.length, rejected: 0, errors: 0, passed: 0 };
+  const rejectCandidate = (instId, reason, extra = {}) => {
+    scanStats.rejected++;
+    console.log('[EVENT REJECT]', JSON.stringify({ instId, reason, ...extra }));
+  };`);
+
+  /* Add diagnostics to the high-confidence filters currently injected by the runner. */
+  code = code.replace(
+    /if \(model\.score < MIN_SCORE\) \{?\s*continue;\s*\}?/,
+    `if (model.score < MIN_SCORE) {
+        rejectCandidate(inst.instId, 'score', { score: model.score, required: MIN_SCORE });
+        continue;
+      }`
+  );
+  code = code.replace(
+    /if \(modelProb < MIN_COMPOSITE_PROB\) continue;/,
+    `if (modelProb < MIN_COMPOSITE_PROB) {
+        rejectCandidate(inst.instId, 'model_probability', { modelProb, required: MIN_COMPOSITE_PROB });
+        continue;
+      }`
+  );
+  code = code.replace(
+    /if \(!requiredConfirmations\.every\(reason => model\.reasons\.includes\(reason\)\)\) continue;/,
+    `const missingConfirmations = requiredConfirmations.filter(reason => !model.reasons.includes(reason));
+      if (missingConfirmations.length) {
+        rejectCandidate(inst.instId, 'confirmation', { missing: missingConfirmations, reasons: model.reasons });
+        continue;
+      }`
+  );
+  code = code.replace(
+    /if \(\n        edge <\n        MIN_EDGE\n      \) \{\s*continue;\s*\}/s,
+    `if (
+        edge <
+        MIN_EDGE
+      ) {
+        rejectCandidate(inst.instId, 'edge', { edge, required: MIN_EDGE, side, entryPx, modelProb });
+        continue;
+      }`
+  );
+
+  /* Diagnostics for common early exits inside scanCandidates. */
+  code = code.replace(/if \(\n        !c5\.length \|\|\n        !c15\.length\n      \) \{\s*continue;\s*\}/s, `if (!c5.length || !c15.length) {
+        rejectCandidate(inst.instId, 'candles_unavailable', { c5: c5.length, c15: c15.length });
+        continue;
+      }`);
+  code = code.replace(/if \(\n          !\(\n            yesAsk > 0 &&\n            yesBid > 0\n          \)\n        \) \{\s*continue;\s*\}/s, `if (!(yesAsk > 0 && yesBid > 0)) {
+        rejectCandidate(inst.instId, 'ticker_unavailable', { yesAsk, yesBid });
+        continue;
+      }`);
+  code = code.replace(/if \(\n        yesAsk >= 1 \|\|\n        yesBid <= 0\n      \) \{\s*continue;\s*\}/s, `if (yesAsk >= 1 || yesBid <= 0) {
+        rejectCandidate(inst.instId, 'invalid_event_quote', { yesAsk, yesBid });
+        continue;
+      }`);
+  code = code.replace(/if \(\n        !Number\.isFinite\(\n          underlyingPrice\n        \)\n      \) \{\s*continue;\s*\}/s, `if (!Number.isFinite(underlyingPrice)) {
+        rejectCandidate(inst.instId, 'invalid_underlying_price', { underlyingPrice });
+        continue;
+      }`);
+  code = code.replace(/if \(\n        !validPrice\(\n          yesEntry\n        \)\n      \) \{\s*continue;\s*\}/s, `if (!validPrice(yesEntry)) {
+        rejectCandidate(inst.instId, 'invalid_yes_price', { yesEntry });
+        continue;
+      }`);
+  code = code.replace(/if \(\n        !validPrice\(\n          noEntry\n        \)\n      \) \{\s*continue;\s*\}/s, `if (!validPrice(noEntry)) {
+        rejectCandidate(inst.instId, 'invalid_no_price', { noEntry });
+        continue;
+      }`);
+
   code = replaceOrThrow(code, `if (\n        model.score <\n        MIN_SCORE\n      ) {\n\n        continue;\n      }`, `if (
         model.score <
         MIN_SCORE
       ) {
+        rejectCandidate(inst.instId, 'score', { score: model.score, required: MIN_SCORE });
         continue;
       }
-      if (modelProb < MIN_COMPOSITE_PROB) continue;
+      if (modelProb < MIN_COMPOSITE_PROB) {
+        rejectCandidate(inst.instId, 'model_probability', { modelProb, required: MIN_COMPOSITE_PROB });
+        continue;
+      }
       const requiredConfirmations = ['5m trend', '15m trend', 'RSI', 'volume'];
-      if (!requiredConfirmations.every(reason => model.reasons.includes(reason))) continue;`, 'high-confidence filter');
+      const missingConfirmations = requiredConfirmations.filter(reason => !model.reasons.includes(reason));
+      if (missingConfirmations.length) {
+        rejectCandidate(inst.instId, 'confirmation', { missing: missingConfirmations, reasons: model.reasons });
+        continue;
+      }`, 'high-confidence filter');
+
+  code = code.replace(/candidates\.push\(\{/, `scanStats.passed++;
+      console.log('[EVENT PASS]', JSON.stringify({ instId: inst.instId, side, entryPx, modelProb, edge, score: model.score, reasons: model.reasons }));
+
+      candidates.push({`);
+  code = code.replace(/return candidates\.sort\(/, `console.log('[SCAN DIAGNOSTICS]', JSON.stringify(scanStats));
+  console.log('[SCAN RESULT] candidates=' + candidates.length);
+  return candidates.sort(`);
 
   code = replaceOrThrow(code, `const candidate =\n    candidates[0];`, `const availableCandidates = candidates.filter(item => !state.usedEventIds.includes(String(item.inst?.instId || '')));
-  if (!availableCandidates.length) return;
+  if (!availableCandidates.length) {
+    console.log('[EVENT SKIP] all candidates already used');
+    return;
+  }
   const candidate = availableCandidates[0];`, 'same event entry lock');
 
   code = replaceOrThrow(code, `const body = {\n\n    instId:`, `const actualTargetStake = px * sz;
@@ -105,57 +190,25 @@ state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(
     rows?.[0];
     if (result) result.requestedContracts = sz;
     console.log('[ENTRY ORDER RESPONSE]', JSON.stringify(result || null));`, 'entry response + requested size');
-
   code = replaceOrThrow(code, `const filled =\n      await getOrder(\n        inst.instId,\n        result.ordId\n      );`, `const filled =
       await getOrder(
         inst.instId,
         result.ordId
       );
-
-    console.log('[ENTRY ORDER STATE]', JSON.stringify({
-      ordId: result.ordId,
-      state: filled?.state,
-      accFillSz: filled?.accFillSz,
-      avgPx: filled?.avgPx,
-      fillPx: filled?.fillPx,
-      fillSz: filled?.fillSz,
-      cancelSource: filled?.cancelSource,
-      sCode: result.sCode,
-      sMsg: result.sMsg
-    }));`, 'entry state logging');
-
+    console.log('[ENTRY ORDER STATE]', JSON.stringify({ ordId: result.ordId, state: filled?.state, accFillSz: filled?.accFillSz, avgPx: filled?.avgPx, fillPx: filled?.fillPx, fillSz: filled?.fillSz, cancelSource: filled?.cancelSource, sCode: result.sCode, sMsg: result.sMsg }));`, 'entry state logging');
   code = replaceOrThrow(code, `const fillSz =\n      Number(\n        filled?.accFillSz ||\n        filled?.fillSz ||\n        ORDER_SIZE_FIXED\n      );`, `const fillSz = Number(filled?.accFillSz ?? filled?.fillSz ?? 0);
-
-    console.log('[ENTRY FILL CHECK]', JSON.stringify({
-      state: filled?.state,
-      requestedContracts: Number(order?.requestedContracts || 0),
-      filledContracts: fillSz,
-      avgPx: filled?.avgPx,
-      cancelSource: filled?.cancelSource
-    }));`, 'strict fill quantity');
-
+    console.log('[ENTRY FILL CHECK]', JSON.stringify({ state: filled?.state, requestedContracts: Number(order?.requestedContracts || 0), filledContracts: fillSz, avgPx: filled?.avgPx, cancelSource: filled?.cancelSource }));`, 'strict fill quantity');
   code = replaceOrThrow(code, `if (\n      !(\n        fillSz > 0\n      )\n    ) {\n\n      return;\n    }`, `if (!(fillSz > 0) || (LIVE_TRADING && String(filled?.state || '').toLowerCase() !== 'filled')) {
-      console.warn('[ENTRY NOT FILLED]', JSON.stringify({
-        ordId: order?.ordId || null,
-        state: filled?.state || null,
-        requestedContracts: Number(order?.requestedContracts || 0),
-        filledContracts: fillSz,
-        cancelSource: filled?.cancelSource || null,
-        sCode: order?.sCode || null,
-        sMsg: order?.sMsg || null
-      }));
+      console.warn('[ENTRY NOT FILLED]', JSON.stringify({ ordId: order?.ordId || null, state: filled?.state || null, requestedContracts: Number(order?.requestedContracts || 0), filledContracts: fillSz, cancelSource: filled?.cancelSource || null, sCode: order?.sCode || null, sMsg: order?.sMsg || null }));
       return;
     }`, 'strict filled state');
-
   code = replaceOrThrow(code, `state.lastTradeAt =\n      Date.now();\n\n    saveState();`, `state.lastTradeAt =
       Date.now();
-
     const usedEventId = String(candidate.inst.instId || '').trim();
     if (usedEventId && !state.usedEventIds.includes(usedEventId)) {
       state.usedEventIds.push(usedEventId);
       if (state.usedEventIds.length > 500) state.usedEventIds.shift();
     }
-
     saveState();`, 'mark event used after entry');
 
   code = code.replace(/console\.log\(\s*`OKX EVENT CONTRACT BOT RUNNING ON PORT \$\{PORT\}`\s*\);/s, `console.log('OKX EVENT CONTRACT BOT RUNNING ON PORT ' + PORT);
