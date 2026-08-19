@@ -17,17 +17,12 @@ fs.readFileSync = function(file, encoding, ...rest) {
   if (typeof file === 'string' && /event-bot\.js$/.test(file) && typeof result === 'string') {
     let code = result;
 
-    // Allow both 5m and 15m UPDOWN event series, even when EVENT_SERIES is configured.
+    // Force both 5m and 15m UPDOWN event series, while preserving any configured series.
     code = code.replace(
-      /function getConfiguredSeries\(\)\{return EVENT_SERIES\.split\(', '\).map\(x=>x\.trim\(\)\)\.filter\(Boolean\);\}/,
-      "function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}"
-    );
-    code = code.replace(
-      /function getConfiguredSeries\(\)\{return EVENT_SERIES\.split\(', '\).map\(x=>x\.trim\(\)\)\.filter\(Boolean\);\}/,
+      "function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}",
       "function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}"
     );
 
-    // Allow both 5m and 15m UPDOWN event series when auto-discovering.
     code = code.replace(
       /function generatedSeries\(\)\{return ASSETS\.map\(c=>`\$\{c\}-UPDOWN-15MIN`\);\}/,
       "function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}"
@@ -39,14 +34,14 @@ fs.readFileSync = function(file, encoding, ...rest) {
       "const __TF4H={}; async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit})); if(bar==='4H') __TF4H[instId]=rows; return rows;}"
     );
 
-    // Make the existing 15m candle request also load 4H context.
+    // Every 15m trend request also loads its 4H main-direction context.
     code = code.replace(
       "async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit})); if(bar==='4H') __TF4H[instId]=rows; return rows;}",
       "async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit})); if(bar==='4H') __TF4H[instId]=rows; if(bar==='15m'){try{__TF4H[instId]=confirmed(await publicGet('/api/v5/market/candles',{instId,bar:'4H',limit:100}));}catch(e){console.error('[4H context]',e.message);}} return rows;}"
     );
 
-    // Replace the scoring function with strict hierarchy:
-    // 4H direction -> 15m confirmation -> 5m entry trigger.
+    // Replace the scoring function with the requested hierarchy:
+    // 4H direction -> 15m confirmation -> 5m entry signal.
     const start = code.indexOf('function modelProbability(');
     const end = code.indexOf('\nasync function getEquity(', start);
     if (start >= 0 && end > start) {
