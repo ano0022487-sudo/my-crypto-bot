@@ -3,8 +3,13 @@
 /*
   OKX Event Contract launcher.
   The trading logic lives in event-bot.js.
-  This runner disables Telegram polling and adds a hard runtime guard
-  so an unexpected 0.1-contract order can never reach LIVE trading.
+
+  PAPER-ONLY SAFETY MODE:
+  - LIVE_TRADING is forcibly disabled at runtime.
+  - Telegram polling is disabled; Telegram is notification-only.
+  - The existing Fixed 5U build and size guard remain enabled.
+  - The runner refuses to load an event-bot build that does not expose
+    the expected paper-trading switch.
 */
 
 const fs = require('fs');
@@ -20,6 +25,14 @@ try {
 
   let code = fs.readFileSync(source, 'utf8');
 
+  // Hard-force paper mode regardless of Render Environment Variables.
+  process.env.LIVE_TRADING = 'false';
+  code = code.replace(
+    /const LIVE_TRADING\s*=\s*[^;]+;/,
+    'const LIVE_TRADING=false;'
+  );
+
+  // Disable Telegram long polling to prevent ETELEGRAM 409 conflicts.
   code = code.replace(/polling\s*:\s*true/g, 'polling: false');
 
   const versionMatch = code.match(/OKX EVENT CONTRACT SNR BOT - ([^*\n]+)/);
@@ -44,6 +57,11 @@ try {
     `const sz=calcOrderSize(px,inst),actualStake=px*sz;console.log('[RUNNER SIZE GUARD]',JSON.stringify({targetStake:5,entryPx:px,contracts:sz,actualStake}));if(!(sz>0.1&&actualStake>=4.5)){throw new Error(\`[RUNNER SIZE GUARD] blocked order: contracts=\${sz}, actualStake=\${actualStake}\`);}`
   );
 
+  // Final source-level assertion: the compiled bot must be paper-only.
+  if (!code.includes('const LIVE_TRADING=false;')) {
+    throw new Error('[Runner] PAPER-ONLY guard failed: LIVE_TRADING was not forced false');
+  }
+
   try {
     const TelegramBot = require('node-telegram-bot-api');
     TelegramBot.prototype.startPolling = async function () {
@@ -56,6 +74,7 @@ try {
 
   console.log('[Runner] Fixed 5U build verified');
   console.log('[Runner] Hard 5U order-size guard enabled');
+  console.log('[Runner] PAPER-ONLY mode forced: LIVE_TRADING=false');
   console.log('[Runner] Telegram polling forced OFF');
 
   const runtimeModule = new Module(source, module);
