@@ -2,13 +2,12 @@
 
 /*
   OKX Event Contract launcher.
-  Runtime patch adds multi-timeframe signal architecture:
   4H = main direction, 15m = trend confirmation, 5m = entry signal.
   Both 5m and 15m event series are eligible.
+  Risk: 3 consecutive losses -> 30 minute cooldown -> automatic resume.
 */
 
 require('./runtime-diagnostics.js');
-
 const fs = require('fs');
 const originalReadFileSync = fs.readFileSync;
 
@@ -17,7 +16,6 @@ fs.readFileSync = function(file, encoding, ...rest) {
   if (typeof file === 'string' && /event-bot\.js$/.test(file) && typeof result === 'string') {
     let code = result;
 
-    // Force both 5m and 15m UPDOWN event series, while preserving any configured series.
     code = code.replace(
       "function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}",
       "function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}"
@@ -28,20 +26,16 @@ fs.readFileSync = function(file, encoding, ...rest) {
       "function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}"
     );
 
-    // Store the latest confirmed 4H candles for each underlying.
     code = code.replace(
       "async function getCandles(instId,bar,limit=100){return confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));}",
       "const __TF4H={}; async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit})); if(bar==='4H') __TF4H[instId]=rows; return rows;}"
     );
 
-    // Every 15m trend request also loads its 4H main-direction context.
     code = code.replace(
       "async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit})); if(bar==='4H') __TF4H[instId]=rows; return rows;}",
       "async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit})); if(bar==='4H') __TF4H[instId]=rows; if(bar==='15m'){try{__TF4H[instId]=confirmed(await publicGet('/api/v5/market/candles',{instId,bar:'4H',limit:100}));}catch(e){console.error('[4H context]',e.message);}} return rows;}"
     );
 
-    // Replace the scoring function with the requested hierarchy:
-    // 4H direction -> 15m confirmation -> 5m entry signal.
     const start = code.indexOf('function modelProbability(');
     const end = code.indexOf('\nasync function getEquity(', start);
     if (start >= 0 && end > start) {
@@ -83,6 +77,32 @@ fs.readFileSync = function(file, encoding, ...rest) {
 `;
       code = code.slice(0,start)+replacement+code.slice(end);
     }
+
+    const cooldownPatch = `const COOLDOWN_MS = 30 * 60 * 1000;
+function riskBlocked(){
+  resetDaily();
+  if(state.cooldownUntil && Date.now() >= Number(state.cooldownUntil)){
+    state.cooldownUntil = 0;
+    state.halted = false;
+    state.consecutiveLosses = 0;
+    saveState();
+    console.log('[RISK] 30-minute cooldown complete; trading resumed');
+  }
+  if(state.cooldownUntil && Date.now() < Number(state.cooldownUntil)) return true;
+  if(state.halted || state.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES){
+    state.halted = true;
+    state.cooldownUntil = Date.now() + COOLDOWN_MS;
+    saveState();
+    console.log('[RISK] 3 consecutive losses; cooldown 30 minutes');
+    return true;
+  }
+  return false;
+}`;
+
+    code = code.replace(
+      /function riskBlocked\(\)\{resetDaily\(\);return state\.halted\|\|state\.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES;\}/,
+      cooldownPatch
+    );
 
     return code;
   }
