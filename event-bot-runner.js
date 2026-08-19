@@ -8,20 +8,24 @@ const Module = require('module');
 const source = path.join(__dirname, 'event-bot.js');
 
 try {
-  if (!fs.existsSync(source)) throw new Error(`找不到 event-bot.js: ${source}`);
+  if (!fs.existsSync(source)) {
+    throw new Error('找不到 event-bot.js: ' + source);
+  }
 
   let code = fs.readFileSync(source, 'utf8');
 
   // HARD SAFETY: this runner can never start live trading.
   process.env.LIVE_TRADING = 'false';
   const livePattern = /const\s+LIVE_TRADING\s*=\s*[^;]+;/;
-  if (!livePattern.test(code)) throw new Error('[Runner] LIVE_TRADING declaration not found');
+  if (!livePattern.test(code)) {
+    throw new Error('[Runner] LIVE_TRADING declaration not found');
+  }
   code = code.replace(livePattern, 'const LIVE_TRADING = false;');
 
   // Force Telegram polling on so commands can be received.
   code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
 
-  // Read-only statistics endpoint.
+  // Read-only HTTP statistics endpoint.
   if (!code.includes("app.get('/stats'")) {
     const statsRoute = `
 app.get('/stats', (req, res) => {
@@ -33,48 +37,52 @@ app.get('/stats', (req, res) => {
     const grossWin = trades.filter(t => Number(t.pnl) > 0).reduce((s, t) => s + Number(t.pnl), 0);
     const grossLoss = trades.filter(t => Number(t.pnl) < 0).reduce((s, t) => s + Number(t.pnl), 0);
     res.json({
-      ok: true, mode: 'PAPER', day: state.day,
+      ok: true,
+      mode: 'PAPER',
+      day: state.day,
       startCapital: Number(state.startEquity || 0),
       paperEquity: Number(state.paperEquity || 0),
       realizedPnl: Number(state.realizedPnl || pnl),
-      tradeCount: trades.length, wins, losses,
+      tradeCount: trades.length,
+      wins,
+      losses,
       winRate: trades.length ? wins / trades.length * 100 : 0,
-      grossWin, grossLoss,
+      grossWin,
+      grossLoss,
       avgWin: wins ? grossWin / wins : 0,
       avgLoss: losses ? grossLoss / losses : 0,
       consecutiveLosses: Number(state.consecutiveLosses || 0),
-      halted: Boolean(state.halted), openPosition: Boolean(state.position), trades
+      halted: Boolean(state.halted),
+      openPosition: Boolean(state.position),
+      trades
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 `;
+
     const healthMarker = "app.get('/health'";
     if (code.includes(healthMarker)) {
       code = code.replace(healthMarker, statsRoute + healthMarker);
     } else {
       const listenMarker = 'app.listen(';
-      if (!code.includes(listenMarker)) throw new Error('[Runner] app.listen route marker not found');
+      if (!code.includes(listenMarker)) {
+        throw new Error('[Runner] app.listen route marker not found');
+      }
       code = code.replace(listenMarker, statsRoute + '\n' + listenMarker);
     }
   }
 
-  // Telegram commands. This handler intentionally contains NO nested template literals.
-  if (!code.includes('[Telegram COMMAND]')) {
+  // Telegram command handler.
+  // Use onText instead of a generic message listener so Telegram slash commands
+  // are matched directly. No chat-id restriction: /stats is read-only.
+  if (!code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
     const handler = `
+/* [Telegram COMMAND HANDLER INSTALLED] */
 if (bot) {
-  bot.on('message', async (msg) => {
+  const sendPaperStats = async (chatId) => {
     try {
-      const raw = String(msg && msg.text || '').trim();
-      const command = raw.split(/\\s+/)[0].split('@')[0].toLowerCase();
-      if (command !== '/stats' && command !== '/stat' && command !== '/統計') return;
-      const chatId = String(msg && msg.chat && msg.chat.id || '').trim();
-      const configuredChat = String(process.env.TELEGRAM_CHAT_ID || '').trim();
-      console.log('[Telegram COMMAND]', JSON.stringify({ command, chatId, configuredChat }));
-      if (!chatId) return;
-      if (configuredChat && chatId !== configuredChat) return;
-
       const trades = Array.isArray(state.trades) ? state.trades : [];
       const wins = trades.filter(t => Number(t.pnl) > 0).length;
       const losses = trades.filter(t => Number(t.pnl) < 0).length;
@@ -107,25 +115,52 @@ if (bot) {
       ].join('\\n');
 
       await bot.sendMessage(chatId, text);
+      console.log('[Telegram COMMAND] /stats replied to ' + chatId);
+    } catch (err) {
+      console.error('[Telegram COMMAND ERROR]', err.message || err);
+    }
+  };
+
+  bot.onText(/^\\/(stats|stat|統計)(?:@[^\\s]+)?$/i, async (msg) => {
+    const chatId = String(msg && msg.chat && msg.chat.id || '').trim();
+    if (chatId) await sendPaperStats(chatId);
+  });
+
+  bot.onText(/^\\/(start|help)(?:@[^\\s]+)?$/i, async (msg) => {
+    const chatId = String(msg && msg.chat && msg.chat.id || '').trim();
+    if (!chatId) return;
+    try {
+      await bot.sendMessage(chatId, 'OKX Event Bot\n\n模式：PAPER（模擬盤）\n\n可用指令：\n/stats\n/stat\n/統計\n\n查詢目前模擬交易統計。');
+      console.log('[Telegram COMMAND] /start or /help replied to ' + chatId);
     } catch (err) {
       console.error('[Telegram COMMAND ERROR]', err.message || err);
     }
   });
+
+  bot.on('polling_error', (err) => {
+    console.error('[Telegram polling_error]', err.message || err);
+  });
 }
 `;
 
-    const botStart = code.indexOf('const bot');
-    if (botStart < 0) throw new Error('[Runner] bot declaration not found');
-    const botEnd = code.indexOf('\n\n', botStart);
-    if (botEnd < 0) throw new Error('[Runner] bot declaration boundary not found');
-    code = code.slice(0, botEnd) + '\n' + handler + code.slice(botEnd);
+    const botStart = code.indexOf('const bot=');
+    if (botStart < 0) {
+      throw new Error('[Runner] bot declaration not found');
+    }
+    const botEnd = code.indexOf('\n', botStart);
+    if (botEnd < 0) {
+      throw new Error('[Runner] bot declaration boundary not found');
+    }
+    code = code.slice(0, botEnd + 1) + handler + code.slice(botEnd + 1);
   }
 
   console.log('[Runner] PAPER-ONLY mode forced: LIVE_TRADING=false');
-  console.log('[Runner] Telegram /stats,/stat,/統計 handler installed');
+  console.log('[Runner] Telegram command handlers installed: /stats /stat /統計 /start /help');
   console.log('[Runner] /stats HTTP endpoint installed');
 
-  if (!code.includes('const LIVE_TRADING = false;')) throw new Error('[Runner] PAPER guard failed');
+  if (!code.includes('const LIVE_TRADING = false;')) {
+    throw new Error('[Runner] PAPER guard failed');
+  }
 
   const runtimeModule = new Module(source, module);
   runtimeModule.filename = source;
