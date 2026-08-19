@@ -53,7 +53,6 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) stat
 if (!Array.isArray(state.usedEventIds)) state.usedEventIds = [];
 state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(Boolean).slice(-500);`, 'state initialization');
 
-  /* Calculate contract quantity inside placeEventOrder scope. */
   code = replaceOrThrow(code, 'const sz = ORDER_SIZE_FIXED;', `var sz = 0;
 
   const currentRollStake = Math.max(ROLL_BASE_STAKE, Number(state.rollStake || ROLL_BASE_STAKE));
@@ -102,8 +101,6 @@ state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(
 
     instId:`, 'order-size diagnostic');
 
-  /* Attach the requested contract quantity to the order result so maybeTrade
-     never references the local `sz` variable from placeEventOrder. */
   code = replaceOrThrow(code, `const result =\n    rows?.[0];`, `const result =
     rows?.[0];
     if (result) result.requestedContracts = sz;
@@ -127,7 +124,6 @@ state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(
       sMsg: result.sMsg
     }));`, 'entry state logging');
 
-  /* IMPORTANT: use order.requestedContracts here, not `sz` from another scope. */
   code = replaceOrThrow(code, `const fillSz =\n      Number(\n        filled?.accFillSz ||\n        filled?.fillSz ||\n        ORDER_SIZE_FIXED\n      );`, `const fillSz = Number(filled?.accFillSz ?? filled?.fillSz ?? 0);
 
     console.log('[ENTRY FILL CHECK]', JSON.stringify({
@@ -140,13 +136,13 @@ state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(
 
   code = replaceOrThrow(code, `if (\n      !(\n        fillSz > 0\n      )\n    ) {\n\n      return;\n    }`, `if (!(fillSz > 0) || (LIVE_TRADING && String(filled?.state || '').toLowerCase() !== 'filled')) {
       console.warn('[ENTRY NOT FILLED]', JSON.stringify({
-        ordId: result?.ordId || null,
+        ordId: order?.ordId || null,
         state: filled?.state || null,
         requestedContracts: Number(order?.requestedContracts || 0),
         filledContracts: fillSz,
         cancelSource: filled?.cancelSource || null,
-        sCode: result?.sCode || null,
-        sMsg: result?.sMsg || null
+        sCode: order?.sCode || null,
+        sMsg: order?.sMsg || null
       }));
       return;
     }`, 'strict filled state');
@@ -162,7 +158,6 @@ state.usedEventIds = state.usedEventIds.map(x => String(x || '').trim()).filter(
 
     saveState();`, 'mark event used after entry');
 
-  /* Startup diagnostics. */
   code = code.replace(/console\.log\(\s*`OKX EVENT CONTRACT BOT RUNNING ON PORT \$\{PORT\}`\s*\);/s, `console.log('OKX EVENT CONTRACT BOT RUNNING ON PORT ' + PORT);
 console.log('[CONFIG] TARGET=' + ROLL_BASE_STAKE + 'U MIN_SCORE=' + MIN_SCORE + ' MIN_EDGE=' + MIN_EDGE + ' MIN_MODEL=' + MIN_COMPOSITE_PROB);
 console.log('[EVENT LOCK] Same event contract can enter only once');
