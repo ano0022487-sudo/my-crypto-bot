@@ -5,6 +5,7 @@
   4H = main direction, 15m = trend confirmation, 5m = entry signal.
   Both 5m and 15m event series are eligible.
   Risk: 3 consecutive losses -> 30 minute cooldown -> automatic resume.
+  Entry optimization: prefer 0.25-0.35 and rank by expiry reward/risk.
 */
 
 require('./runtime-diagnostics.js');
@@ -77,6 +78,30 @@ fs.readFileSync = function(file, encoding, ...rest) {
 `;
       code = code.slice(0,start)+replacement+code.slice(end);
     }
+
+    /* Prefer Event entries in the 0.25-0.35 band. Theoretical expiry reward/risk is
+       (1-entry)/entry for a correct binary settlement, so lower entry is preferred.
+       We do not force a false 1:3 guarantee: 1:3 is reached at entry <= 0.25. */
+    code = code.replace(
+      "function validPrice(p){return Number.isFinite(p)&&p>=MIN_ENTRY_PRICE&&p<=MAX_ENTRY_PRICE;}",
+      "const PREFERRED_ENTRY_MIN=0.25,PREFERRED_ENTRY_MAX=0.35,MAX_ENTRY_FOR_SELECTION=0.40,MIN_EXPIRY_RR=2.00; function expiryRewardRisk(p){return Number.isFinite(p)&&p>0&&p<1?(1-p)/p:0;} function validPrice(p){return Number.isFinite(p)&&p>=PREFERRED_ENTRY_MIN&&p<=MAX_ENTRY_FOR_SELECTION&&expiryRewardRisk(p)>=MIN_EXPIRY_RR;}"
+    );
+
+    /* Add explicit entry economics to each candidate and prefer the 0.25-0.35 band. */
+    code = code.replace(
+      "candidates.push({inst,seriesId:inst.seriesId,coin,underlying,side,entryPx,modelProb,marketProb:entryPx,edge,score:model.score,reasons:model.reasons,signals:model.signals,confirmation:model.confirmation,strikePx:strike,underlyingPrice:price,expiry:getExpiry(inst),minutesToExpiry:mins,atr:model.atr});",
+      "const expiryRR=expiryRewardRisk(entryPx),preferredEntry=entryPx>=PREFERRED_ENTRY_MIN&&entryPx<=PREFERRED_ENTRY_MAX; candidates.push({inst,seriesId:inst.seriesId,coin,underlying,side,entryPx,modelProb,marketProb:entryPx,edge,score:model.score,reasons:model.reasons,signals:model.signals,confirmation:model.confirmation,strikePx:strike,underlyingPrice:price,expiry:getExpiry(inst),minutesToExpiry:mins,atr:model.atr,expiryRR,preferredEntry});"
+    );
+
+    code = code.replace(
+      "console.log('[EVENT PASS]',JSON.stringify({instId:inst.instId,side,entryPx,score:model.score,model:Number((modelProb*100).toFixed(1)),edge:Number((edge*100).toFixed(1)),reasons:model.reasons,signals:model.signals}));",
+      "console.log('[EVENT PASS]',JSON.stringify({instId:inst.instId,side,entryPx,expiryRR:Number(expiryRR.toFixed(2)),preferredEntry,score:model.score,model:Number((modelProb*100).toFixed(1)),edge:Number((edge*100).toFixed(1)),reasons:model.reasons,signals:model.signals}));"
+    );
+
+    code = code.replace(
+      "return candidates.sort((a,b)=>b.edge-a.edge||b.score-a.score);",
+      "return candidates.sort((a,b)=>Number(b.preferredEntry)-Number(a.preferredEntry)||b.expiryRR-a.expiryRR||b.edge-a.edge||b.score-a.score);"
+    );
 
     const cooldownPatch = `const COOLDOWN_MS = 30 * 60 * 1000;
 function riskBlocked(){
