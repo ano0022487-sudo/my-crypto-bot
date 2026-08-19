@@ -35,10 +35,6 @@ try {
 
   let code = fs.readFileSync(source, 'utf8');
 
-  /* =========================================================
-     TELEGRAM: notification-only, never getUpdates polling
-  ========================================================= */
-
   code = code.replace(/polling\s*:\s*true/g, 'polling: false');
 
   try {
@@ -50,10 +46,6 @@ try {
   } catch (err) {
     console.error('[Runner Telegram Patch Error]', err.message || err);
   }
-
-  /* =========================================================
-     EVENT CONTRACT SETTINGS
-  ========================================================= */
 
   code = replaceOrThrow(
     code,
@@ -80,10 +72,6 @@ const ROLL_RESET_LOSSES = 6;`,
     /const MAX_CONSECUTIVE_LOSSES =\s*Number\(\s*process\.env\.MAX_CONSECUTIVE_LOSSES \|\| 3\s*\);/s,
     `const MAX_CONSECUTIVE_LOSSES = Number(process.env.MAX_CONSECUTIVE_LOSSES || 999999);`
   );
-
-  /* =========================================================
-     ROLLING STAKE STATE
-  ========================================================= */
 
   code = replaceOrThrow(
     code,
@@ -112,9 +100,6 @@ if (!Number.isFinite(Number(state.rollStep)) || Number(state.rollStep) < 0) {
   state.rollStep = 0;
 }
 
-/* =========================================================
-   SAME EVENT = ONE ENTRY ONLY
-========================================================= */
 if (!Array.isArray(state.usedEventIds)) {
   state.usedEventIds = [];
 }
@@ -126,10 +111,6 @@ if (state.usedEventIds.length > 500) {
 }`,
     'state initialization'
   );
-
-  /* =========================================================
-     CORRECT EVENT CONTRACT QUANTITY
-  ========================================================= */
 
   code = replaceOrThrow(
     code,
@@ -157,10 +138,6 @@ if (state.usedEventIds.length > 500) {
   );`,
     'order quantity'
   );
-
-  /* =========================================================
-     FRESH QUOTE + STALE-SIGNAL PROTECTION
-  ========================================================= */
 
   code = replaceOrThrow(
     code,
@@ -200,10 +177,6 @@ if (state.usedEventIds.length > 500) {
     'fresh quote protection'
   );
 
-  /* =========================================================
-     ENTRY ORDER: FOK
-  ========================================================= */
-
   code = replaceOrThrow(
     code,
     `ordType:\n      'ioc',`,
@@ -211,10 +184,6 @@ if (state.usedEventIds.length > 500) {
       'fok',`,
     'entry order type'
   );
-
-  /* =========================================================
-     HIGH-CONFIDENCE FILTER
-  ========================================================= */
 
   code = replaceOrThrow(
     code,
@@ -246,10 +215,6 @@ if (state.usedEventIds.length > 500) {
     'high-confidence filter'
   );
 
-  /* =========================================================
-     SAME EVENT FILTER
-  ========================================================= */
-
   code = replaceOrThrow(
     code,
     `const candidate =\n    candidates[0];`,
@@ -267,10 +232,6 @@ if (state.usedEventIds.length > 500) {
     availableCandidates[0];`,
     'same event entry lock'
   );
-
-  /* =========================================================
-     DIAGNOSTIC ORDER SIZE
-  ========================================================= */
 
   code = replaceOrThrow(
     code,
@@ -291,10 +252,6 @@ if (state.usedEventIds.length > 500) {
     instId:`,
     'order-size diagnostic'
   );
-
-  /* =========================================================
-     DIAGNOSTIC ORDER RESPONSE + STRICT FILL CHECK
-  ========================================================= */
 
   code = replaceOrThrow(
     code,
@@ -329,18 +286,45 @@ if (state.usedEventIds.length > 500) {
     'entry order state logging'
   );
 
-  /* =========================================================
-     MARK EVENT USED ONLY AFTER CONFIRMED FILLED ENTRY
-  ========================================================= */
+  code = replaceOrThrow(
+    code,
+    `const fillSz =\n      Number(\n        filled?.accFillSz ||\n        filled?.fillSz ||\n        ORDER_SIZE_FIXED\n      );`,
+    `const fillSz = Number(
+      filled?.accFillSz ??
+      filled?.fillSz ??
+      0
+    );
+
+    console.log('[ENTRY FILL CHECK]', JSON.stringify({
+      state: filled?.state,
+      requestedContracts: sz,
+      filledContracts: fillSz,
+      avgPx: filled?.avgPx,
+      cancelSource: filled?.cancelSource
+    }));`,
+    'strict fill quantity'
+  );
 
   code = replaceOrThrow(
     code,
-    `state.lastTradeAt =\n      Date.now();\n\n    const usedEventId =`,
-    `state.lastTradeAt =
-      Date.now();
-
-    const usedEventId =`,
-    'event lock anchor'
+    `if (\n      !(\n        fillSz > 0\n      )\n    ) {\n\n      return;\n    }`,
+    `if (
+      !(fillSz > 0) ||
+      (LIVE_TRADING && String(filled?.state || '').toLowerCase() !== 'filled')
+    ) {
+      console.warn(
+        '[ENTRY NOT FILLED]',
+        JSON.stringify({
+          ordId: order?.ordId || null,
+          state: filled?.state || null,
+          filledContracts: fillSz,
+          cancelSource: filled?.cancelSource || null,
+          sMsg: order?.sMsg || null
+        })
+      );
+      return;
+    }`,
+    'strict filled state'
   );
 
   code = replaceOrThrow(
@@ -363,10 +347,6 @@ if (state.usedEventIds.length > 500) {
     'mark event used after entry'
   );
 
-  /* =========================================================
-     STARTUP DIAGNOSTICS
-  ========================================================= */
-
   code = code.replace(
     /console\.log\(`OKX EVENT CONTRACT BOT RUNNING ON PORT \$\{PORT\}`\);/,
     "console.log('OKX EVENT CONTRACT BOT RUNNING ON PORT ' + PORT);\n" +
@@ -376,10 +356,6 @@ if (state.usedEventIds.length > 500) {
     "    console.log('[ENTRY] FOK + fresh quote + strict fill verification');\n" +
     "    console.log('[Telegram] polling forced OFF; entry FOK / exit IOC');"
   );
-
-  /* =========================================================
-     COMPILE
-  ========================================================= */
 
   const runtimeModule = new Module(source, module);
   runtimeModule.filename = source;
