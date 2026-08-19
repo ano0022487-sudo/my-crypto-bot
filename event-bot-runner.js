@@ -24,7 +24,16 @@ try {
   // Notification-only Telegram mode on Render.
   code = code.replace(/polling\s*:\s*true/g, 'polling: false');
 
-  // Defensive runtime patch in case a future event-bot.js uses startPolling.
+  // Runtime marker: confirms Render is executing the current event-bot.js.
+  const versionMatch = code.match(/OKX EVENT CONTRACT SNR BOT - ([^*\n]+)/);
+  console.log(`[Runner] event-bot source loaded: ${versionMatch ? versionMatch[1].trim() : 'unknown-version'}`);
+
+  // Hard safety check: the deployed source must contain the fixed 5U sizing logic.
+  if (!code.includes('const TARGET_STAKE=5;') || !code.includes('function calcOrderSize(')) {
+    throw new Error('[Runner] event-bot.js is not the expected Fixed 5U build');
+  }
+
+  // Notification-only Telegram mode on Render.
   try {
     const TelegramBot = require('node-telegram-bot-api');
     TelegramBot.prototype.startPolling = async function () {
@@ -35,7 +44,7 @@ try {
     console.error('[Runner Telegram Patch Error]', err.message || err);
   }
 
-  console.log('[Runner] event-bot.js loaded without strategy patches');
+  console.log('[Runner] Fixed 5U build verified');
   console.log('[Runner] Telegram polling forced OFF');
 
   const runtimeModule = new Module(source, module);
