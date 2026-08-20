@@ -11,6 +11,15 @@ const originalReadFileSync=fs.readFileSync;
 
 fs.readFileSync=function(file,encoding,...rest){
   const result=originalReadFileSync.call(fs,file,encoding,...rest);
+
+  /* Telegram polling is intentionally disabled at the runtime boundary.
+     Notifications still use bot.sendMessage(), but getUpdates is not started.
+     This prevents Render/old instances from competing for the same Telegram
+     update stream and producing ETELEGRAM 409 Conflict. */
+  if(typeof file==='string'&&/event-bot-runner\.js$/.test(file)&&typeof result==='string'){
+    return result.replace("code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: true');","code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: false');");
+  }
+
   if(typeof file==='string'&&/event-bot\.js$/.test(file)&&typeof result==='string'){
     let code=result;
 
