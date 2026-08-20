@@ -1,9 +1,14 @@
 {
   "name": "okx-event-bot",
   "version": "1.0.0",
-  "main": "event-bot-runner.js",
+  "private": true,
+  "description": "OKX event contract bot with a 1H mathematical trend strategy",
+  "main": "index.js",
   "scripts": {
-    "start": "node event-bot-runner.js"
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "axios": "^1.7.9",
