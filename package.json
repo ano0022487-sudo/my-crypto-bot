@@ -1,9 +1,9 @@
 {
   "name": "okx-event-bot",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "event-bot-runner.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node event-bot-runner.js"
   },
   "dependencies": {
     "axios": "^1.7.9",
