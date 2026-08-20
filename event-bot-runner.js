@@ -58,16 +58,41 @@ try {
   if (!livePattern.test(code)) throw new Error('[Runner] LIVE_TRADING declaration not found');
   code = code.replace(livePattern, 'const LIVE_TRADING = false;');
 
-  // Only this runner instance owns Telegram polling.
-  code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
-  const telegramConstructPattern = /new\s+TelegramBot\s*\(\s*([^,]+),\s*\{\s*polling\s*:\s*true\s*\}\s*\)/g;
-  let telegramConstructCount = 0;
-  code = code.replace(telegramConstructPattern, (full, tokenExpr) => {
-    telegramConstructCount += 1;
-    return telegramConstructCount === 1
-      ? `new TelegramBot(${tokenExpr}, { polling: true })`
-      : `new TelegramBot(${tokenExpr}, { polling: false })`;
+  // Telegram uses webhook mode. Polling is deliberately disabled so there is
+  // exactly one update delivery mechanism and no getUpdates 409 conflicts.
+  code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: false');
+  code = code.replace(/new\s+TelegramBot\s*\(\s*([^,]+),\s*\{\s*polling\s*:\s*(true|false)\s*\}\s*\)/g,
+    (full, tokenExpr) => `new TelegramBot(${tokenExpr}, { polling: false })`);
+
+  const webhookBlock = `
+// [RUNNER TELEGRAM WEBHOOK]
+// Render provides RENDER_EXTERNAL_URL on hosted services. A custom
+// TELEGRAM_WEBHOOK_URL may be supplied when a different public HTTPS URL is used.
+const __telegramWebhookBase = String(process.env.TELEGRAM_WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\\/$/, '');
+const __telegramWebhookPath = '/telegram/webhook';
+if (bot && app && __telegramWebhookBase) {
+  app.post(__telegramWebhookPath, (req, res) => {
+    try {
+      bot.processUpdate(req.body);
+      res.sendStatus(200);
+    } catch (err) {
+      console.error('[Telegram webhook process error]', err.message || err);
+      res.sendStatus(500);
+    }
   });
+  const __telegramWebhookUrl = __telegramWebhookBase + __telegramWebhookPath;
+  bot.deleteWebHook().catch(() => {}).then(() => bot.setWebHook(__telegramWebhookUrl)).then(() => {
+    console.log('[Telegram] Webhook enabled:', __telegramWebhookUrl);
+  }).catch(err => {
+    console.error('[Telegram webhook setup error]', err.message || err);
+  });
+} else if (bot) {
+  console.warn('[Telegram] Webhook not configured: set TELEGRAM_WEBHOOK_URL or RENDER_EXTERNAL_URL');
+}
+`;
+  const botDeclaration = 'const bot=TG_TOKEN?new TelegramBot(TG_TOKEN,{polling:false}):null;';
+  if (!code.includes(botDeclaration)) throw new Error('[Runner] Telegram bot declaration not found after polling conversion');
+  code = code.replace(botDeclaration, botDeclaration + webhookBlock);
 
   const forcedConfig = `
 // [RUNNER FORCED CONFIG]
@@ -135,11 +160,9 @@ app.get('/stats', (req, res) => {
     }
   }
 
-  // event-bot.js already owns the Telegram /stats handler. Only inject the
-  // fallback handler when no stats command handler exists, preventing two
-  // replies to a single /stats command.
-  const hasStatsHandler = code.includes('bot.onText(/^\\/(stats|stat|統計)');
-  if (!hasStatsHandler && !code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
+  // event-bot.js owns its Telegram commands. Do not inject another copy.
+  // Webhook delivery reaches the same bot instance via bot.processUpdate().
+  if (!code.includes('bot.onText(/^\\/(stats|stat|統計)')) {
     const handler = `
 /* [Telegram COMMAND HANDLER INSTALLED] */
 if (bot) {
@@ -161,7 +184,6 @@ if (bot) {
   };
   bot.onText(/^\\/(stats|stat|統計)(?:@[^\\s]+)?$/i,async msg=>{const chatId=String(msg&&msg.chat&&msg.chat.id||'').trim();if(chatId)await sendPaperStats(chatId);});
   bot.onText(/^\\/(start|help)(?:@[^\\s]+)?$/i,async msg=>{const chatId=String(msg&&msg.chat&&msg.chat.id||'').trim();if(!chatId)return;try{const nl=String.fromCharCode(10);const helpText=['OKX Event Bot','','模式：PAPER（模擬盤）','','可用指令：','/stats','/stat','/統計','','查詢目前模擬交易統計。'].join(nl);await bot.sendMessage(chatId,helpText);}catch(err){console.error('[Telegram COMMAND ERROR]',err.message||err);}});
-  bot.on('polling_error',err=>console.error('[Telegram polling_error]',err.message||err));
 }
 `;
     const botStart=code.indexOf('const bot=');
@@ -176,7 +198,8 @@ if (bot) {
   console.log('[Runner] Risk forced: daily loss 10% / max consecutive losses 3 / cooldown 30 minutes');
   console.log('[Runner] Event expiry forced: 2-20 minutes');
   console.log('[Runner] FINAL PRE-ORDER GATE: score/model/edge/entry checked immediately before placeEventOrder');
-  console.log('[Runner] Telegram command handlers installed: /stats /stat /統計 /start /help');
+  console.log('[Runner] Telegram mode: WEBHOOK (polling disabled; no getUpdates)');
+  console.log('[Runner] Telegram command handlers: /stats /stat /統計 /start /help');
   console.log('[Runner] /stats HTTP endpoint installed');
   console.log('[Runner] Singleton protection enabled; only one bot process may run per container.');
 
