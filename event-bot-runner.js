@@ -5,38 +5,39 @@ const Module=require('module');
 const source=path.join(__dirname,'event-bot.js');
 const LOCK='/tmp/okx-event-bot.singleton.lock';
 let fd=null;
-function acquire(){try{fd=fs.openSync(LOCK,'wx');fs.writeFileSync(fd,String(process.pid));const release=()=>{try{if(fd!==null)fs.closeSync(fd)}catch{}try{if(fs.existsSync(LOCK))fs.unlinkSync(LOCK)}catch{}};process.once('exit',release);process.once('SIGTERM',()=>{release();process.exit(0)});process.once('SIGINT',()=>{release();process.exit(0)});console.log('[Runner] Singleton lock acquired pid='+process.pid);return true}catch(e){try{const p=Number(fs.readFileSync(LOCK,'utf8').trim());if(p>0){try{process.kill(p,0);console.error('[Runner] Another bot process is already running pid='+p+'; refusing duplicate startup.');return false}catch{try{fs.unlinkSync(LOCK)}catch{}return acquire()}}}catch{}try{fs.unlinkSync(LOCK)}catch{}return acquire()}}
+function acquire(){try{fd=fs.openSync(LOCK,'wx');fs.writeFileSync(fd,String(process.pid));const release=()=>{try{if(fd!==null)fs.closeSync(fd)}catch{}try{if(fs.existsSync(LOCK))fs.unlinkSync(LOCK)}catch{}};process.once('exit',release);process.once('SIGTERM',()=>{release();process.exit(0)});process.once('SIGINT',()=>{release();process.exit(0)});console.log('[Runner] Singleton lock acquired pid='+process.pid);return true}catch(e){try{const p=Number(fs.readFileSync(LOCK,'utf8').trim());if(p>0){try{process.kill(p,0);console.error('[Runner] Another bot process is already running pid='+p+'; refusing duplicate startup.');return false}catch{try{fs.unlinkSync(LOCK)}catch{}return acquire()}}}catch{}try{fs.unlinkSync(LOCK)}catch{}return acquire()}}}
 if(!acquire()){process.exitCode=0;return;}
 try{
- let code=fs.readFileSync(source,'utf8');
- code=code.replace(/const\s+LIVE_TRADING\s*=\s*[^;]+;/,'const LIVE_TRADING = false;');
- code=code.replace(/polling\s*:\s*(true|false)/g,'polling: false');
- const cfg='const TARGET_STAKE=1;const MIN_EDGE=0.15;const MIN_SCORE=90;const MIN_MODEL_PROB=0.75;const MIN_ENTRY_PRICE=0.25;const MAX_ENTRY_PRICE=0.40;const EARLY_TP_PCT=0.30;const EARLY_SL_PCT=0.25;const MIN_MINUTES_TO_EXPIRY=2;const MAX_MINUTES_TO_EXPIRY=20;const DAILY_LOSS_PCT=0.10;const MAX_CONSECUTIVE_LOSSES=3;';
- const cs=code.indexOf('const TARGET_STAKE=');const ce=code.indexOf(';',code.indexOf('MAX_CONSECUTIVE_LOSSES=',cs));if(cs<0||ce<0)throw Error('[Runner] strategy config not found');code=code.slice(0,cs)+cfg+code.slice(ce+1);
- code=code.replace('const MIN_ENTRY_PRICE=0.25;','const MIN_ENTRY_PRICE=0.25;const MIN_MODEL_RATIO=1.50;');
- const oldReject='let reject=null;if(model.score<MIN_SCORE)reject=`score ${model.score}<${MIN_SCORE}`;else if(modelProb<MIN_MODEL_PROB)reject=`model ${(modelProb*100).toFixed(1)}%<${MIN_MODEL_PROB*100}%`;else if(edge<MIN_EDGE)reject=`edge ${(edge*100).toFixed(1)}%<${MIN_EDGE*100}%`;';
- const newReject='const expectedValue=modelProb-entryPx;const expectedReturn=entryPx>0?modelProb/entryPx-1:-Infinity;const modelMarketRatio=entryPx>0?modelProb/entryPx:0;let reject=null;if(model.score<MIN_SCORE)reject=`score ${model.score}<${MIN_SCORE}`;else if(modelProb<MIN_MODEL_PROB)reject=`model ${(modelProb*100).toFixed(1)}%<${MIN_MODEL_PROB*100}%`;else if(edge<MIN_EDGE)reject=`edge ${(edge*100).toFixed(1)}%<${MIN_EDGE*100}%`;else if(expectedValue<=0)reject=`EV ${expectedValue.toFixed(4)}<=0`;else if(modelMarketRatio<MIN_MODEL_RATIO)reject=`model/market ${modelMarketRatio.toFixed(2)}<${MIN_MODEL_RATIO}`;';
- if(!code.includes(oldReject))throw Error('[Runner] formula gate marker not found');code=code.replace(oldReject,newReject);
- const oldSync=/function syncAccounting\(\)\{[\s\S]*?\n\}\nfunction resetDaily\(\)/;
- const newSync=`function syncAccounting(){\n  const trades=Array.isArray(state.trades)?state.trades:[];\n  const pnl=trades.reduce((s,t)=>s+Number(t&&t.pnl||0),0);\n  state.startEquity=START_CAPITAL;\n  state.realizedPnl=Number(pnl.toFixed(4));\n  if(!LIVE_TRADING){const expected=Number((START_CAPITAL+pnl).toFixed(4));if(!Number.isFinite(Number(state.paperEquity))||Math.abs(Number(state.paperEquity)-expected)>0.0001)state.paperEquity=Math.max(0,expected);}\n}\nfunction resetDaily()`;
- if(!oldSync.test(code))throw Error('[Runner] syncAccounting marker not found');code=code.replace(oldSync,newSync);
- const oldRisk=/function riskBlocked\(\)\{[\s\S]*?\n\}\nfunction eventUsed/;
- const newRisk=`function riskBlocked(){\n  resetDaily();\n  const now=Date.now();\n  const until=Number(state.cooldownUntil||0);\n  if(until>0){\n    if(now>=until){state.cooldownUntil=0;state.halted=false;state.consecutiveLosses=0;saveState();console.log('[RISK] COOLDOWN_EXPIRED -> AUTO_RESUME');return false;}\n    state.halted=true;saveState();return true;\n  }\n  if(state.halted||Number(state.consecutiveLosses||0)>=MAX_CONSECUTIVE_LOSSES){state.halted=false;state.consecutiveLosses=0;saveState();console.log('[RISK] stale halt cleared -> AUTO_RESUME');}\n  return false;\n}\nfunction eventUsed`;
- if(!oldRisk.test(code))throw Error('[Runner] riskBlocked marker not found');code=code.replace(oldRisk,newRisk);
- const oldExit='state.position=null;syncAccounting();if(state.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+COOLDOWN_MS;}saveState();';
- const newExit='state.position=null;syncAccounting();if(pnl<0){state.consecutiveLosses=Number(state.consecutiveLosses||0)+1;}else if(pnl>0){state.consecutiveLosses=0;}if(state.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+COOLDOWN_MS;console.log(`[RISK] ${state.consecutiveLosses} consecutive NEW losses -> 30m cooldown`);}saveState();';
- if(!code.includes(oldExit))throw Error('[Runner] exit risk marker not found');code=code.replace(oldExit,newExit);
- const startup=`\n/* HARD restart-safe cooldown controller. Historical trades never trigger a new cooldown. */\nstate.cooldownUntil=0;state.halted=false;state.consecutiveLosses=0;saveState();\nsetInterval(()=>{try{const until=Number(state.cooldownUntil||0);if(until>0&&Date.now()>=until){state.cooldownUntil=0;state.halted=false;state.consecutiveLosses=0;saveState();console.log('[RISK] COOLDOWN_EXPIRED -> AUTO_RESUME');}}catch(e){console.error('[RISK TIMER]',e.message||e);}},5000);\nconsole.log('[RISK] startup: fresh consecutive-loss counter = 0; 3 NEW losses -> 30m cooldown');\n`;
- const listen='app.listen(';if(!code.includes(listen))throw Error('[Runner] app.listen marker not found');
- const webhook=`\n/* Telegram webhook for commands; outbound trade notifications use Bot API directly. */\nconst __tgToken=String(process.env.TELEGRAM_BOT_TOKEN||'').trim().replace(/[\\\"']/g,'');\nconst __tgBase=String(process.env.TELEGRAM_WEBHOOK_URL||process.env.RENDER_EXTERNAL_URL||'').trim().replace(/\\/$/,'');\nasync function __tgSend(chatId,text){if(!__tgToken||!chatId)return;try{await fetch('https://api.telegram.org/bot'+__tgToken+'/sendMessage',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:chatId,text})});}catch(e){console.error('[Telegram send]',e.message||e);}}\nfunction __tgStats(){const ts=Array.isArray(state.trades)?state.trades:[];const wins=ts.filter(t=>Number(t.pnl)>0).length;const losses=ts.filter(t=>Number(t.pnl)<0).length;const pnl=ts.reduce((s,t)=>s+Number(t.pnl||0),0);const gw=ts.filter(t=>Number(t.pnl)>0).reduce((s,t)=>s+Number(t.pnl),0);const gl=ts.filter(t=>Number(t.pnl)<0).reduce((s,t)=>s+Number(t.pnl),0);const wr=ts.length?wins/ts.length*100:0;const eq=Number(state.paperEquity||0);const start=Number(state.startEquity||20);return ['📊 PAPER 統計','','交易筆數：'+ts.length,'勝場：'+wins,'敗場：'+losses,'勝率：'+wr.toFixed(1)+'%','累計 PnL：'+(pnl>=0?'+':'')+pnl.toFixed(4)+'U','起始資金：'+start.toFixed(2)+'U','目前資金：'+eq.toFixed(4)+'U','總獲利：+'+gw.toFixed(4)+'U','總虧損：'+gl.toFixed(4)+'U','平均獲利：+'+(wins?gw/wins:0).toFixed(4)+'U','平均虧損：'+(losses?gl/losses:0).toFixed(4)+'U','目前連敗：'+Number(state.consecutiveLosses||0),'停機鎖定：'+(state.halted?'是':'否'),'持倉：'+(state.position?'有':'無'),'','模式：PAPER','','策略：1U / Score≥90 / Model≥75% / Edge≥15% / EV>0 / Model÷Market≥1.50 / Entry 0.25-0.40'].join('\\n');}\nasync function __tgSendStats(){if(!__tgToken||!process.env.TELEGRAM_CHAT_ID)return;await __tgSend(process.env.TELEGRAM_CHAT_ID,__tgStats());}\nif(typeof app!=='undefined'){app.post('/telegram/webhook',async(req,res)=>{try{const msg=req.body&&req.body.message;const chatId=msg&&msg.chat&&msg.chat.id;const text=String(msg&&msg.text||'').trim();if(chatId&&/^\\/(stats|stat|統計)(?:@[^\\s]+)?$/i.test(text))await __tgSend(chatId,__tgStats());else if(chatId&&/^\\/(start|help)(?:@[^\\s]+)?$/i.test(text))await __tgSend(chatId,'OKX Event Bot\\n\\n模式：PAPER（模擬盤）\\n\\n可用指令：\\n/stats\\n/stat\\n/統計');res.sendStatus(200);}catch(e){console.error('[Telegram webhook]',e.message||e);res.sendStatus(200);}});}\n`;
- code=code.replace(listen,startup+webhook+listen);
- const statsMarker='state.position=null;syncAccounting();if(pnl<0){state.consecutiveLosses=Number(state.consecutiveLosses||0)+1;}else if(pnl>0){state.consecutiveLosses=0;}if(state.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+COOLDOWN_MS;console.log(`[RISK] ${state.consecutiveLosses} consecutive NEW losses -> 30m cooldown`);}saveState();';
- const statsReplacement=statsMarker+'\nif(!LIVE_TRADING){__tgSendStats().then(()=>console.log(\'[Telegram stats] auto sent after EXIT\')).catch(e=>console.error(\'[Telegram stats] send failed\',e.message||e));}\n';
- if(!code.includes(statsMarker))throw Error('[Runner] stats insertion marker not found');code=code.replace(statsMarker,statsReplacement);
- console.log('[Runner] PAPER ONLY');
- console.log('[Runner] Strategy: 1U / Score>=90 / Model>=75% / Edge>=15% / EV>0 / Model÷Market>=1.50 / Entry 0.25-0.40');
- console.log('[Runner] Risk: 3 NEW consecutive losses -> 30 minute cooldown -> hard timer auto resume');
- console.log('[Runner] Historical trades are ignored for cooldown after restart.');
- console.log('[Runner] Telegram: auto PAPER stats after every EXIT + /stats command.');
- const m=new Module(source,module);m.filename=source;m.paths=Module._nodeModulePaths(__dirname);m._compile(code,source);
+  let code=fs.readFileSync(source,'utf8');
+
+  // Runner-level safety overrides only. Strategy/risk logic remains in event-bot.js.
+  code=code.replace(/const\s+LIVE_TRADING\s*=\s*[^;]+;/,'const LIVE_TRADING = false;');
+  code=code.replace(/polling\s*:\s*(true|false)/g,'polling: false');
+
+  // Keep the configured PAPER stake and entry range without depending on exact formatting.
+  code=code.replace(/const\s+TARGET_STAKE\s*=\s*[^;]+;/,'const TARGET_STAKE=1;');
+  code=code.replace(/const\s+MIN_ENTRY_PRICE\s*=\s*[^;]+;/,'const MIN_ENTRY_PRICE=0.25;');
+  code=code.replace(/const\s+MAX_ENTRY_PRICE\s*=\s*[^;]+;/,'const MAX_ENTRY_PRICE=0.40;');
+  code=code.replace(/const\s+MIN_SCORE\s*=\s*[^;]+;/,'const MIN_SCORE=90;');
+  code=code.replace(/const\s+MIN_MODEL_PROB\s*=\s*[^;]+;/,'const MIN_MODEL_PROB=0.75;');
+  code=code.replace(/const\s+MIN_EDGE\s*=\s*[^;]+;/,'const MIN_EDGE=0.15;');
+  code=code.replace(/const\s+MAX_CONSECUTIVE_LOSSES\s*=\s*[^;]+;/,'const MAX_CONSECUTIVE_LOSSES=3;');
+
+  if(!code.includes('const TARGET_STAKE=1;'))throw Error('[Runner] TARGET_STAKE override failed');
+  if(!code.includes('const MIN_ENTRY_PRICE=0.25;'))throw Error('[Runner] MIN_ENTRY_PRICE override failed');
+  if(!code.includes('const MAX_ENTRY_PRICE=0.40;'))throw Error('[Runner] MAX_ENTRY_PRICE override failed');
+  if(!code.includes('const MIN_SCORE=90;'))throw Error('[Runner] MIN_SCORE override failed');
+  if(!code.includes('const MIN_MODEL_PROB=0.75;'))throw Error('[Runner] MIN_MODEL_PROB override failed');
+  if(!code.includes('const MIN_EDGE=0.15;'))throw Error('[Runner] MIN_EDGE override failed');
+  if(!code.includes('const MAX_CONSECUTIVE_LOSSES=3;'))throw Error('[Runner] MAX_CONSECUTIVE_LOSSES override failed');
+
+  console.log('[Runner] PAPER ONLY');
+  console.log('[Runner] Strategy logic loaded directly from event-bot.js');
+  console.log('[Runner] No formula-gate source injection; avoids marker mismatch deployments.');
+  console.log('[Runner] Stake=1U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.40');
+
+  const m=new Module(source,module);
+  m.filename=source;
+  m.paths=Module._nodeModulePaths(__dirname);
+  m._compile(code,source);
 }catch(e){console.error('[Runner Error]',e&&e.stack||e);process.exitCode=1;}
