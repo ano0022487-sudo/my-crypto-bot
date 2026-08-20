@@ -13,14 +13,14 @@ const originalReadFileSync=fs.readFileSync;
 
 fs.readFileSync=function(file,encoding,...rest){
   const result=originalReadFileSync.call(fs,file,encoding,...rest);
-  if(typeof file==='string'&&/event-bot-runner\\.js$/.test(file)&&typeof result==='string'){
+  if(typeof file==='string'&&/event-bot-runner\.js$/.test(file)&&typeof result==='string'){
     return result.replace("code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: true');","code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: false');");
   }
-  if(typeof file==='string'&&/event-bot\\.js$/.test(file)&&typeof result==='string'){
+  if(typeof file==='string'&&/event-bot\.js$/.test(file)&&typeof result==='string'){
     let code=result;
 
     code=code.replace("function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}","function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}");
-    code=code.replace(/function generatedSeries\\(\\)\\{return ASSETS\\.map\\(c=>`\\$\\{c\\}-UPDOWN-15MIN`\\);\\}/,"function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}");
+    code=code.replace(/function generatedSeries\(\)\{return ASSETS\.map\(c=>`\$\{c\}-UPDOWN-15MIN`\);\}/,"function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}");
 
     /* Cache 4H candles while scanning 15m data. */
     code=code.replace(
@@ -29,7 +29,7 @@ fs.readFileSync=function(file,encoding,...rest){
     );
 
     const start=code.indexOf('function modelProbability(');
-    const end=code.indexOf('\\nasync function getEquity(',start);
+    const end=code.indexOf('\nasync function getEquity(',start);
     if(start<0||end<=start)throw new Error('[SAFETY PATCH] modelProbability boundary not found');
     const replacement=`function modelProbability(price,strike,c5,c15){
   const cl5=closes(c5),cl15=closes(c15),cl4=closes(__LAST4H),vol=volumes(c5);
@@ -63,10 +63,6 @@ fs.readFileSync=function(file,encoding,...rest){
 
     /* CORE FORMULA: EV = P / E - 1. P is model probability, E is contract entry. */
     code=code.replace(
-      "const strike=getStrike(inst),model=modelProbability(price,strike,c5,c15),yesEntry=yesAsk,noEntry=1-yesBid;",
-      "const strike=getStrike(inst),model=modelProbability(price,strike,c5,c15),yesEntry=yesAsk,noEntry=1-yesBid;"
-    );
-    code=code.replace(
       "const yesValid=validPrice(yesEntry),noValid=validPrice(noEntry),yesEdge=yesValid?model.upProbability-yesEntry:-Infinity,noEdge=noValid?model.downProbability-noEntry:-Infinity;",
       "const yesValid=validPrice(yesEntry),noValid=validPrice(noEntry),yesEdge=yesValid&&yesEntry>0?model.upProbability/yesEntry-1:-Infinity,noEdge=noValid&&noEntry>0?model.downProbability/noEntry-1:-Infinity;"
     );
@@ -81,7 +77,7 @@ fs.readFileSync=function(file,encoding,...rest){
   if(Number(state.consecutiveLosses)>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+30*60*1000;saveState();console.log('[RISK] 3 consecutive losses; cooldown 30 minutes');return true;}
   return false;
 }`;
-    code=code.replace(/function riskBlocked\\(\\)\\{resetDaily\\(\\);return state\\.halted\\|\\|state\\.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES;\\}/,cooldownPatch);
+    code=code.replace(/function riskBlocked\(\)\{resetDaily\(\);return state\.halted\|\|state\.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES;\}/,cooldownPatch);
     return code;
   }
   return result;
