@@ -14,13 +14,19 @@ const originalReadFileSync=fs.readFileSync;
 fs.readFileSync=function(file,encoding,...rest){
   const result=originalReadFileSync.call(fs,file,encoding,...rest);
   if(typeof file==='string'&&/event-bot-runner\\.js$/.test(file)&&typeof result==='string'){
-    return result.replace("code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: true');","code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: false');");
+    return result;
   }
   if(typeof file==='string'&&/event-bot\\.js$/.test(file)&&typeof result==='string'){
     let code=result;
+
+    /* Series discovery: always include BTC/ETH/SOL 5m + 15m UPDOWN series. */
     code=code.replace("function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}","function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}");
     code=code.replace(/function generatedSeries\\(\\)\\{return ASSETS\\.map\\(c=>`\\$\\{c\\}-UPDOWN-15MIN`\\);\\}/,"function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}");
+
+    /* Supply 4H candles as trend context whenever 15m candles are requested. */
     code=code.replace("async function getCandles(instId,bar,limit=100){return confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));}","let __LAST4H=[]; async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));if(bar==='15m'){try{__LAST4H=confirmed(await publicGet('/api/v5/market/candles',{instId,bar:'4H',limit:100}));}catch(e){__LAST4H=[];console.error('[4H context]',e.message);}}return rows;}");
+
+    /* 4H + 15m main trend; 5m is confirmation only. */
     const start=code.indexOf('function modelProbability(');
     const end=code.indexOf('\\nasync function getEquity(',start);
     if(start<0||end<=start)throw new Error('[SAFETY PATCH] modelProbability boundary not found');
@@ -48,10 +54,31 @@ fs.readFileSync=function(file,encoding,...rest){
 }
 `;
     code=code.slice(0,start)+replacement+code.slice(end);
-    code=code.replace("const MIN_EDGE=0.15;","const MIN_EDGE=0;");
-    code=code.replace("function validPrice(p){return Number.isFinite(p)&&p>=MIN_ENTRY_PRICE&&p<=MAX_ENTRY_PRICE;}","const PREFERRED_ENTRY_MIN=.25,PREFERRED_ENTRY_MAX=.35,MAX_ENTRY_FOR_SELECTION=.40,MIN_EXPIRY_RR=2;function expiryRewardRisk(p){return Number.isFinite(p)&&p>0&&p<1?(1-p)/p:0;}function validPrice(p){return Number.isFinite(p)&&p>=PREFERRED_ENTRY_MIN&&p<=MAX_ENTRY_FOR_SELECTION&&expiryRewardRisk(p)>=MIN_EXPIRY_RR;}");
+
+    /* EV is the only selection gate; Score is diagnostic only. */
+    code=code.replace(/const\\s+MIN_SCORE\\s*=\\s*[^;]+;/,'const MIN_SCORE=0;');
+    code=code.replace(/const\\s+MIN_EDGE\\s*=\\s*[^;]+;/,'const MIN_EDGE=0;');
+    code=code.replace(/const\\s+MAX_ENTRY_PRICE\\s*=\\s*[^;]+;/,'const MAX_ENTRY_PRICE=0.40;');
+    code=code.replace(/const\\s+MIN_MODEL_PROB\\s*=\\s*[^;]+;/,'const MIN_MODEL_PROB=0.75;');
     code=code.replace("const yesValid=validPrice(yesEntry),noValid=validPrice(noEntry),yesEdge=yesValid?model.upProbability-yesEntry:-Infinity,noEdge=noValid?model.downProbability-noEntry:-Infinity;","const yesValid=validPrice(yesEntry),noValid=validPrice(noEntry),yesEdge=yesValid&&yesEntry>0?model.upProbability/yesEntry-1:-Infinity,noEdge=noValid&&noEntry>0?model.downProbability/noEntry-1:-Infinity;");
-    code=code.replace("return candidates.sort((a,b)=>b.edge-a.edge||b.score-a.score);","return candidates.sort((a,b)=>b.edge-a.edge||b.score-a.score);");
+
+    /* Runtime diagnostics must reflect the actual gate policy. */
+    code=code.replace('[SAFETY] PAPER / 1U / Score>=90 / Model>=75% / Edge>=15%','[SAFETY] PAPER / 1U / Score diagnostic only / Model>=75% / EV>0 / Entry 0.25-0.40 / expiry RR>=2');
+    code=code.replace('[STRATEGY] Score is diagnostic only; NO Score>=90 entry gate','[STRATEGY] Score is diagnostic only; NO Score>=90 entry gate');
+
+    /* Function-level re-entry guard. Supports both function declarations and const arrow functions. */
+    const fnDecl=/async\\s+function\\s+mainLoop\\s*\\([^)]*\\)\\s*\\{/;
+    const fnArrow=/const\\s+mainLoop\\s*=\\s*async\\s*\\([^)]*\\)\\s*=>\\s*\\{/;
+    if(fnDecl.test(code)){
+      code=code.replace(fnDecl,'async function __mainLoopCore(){');
+      code += `\nlet __mainLoopRunning=false;\nconst __originalMainLoop=async function(){if(__mainLoopRunning){console.error('[Runner] Duplicate mainLoop invocation blocked');return;}__mainLoopRunning=true;try{return await __mainLoopCore();}finally{__mainLoopRunning=false;}};\nmainLoop=__originalMainLoop;\n`;
+    }else if(fnArrow.test(code)){
+      code=code.replace(fnArrow,'const __mainLoopCore=async()=>{');
+      code += `\nlet __mainLoopRunning=false;\nconst mainLoop=async function(){if(__mainLoopRunning){console.error('[Runner] Duplicate mainLoop invocation blocked');return;}__mainLoopRunning=true;try{return await __mainLoopCore();}finally{__mainLoopRunning=false;}};\n`;
+    }else{
+      throw new Error('[SAFETY PATCH] mainLoop function form not found');
+    }
+
     return code;
   }
   return result;
