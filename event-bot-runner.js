@@ -5,16 +5,12 @@ const Module=require('module');
 const source=path.join(__dirname,'event-bot.js');
 const LOCK='/tmp/okx-event-bot.singleton.lock';
 let fd=null;
-function acquire(){try{fd=fs.openSync(LOCK,'wx');fs.writeFileSync(fd,String(process.pid));const release=()=>{try{if(fd!==null)fs.closeSync(fd)}catch{}try{if(fs.existsSync(LOCK))fs.unlinkSync(LOCK)}catch{}};process.once('exit',release);process.once('SIGTERM',()=>{release();process.exit(0)});process.once('SIGINT',()=>{release();process.exit(0)});console.log('[Runner] Singleton lock acquired pid='+process.pid);return true}catch(e){try{const p=Number(fs.readFileSync(LOCK,'utf8').trim());if(p>0){try{process.kill(p,0);console.error('[Runner] Another bot process is already running pid='+p+'; refusing duplicate startup.');return false}catch{try{fs.unlinkSync(LOCK)}catch{}return acquire()}}}catch{}try{fs.unlinkSync(LOCK)}catch{}return acquire()}}}
+function acquire(){try{fd=fs.openSync(LOCK,'wx');fs.writeFileSync(fd,String(process.pid));const release=()=>{try{if(fd!==null)fs.closeSync(fd)}catch{}try{if(fs.existsSync(LOCK))fs.unlinkSync(LOCK)}catch{}};process.once('exit',release);process.once('SIGTERM',()=>{release();process.exit(0)});process.once('SIGINT',()=>{release();process.exit(0)});console.log('[Runner] Singleton lock acquired pid='+process.pid);return true}catch(e){try{const p=Number(fs.readFileSync(LOCK,'utf8').trim());if(p>0){try{process.kill(p,0);console.error('[Runner] Another bot process is already running pid='+p+'; refusing duplicate startup.');return false}catch{try{fs.unlinkSync(LOCK)}catch{}return acquire()}}}catch{}try{fs.unlinkSync(LOCK)}catch{}return acquire()}}
 if(!acquire()){process.exitCode=0;return;}
 try{
   let code=fs.readFileSync(source,'utf8');
-
-  // Runner-level safety overrides only. Strategy/risk logic remains in event-bot.js.
   code=code.replace(/const\s+LIVE_TRADING\s*=\s*[^;]+;/,'const LIVE_TRADING = false;');
   code=code.replace(/polling\s*:\s*(true|false)/g,'polling: false');
-
-  // Keep the configured PAPER stake and entry range without depending on exact formatting.
   code=code.replace(/const\s+TARGET_STAKE\s*=\s*[^;]+;/,'const TARGET_STAKE=1;');
   code=code.replace(/const\s+MIN_ENTRY_PRICE\s*=\s*[^;]+;/,'const MIN_ENTRY_PRICE=0.25;');
   code=code.replace(/const\s+MAX_ENTRY_PRICE\s*=\s*[^;]+;/,'const MAX_ENTRY_PRICE=0.40;');
@@ -22,7 +18,6 @@ try{
   code=code.replace(/const\s+MIN_MODEL_PROB\s*=\s*[^;]+;/,'const MIN_MODEL_PROB=0.75;');
   code=code.replace(/const\s+MIN_EDGE\s*=\s*[^;]+;/,'const MIN_EDGE=0.15;');
   code=code.replace(/const\s+MAX_CONSECUTIVE_LOSSES\s*=\s*[^;]+;/,'const MAX_CONSECUTIVE_LOSSES=3;');
-
   if(!code.includes('const TARGET_STAKE=1;'))throw Error('[Runner] TARGET_STAKE override failed');
   if(!code.includes('const MIN_ENTRY_PRICE=0.25;'))throw Error('[Runner] MIN_ENTRY_PRICE override failed');
   if(!code.includes('const MAX_ENTRY_PRICE=0.40;'))throw Error('[Runner] MAX_ENTRY_PRICE override failed');
@@ -30,14 +25,9 @@ try{
   if(!code.includes('const MIN_MODEL_PROB=0.75;'))throw Error('[Runner] MIN_MODEL_PROB override failed');
   if(!code.includes('const MIN_EDGE=0.15;'))throw Error('[Runner] MIN_EDGE override failed');
   if(!code.includes('const MAX_CONSECUTIVE_LOSSES=3;'))throw Error('[Runner] MAX_CONSECUTIVE_LOSSES override failed');
-
   console.log('[Runner] PAPER ONLY');
   console.log('[Runner] Strategy logic loaded directly from event-bot.js');
   console.log('[Runner] No formula-gate source injection; avoids marker mismatch deployments.');
   console.log('[Runner] Stake=1U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.40');
-
-  const m=new Module(source,module);
-  m.filename=source;
-  m.paths=Module._nodeModulePaths(__dirname);
-  m._compile(code,source);
+  const m=new Module(source,module);m.filename=source;m.paths=Module._nodeModulePaths(__dirname);m._compile(code,source);
 }catch(e){console.error('[Runner Error]',e&&e.stack||e);process.exitCode=1;}
