@@ -5,7 +5,7 @@ const BASE=String(process.env.OKX_BASE_URL||'https://www.okx.com').replace(/\/$/
 const TG=String(process.env.TELEGRAM_BOT_TOKEN||'').trim().replace(/["']/g,''),CHAT=String(process.env.TELEGRAM_CHAT_ID||'').trim();
 const SYMBOLS=String(process.env.PERP_SYMBOLS||'BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP').split(',').map(x=>x.trim()).filter(Boolean);
 const LOOP=Math.max(15000,Number(process.env.CHECK_INTERVAL||30000));
-const RISK=Math.min(.02,Math.max(.01,Number(process.env.RISK_PCT||.01))),LEV=Math.min(5,Math.max(3,Number(process.env.LEVERAGE||3))),RR=Math.min(3,Math.max(2,Number(process.env.RR||2))),MINP=Math.max(.75,Number(process.env.MIN_BAYES||.75));
+const RISK=Math.min(.02,Math.max(.01,Number(process.env.RISK_PCT||.01))),LEV=Math.min(10,Math.max(3,Number(process.env.LEVERAGE||10))),RR=Math.min(3,Math.max(2,Number(process.env.RR||2))),MINP=Math.max(.75,Number(process.env.MIN_BAYES||.75));
 const PAPER=Number(process.env.PAPER_EQUITY||43),STATE=process.env.PERP_STATE_FILE||path.join(__dirname,'perp-1h-state.json'),COOLDOWN=30*60*1000;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)),q=o=>Object.entries(o).filter(([,v])=>v!==undefined&&v!==null&&v!=='').map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&');
 async function http(c){let e;for(let i=0;i<3;i++)try{return await axios({timeout:15000,...c})}catch(x){e=x;if(i<2)await sleep(400*(i+1))}throw e}
