@@ -93,7 +93,11 @@ app.get('/stats', (req, res) => {
     }
   }
 
-  if (!code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
+  // event-bot.js already owns the Telegram /stats handler. Only inject the
+  // fallback handler when no stats command handler exists, preventing two
+  // replies to a single /stats command.
+  const hasStatsHandler = code.includes('bot.onText(/^\\/(stats|stat|統計)');
+  if (!hasStatsHandler && !code.includes('[Telegram COMMAND HANDLER INSTALLED]')) {
     const handler = `
 /* [Telegram COMMAND HANDLER INSTALLED] */
 if (bot) {
