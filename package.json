@@ -1,8 +1,8 @@
 {
   "name": "okx-event-contract-bot",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
-  "description": "Minimal OKX Event Contract bot with a 1H mathematical trend strategy",
+  "description": "OKX Event Contract bot - single-process 1H mathematical trend strategy",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
