@@ -2,33 +2,34 @@
 
 /* OKX Event Contract launcher / safety patch.
    4H + 15m define the main trend; 5m is an entry confirmation.
-   PAPER risk: 1U stake, 3 consecutive losses -> 30m cooldown. */
+   PAPER risk: 1U stake, 3 consecutive losses -> 30m cooldown.
+   EV strategy: EV = P / Entry - 1. */
 
 require('./runtime-diagnostics.js');
 const fs=require('fs');
-const Module=require('module');
 const path=require('path');
 const source=path.join(__dirname,'event-bot.js');
 const originalReadFileSync=fs.readFileSync;
 
 fs.readFileSync=function(file,encoding,...rest){
   const result=originalReadFileSync.call(fs,file,encoding,...rest);
-  if(typeof file==='string'&&/event-bot-runner\.js$/.test(file)&&typeof result==='string'){
+  if(typeof file==='string'&&/event-bot-runner\\.js$/.test(file)&&typeof result==='string'){
     return result.replace("code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: true');","code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: false');");
   }
-  if(typeof file==='string'&&/event-bot\.js$/.test(file)&&typeof result==='string'){
+  if(typeof file==='string'&&/event-bot\\.js$/.test(file)&&typeof result==='string'){
     let code=result;
-    code=code.replace("function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}","function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}");
-    code=code.replace(/function generatedSeries\(\)\{return ASSETS\.map\(c=>`\$\{c\}-UPDOWN-15MIN`\);\}/,"function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}");
 
-    /* 4H cache is fetched for the same underlying symbol when 15m data is requested. */
+    code=code.replace("function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}","function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}");
+    code=code.replace(/function generatedSeries\\(\\)\\{return ASSETS\\.map\\(c=>`\\$\\{c\\}-UPDOWN-15MIN`\\);\\}/,"function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}");
+
+    /* Cache 4H candles while scanning 15m data. */
     code=code.replace(
       "async function getCandles(instId,bar,limit=100){return confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));}",
       "let __LAST4H=[]; async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));if(bar==='15m'){try{__LAST4H=confirmed(await publicGet('/api/v5/market/candles',{instId,bar:'4H',limit:100}));}catch(e){__LAST4H=[];console.error('[4H context]',e.message);}}return rows;}"
     );
 
     const start=code.indexOf('function modelProbability(');
-    const end=code.indexOf('\nasync function getEquity(',start);
+    const end=code.indexOf('\\nasync function getEquity(',start);
     if(start<0||end<=start)throw new Error('[SAFETY PATCH] modelProbability boundary not found');
     const replacement=`function modelProbability(price,strike,c5,c15){
   const cl5=closes(c5),cl15=closes(c15),cl4=closes(__LAST4H),vol=volumes(c5);
@@ -37,7 +38,6 @@ fs.readFileSync=function(file,encoding,...rest){
   const trend15=e20_15&&e50_15?(e20_15>e50_15?'UP':'DOWN'):null;
   const entry5=e9_5&&e20_5?(e9_5>e20_5?'UP':'DOWN'):null;
   if(!main4h||!trend15||!entry5)return{score:0,upProbability:.5,downProbability:.5,reasons:[],signals:['insufficient multi-timeframe data'],direction:null,atr:a,volumeRatio:1,confirmation:{score:0,bestWeight:0,confidenceGap:0,optionalMissing:['4H/15m/5m data']}};
-  /* 4H + 15m are the hard trend gate. 5m is not a hard gate. */
   if(main4h!==trend15)return{score:0,upProbability:.5,downProbability:.5,reasons:[],signals:['4H/15m conflict: 4H='+main4h+',15m='+trend15+',5m='+entry5],direction:null,atr:a,volumeRatio:1,confirmation:{score:0,bestWeight:0,confidenceGap:0,optionalMissing:['4H/15m direction conflict']}};
   const direction=main4h;
   let score=60;
@@ -57,8 +57,21 @@ fs.readFileSync=function(file,encoding,...rest){
 `;
     code=code.slice(0,start)+replacement+code.slice(end);
 
+    /* Entry constraints remain risk controls; EV is the selection metric. */
+    code=code.replace("const MIN_EDGE=0.15;","const MIN_EDGE=0;");
     code=code.replace("function validPrice(p){return Number.isFinite(p)&&p>=MIN_ENTRY_PRICE&&p<=MAX_ENTRY_PRICE;}","const PREFERRED_ENTRY_MIN=.25,PREFERRED_ENTRY_MAX=.35,MAX_ENTRY_FOR_SELECTION=.40,MIN_EXPIRY_RR=2;function expiryRewardRisk(p){return Number.isFinite(p)&&p>0&&p<1?(1-p)/p:0;}function validPrice(p){return Number.isFinite(p)&&p>=PREFERRED_ENTRY_MIN&&p<=MAX_ENTRY_FOR_SELECTION&&expiryRewardRisk(p)>=MIN_EXPIRY_RR;}");
-    code=code.replace("return candidates.sort((a,b)=>b.edge-a.edge||b.score-a.score);","return candidates.sort((a,b)=>Number(b.entryPx>=PREFERRED_ENTRY_MIN&&b.entryPx<=PREFERRED_ENTRY_MAX)-Number(a.entryPx>=PREFERRED_ENTRY_MIN&&a.entryPx<=PREFERRED_ENTRY_MAX)||expiryRewardRisk(b.entryPx)-expiryRewardRisk(a.entryPx)||b.edge-a.edge||b.score-a.score);");
+
+    /* CORE FORMULA: EV = P / E - 1. P is model probability, E is contract entry. */
+    code=code.replace(
+      "const strike=getStrike(inst),model=modelProbability(price,strike,c5,c15),yesEntry=yesAsk,noEntry=1-yesBid;",
+      "const strike=getStrike(inst),model=modelProbability(price,strike,c5,c15),yesEntry=yesAsk,noEntry=1-yesBid;"
+    );
+    code=code.replace(
+      "const yesValid=validPrice(yesEntry),noValid=validPrice(noEntry),yesEdge=yesValid?model.upProbability-yesEntry:-Infinity,noEdge=noValid?model.downProbability-noEntry:-Infinity;",
+      "const yesValid=validPrice(yesEntry),noValid=validPrice(noEntry),yesEdge=yesValid&&yesEntry>0?model.upProbability/yesEntry-1:-Infinity,noEdge=noValid&&noEntry>0?model.downProbability/noEntry-1:-Infinity;"
+    );
+
+    code=code.replace("return candidates.sort((a,b)=>b.edge-a.edge||b.score-a.score);","return candidates.sort((a,b)=>Number(b.entryPx>=PREFERRED_ENTRY_MIN&&b.entryPx<=PREFERRED_ENTRY_MAX)-Number(a.entryPx>=PREFERRED_ENTRY_MIN&&a.entryPx<=PREFERRED_ENTRY_MAX)||b.edge-a.edge||b.score-a.score);");
 
     const cooldownPatch=`function riskBlocked(){
   resetDaily();
@@ -68,7 +81,7 @@ fs.readFileSync=function(file,encoding,...rest){
   if(Number(state.consecutiveLosses)>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+30*60*1000;saveState();console.log('[RISK] 3 consecutive losses; cooldown 30 minutes');return true;}
   return false;
 }`;
-    code=code.replace(/function riskBlocked\(\)\{resetDaily\(\);return state\.halted\|\|state\.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES;\}/,cooldownPatch);
+    code=code.replace(/function riskBlocked\\(\\)\\{resetDaily\\(\\);return state\\.halted\\|\\|state\\.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES;\\}/,cooldownPatch);
     return code;
   }
   return result;
@@ -76,8 +89,10 @@ fs.readFileSync=function(file,encoding,...rest){
 
 if(!fs.existsSync(source))throw new Error('找不到 event-bot.js: '+source);
 console.log('[SAFETY] PAPER launcher loaded');
+console.log('[STRATEGY] EV = P / Entry - 1');
+console.log('[STRATEGY] EV > 0 = positive expectation; selection uses highest EV');
 console.log('[SAFETY] Trend gate: 4H + 15m; 5m is entry confirmation, not hard gate');
-console.log('[SAFETY] 1U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.40 / expiry RR>=2');
+console.log('[SAFETY] 1U / Score>=90 / Model>=75% / EV>0 / Entry 0.25-0.40 / expiry RR>=2');
 console.log('[SAFETY] 3 consecutive losses -> 30 minute cooldown');
 
 require('./event-bot-runner.js');
