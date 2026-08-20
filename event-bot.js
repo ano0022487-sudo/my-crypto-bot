@@ -1,6 +1,6 @@
 'use strict';
 
-/* OKX EVENT CONTRACT SNR BOT - FIXED 5U / ONE ENTRY PER EVENT */
+/* OKX EVENT CONTRACT SNR BOT - PAPER ACCOUNTING / RISK FIX */
 const express=require('express');
 const axios=require('axios');
 const crypto=require('crypto');
@@ -19,18 +19,18 @@ const TG_TOKEN=String(process.env.TELEGRAM_BOT_TOKEN||'').trim().replace(/[\"']/
 const TG_CHAT=String(process.env.TELEGRAM_CHAT_ID||'').trim();
 const CHECK_INTERVAL=Number(process.env.CHECK_INTERVAL||15000);
 const POSITION_CHECK_INTERVAL=Number(process.env.POSITION_CHECK_INTERVAL||5000);
-const START_CAPITAL=Number(process.env.START_CAPITAL||20);
+const START_CAPITAL=20;
 const TARGET_STAKE=1;
-const MIN_EDGE=Number(process.env.MIN_EDGE||0.10);
-const MIN_SCORE=Number(process.env.MIN_SCORE||85);
-const MIN_MODEL_PROB=Number(process.env.MIN_MODEL_PROB||0.70);
+const MIN_EDGE=0.15;
+const MIN_SCORE=90;
+const MIN_MODEL_PROB=0.75;
 const MIN_ENTRY_PRICE=0.25;
-const MAX_ENTRY_PRICE=0.35;
+const MAX_ENTRY_PRICE=0.45;
 const EARLY_TP_PCT=Number(process.env.EARLY_TP_PCT||0.30);
 const EARLY_SL_PCT=Number(process.env.EARLY_SL_PCT||0.25);
 const MIN_MINUTES_TO_EXPIRY=Number(process.env.MIN_MINUTES_TO_EXPIRY||2);
 const MAX_MINUTES_TO_EXPIRY=Number(process.env.MAX_MINUTES_TO_EXPIRY||20);
-const DAILY_LOSS_PCT=Number(process.env.DAILY_LOSS_PCT||0.20);
+const DAILY_LOSS_PCT=0.10;
 const MAX_CONSECUTIVE_LOSSES=3;
 const COOLDOWN_MS=30*60*1000;
 const EVENT_SERIES=String(process.env.EVENT_SERIES||'').trim();
@@ -49,17 +49,32 @@ function sign(ts,method,rp,body){return crypto.createHmac('sha256',SECRET_KEY).u
 async function privateRequest(method,rp,bodyObj=null){if(!API_KEY||!SECRET_KEY||!PASSPHRASE)throw new Error('OKX API credentials missing');const ts=new Date().toISOString();const body=bodyObj?JSON.stringify(bodyObj):'';const headers={'OK-ACCESS-KEY':API_KEY,'OK-ACCESS-SIGN':sign(ts,method,rp,body),'OK-ACCESS-TIMESTAMP':ts,'OK-ACCESS-PASSPHRASE':PASSPHRASE,'Content-Type':'application/json'};const r=await request({method,url:`${BASE_URL}${rp}`,data:body||undefined,headers});if(!r.data||String(r.data.code)!=='0')throw new Error(`OKX private ${r.status}: ${JSON.stringify(r.data)}`);return Array.isArray(r.data.data)?r.data.data:[];}
 
 function freshState(){return{day:new Date().toISOString().slice(0,10),startEquity:START_CAPITAL,paperEquity:START_CAPITAL,realizedPnl:0,consecutiveLosses:0,halted:false,cooldownUntil:0,lastTradeAt:0,position:null,trades:[],usedEvents:[]};}
-function loadState(){try{if(!fs.existsSync(BOT_STATE_FILE))return freshState();const d=JSON.parse(fs.readFileSync(BOT_STATE_FILE,'utf8'));return{...freshState(),...d,usedEvents:Array.isArray(d.usedEvents)?d.usedEvents:[]};}catch(e){console.error('[State load]',e.message);return freshState();}}
+function loadState(){try{if(!fs.existsSync(BOT_STATE_FILE))return freshState();const d=JSON.parse(fs.readFileSync(BOT_STATE_FILE,'utf8'));return{...freshState(),...d,usedEvents:Array.isArray(d.usedEvents)?d.usedEvents:[],trades:Array.isArray(d.trades)?d.trades:[]};}catch(e){console.error('[State load]',e.message);return freshState();}}
 const state=loadState();
 function saveState(){try{fs.writeFileSync(BOT_STATE_FILE,JSON.stringify(state,null,2),'utf8');}catch(e){console.error('[State save]',e.message);}}
-function resetDaily(){const today=new Date().toISOString().slice(0,10);if(state.day!==today){state.day=today;state.startEquity=LIVE_TRADING?0:Number(state.paperEquity||START_CAPITAL);state.realizedPnl=0;state.consecutiveLosses=0;state.halted=false;state.cooldownUntil=0;saveState();}}
+function syncAccounting(){
+  const trades=Array.isArray(state.trades)?state.trades:[];
+  const pnl=trades.reduce((s,t)=>s+Number(t&&t.pnl||0),0);
+  let losses=0;
+  for(let i=trades.length-1;i>=0;i--){const p=Number(trades[i]&&trades[i].pnl||0);if(p<0)losses++;else if(p>0)break;}
+  state.startEquity=START_CAPITAL;
+  state.realizedPnl=Number(pnl.toFixed(4));
+  state.consecutiveLosses=losses;
+  if(!LIVE_TRADING){const expected=Number((START_CAPITAL+pnl).toFixed(4));if(!Number.isFinite(Number(state.paperEquity))||Math.abs(Number(state.paperEquity)-expected)>0.0001)state.paperEquity=Math.max(0,expected);}
+}
+function resetDaily(){
+  const today=new Date().toISOString().slice(0,10);
+  syncAccounting();
+  if(state.day!==today){state.day=today;state.halted=false;state.cooldownUntil=0;saveState();}
+}
 function riskBlocked(){
   resetDaily();
   const now=Date.now();
   if(Number(state.cooldownUntil||0)>0){
     if(now>=Number(state.cooldownUntil)){state.cooldownUntil=0;state.halted=false;state.consecutiveLosses=0;saveState();console.log('[RISK] 30-minute cooldown complete; trading resumed');}
-    else return true;
+    else {state.halted=true;saveState();return true;}
   }
+  syncAccounting();
   if(state.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=now+COOLDOWN_MS;saveState();console.log('[RISK] 3 consecutive losses; cooldown 30 minutes');return true;}
   if(state.halted){state.halted=false;saveState();}
   return false;
@@ -145,34 +160,25 @@ async function scanCandidates(){
 function calcOrderSize(price,inst){const lot=Math.max(Number(inst.lotSz||0.1),0.1),min=Math.max(Number(inst.minSz||lot),lot);let sz=Math.floor((TARGET_STAKE/price)/lot)*lot;if(sz<min)sz=min;return Number(sz.toFixed(8));}
 async function placeEventOrder(candidate){const inst=candidate.inst,tick=Number(inst.tickSz||0.001),px=roundToTick(candidate.entryPx,tick),sz=calcOrderSize(px,inst),actualStake=px*sz;console.log('[ORDER SIZE]',JSON.stringify({targetStake:TARGET_STAKE,entryPx:px,lotSz:Number(inst.lotSz||0.1),minSz:Number(inst.minSz||0.1),contracts:sz,actualStake}));const body={instId:inst.instId,tdMode:'isolated',ccy:'USDT',side:'buy',ordType:'ioc',px:px.toFixed(6),sz:String(sz),outcome:candidate.side,clOrdId:`snr${Date.now().toString(36)}`.slice(0,32)};if(!LIVE_TRADING)return{ordId:`SIM-${Date.now()}`,state:'filled',avgPx:px,accFillSz:sz,simulated:true,body};const rows=await privateRequest('POST','/api/v5/trade/order',body),result=rows?.[0];console.log('[ENTRY ORDER RESPONSE]',JSON.stringify(result));if(!result||String(result.sCode)!=='0')throw new Error(`Order rejected: ${JSON.stringify(result)}`);if(!result.ordId)return result;await sleep(700);const filled=await getOrder(inst.instId,result.ordId);console.log('[ENTRY ORDER STATE]',JSON.stringify(filled));return{...result,...filled};}
 async function getOrder(instId,ordId){const rows=await privateRequest('GET',`/api/v5/trade/order?${q({instId,ordId})}`);return rows?.[0]||null;}
-async function closePosition(position,currentPx){const inst=position.inst,tick=Number(inst.tickSz||0.001),px=roundToTick(currentPx,tick),sz=Number(position.sz);if(!(sz>0))throw new Error(`Invalid close size: ${sz}`);const body={instId:inst.instId,tdMode:'isolated',ccy:'USDT',side:'sell',ordType:'ioc',px:px.toFixed(6),sz:String(sz),outcome:position.side,clOrdId:`exit${Date.now().toString(36)}`.slice(0,32)};if(!LIVE_TRADING)return{state:'filled',avgPx:px,accFillSz:sz,pnl:(px-position.entryPx)*sz,simulated:true};const rows=await privateRequest('POST','/api/v5/trade/order',body),r=rows?.[0];if(!r||String(r.sCode)!=='0')throw new Error(`Exit rejected: ${JSON.stringify(r)}`);if(r.ordId){await sleep(700);const filled=await getOrder(inst.instId,r.ordId);return{...r,...filled};}return r;}
+async function closePosition(position,currentPx){const inst=position.inst,tick=Number(inst.tickSz||0.001),px=roundToTick(currentPx,tick),sz=Number(position.sz);if(!(sz>0))throw new Error(`Invalid close size: ${sz}`);const body={instId:inst.instId,tdMode:'isolated',ccy:'USDT',side:'sell',ordType:'ioc',px:px.toFixed(6),sz:String(sz),outcome:position.side,clOrdId:`exit${Date.now().toString(36)}`.slice(0,32)};if(!LIVE_TRADING)return{state:'filled',avgPx:px,accFillSz:sz,simulated:true};const rows=await privateRequest('POST','/api/v5/trade/order',body),r=rows?.[0];if(!r||String(r.sCode)!=='0')throw new Error(`Exit rejected: ${JSON.stringify(r)}`);if(r.ordId){await sleep(700);const filled=await getOrder(inst.instId,r.ordId);return{...r,...filled};}return r;}
 
 async function managePosition(){if(!state.position)return;const p=state.position;try{const t=await getTicker(p.inst.instId,'EVENTS'),bid=Number(t?.bidPx||t?.last),ask=Number(t?.askPx||t?.last);if(!(bid>0))return;const current=p.side==='yes'?bid:1-(ask>0?ask:bid);if(!(current>0&&current<1))return;const change=(current-p.entryPx)/p.entryPx;if(change>=EARLY_TP_PCT)return exitPosition(p,current,'TP');if(change<=-EARLY_SL_PCT)return exitPosition(p,current,'SL');}catch(e){console.error('[EVENT POSITION MANAGER]',e.message);}}
 function calcTradePnl(side,entryPx,exitPx,sz){const delta=side==='yes'?exitPx-entryPx:entryPx-exitPx;return Number((delta*sz).toFixed(4));}
-async function exitPosition(position,currentPx,reason){const result=await closePosition(position,currentPx);const exitPx=Number(result?.avgPx||result?.fillPx||currentPx),pnl=result?.forcedClear?0:calcTradePnl(position.side,position.entryPx,exitPx,position.sz);state.realizedPnl=Number((state.realizedPnl+pnl).toFixed(4));if(!LIVE_TRADING)state.paperEquity=Math.max(0,Number((Number(state.paperEquity||START_CAPITAL)+pnl).toFixed(4)));state.consecutiveLosses=pnl<0?state.consecutiveLosses+1:0;state.trades.push({at:new Date().toISOString(),instId:position.inst.instId,side:position.side,entryPx:position.entryPx,exitPx,sz:position.sz,pnl,reason});if(state.trades.length>200)state.trades.shift();state.position=null;if(state.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+COOLDOWN_MS;}saveState();await notify(`${pnl>=0?'🟢':'🔴'} EVENT EXIT\
-${position.inst.instId}\
-${position.side.toUpperCase()}\
-Reason ${reason}\
-Entry ${position.entryPx.toFixed(4)}\
-Exit ${exitPx.toFixed(4)}\
-Contracts ${position.sz}\
-PnL ${pnl>=0?'+':''}${pnl.toFixed(4)}U\
-${LIVE_TRADING?'LIVE':'PAPER'}`);}
+async function exitPosition(position,currentPx,reason){const result=await closePosition(position,currentPx);const exitPx=Number(result?.avgPx||result?.fillPx||currentPx),pnl=calcTradePnl(position.side,position.entryPx,exitPx,position.sz);state.trades.push({at:new Date().toISOString(),instId:position.inst.instId,side:position.side,entryPx:position.entryPx,exitPx,sz:position.sz,pnl,reason});if(state.trades.length>200)state.trades.shift();state.position=null;syncAccounting();if(state.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+COOLDOWN_MS;}saveState();await notify(`${pnl>=0?'🟢':'🔴'} EVENT EXIT\n${position.inst.instId}\n${position.side.toUpperCase()}\nReason ${reason}\nEntry ${position.entryPx.toFixed(4)}\nExit ${exitPx.toFixed(4)}\nContracts ${position.sz}\nPnL ${pnl>=0?'+':''}${pnl.toFixed(4)}U\n${LIVE_TRADING?'LIVE':'PAPER'}`);}
 
-async function maybeTrade(){if(riskBlocked()||state.position)return;let equity;try{equity=await getEquity();}catch(e){console.error('[EQUITY]',e.message);return;}if(!state.startEquity){state.startEquity=equity;saveState();}const dailyStart=Number(state.startEquity||START_CAPITAL);if(state.realizedPnl<=-(dailyStart*DAILY_LOSS_PCT)){state.halted=true;state.cooldownUntil=Date.now()+COOLDOWN_MS;saveState();await notify(`⛔ EVENT BOT DAILY LOSS LOCK\
-PnL ${state.realizedPnl.toFixed(4)}U`);return;}let candidates;try{candidates=await scanCandidates();}catch(e){console.error('[SCAN ERROR]',e.message);return;}console.log(`[SCAN RESULT] candidates=${candidates.length}`);if(!candidates.length){console.log('[SCAN] no candidates passed all filters');return;}const c=candidates[0];markEventUsed(c.inst.instId);console.log('[EVENT LOCK]',c.inst.instId);try{const order=await placeEventOrder(c,equity);const fillSz=Number(order?.accFillSz||order?.fillSz||0);const avgPx=Number(order?.avgPx||order?.fillPx||0);if(!(fillSz>0&&avgPx>0)){console.log('[EVENT NO FILL]',JSON.stringify({instId:c.inst.instId,state:order?.state||'unknown',accFillSz:fillSz}));return;}const stake=Number((avgPx*fillSz).toFixed(4));state.position={inst:c.inst,seriesId:c.seriesId,coin:c.coin,side:c.side,sz:fillSz,entryPx:avgPx,stake,score:c.score,edge:c.edge,modelProb:c.modelProb,marketProb:c.marketProb,underlyingPrice:c.underlyingPrice,openedAt:Date.now()};state.lastTradeAt=Date.now();saveState();await notify(`🟡 EVENT ENTRY\
-${c.inst.instId}\
-${c.side.toUpperCase()}\
-Entry ${avgPx.toFixed(4)}\
-Contracts ${fillSz}\
-Actual ${stake.toFixed(4)}U\
-Score ${c.score}\
-Model ${(c.modelProb*100).toFixed(1)}%\
-Edge ${(c.edge*100).toFixed(1)}%\
-${LIVE_TRADING?'LIVE':'PAPER'}`);}catch(e){console.error('[EVENT ORDER ERROR]',e.message);}}
+async function maybeTrade(){if(riskBlocked()||state.position)return;const equity=await getEquity();const dailyStart=START_CAPITAL;if(state.realizedPnl<=-(dailyStart*DAILY_LOSS_PCT)){state.halted=true;state.cooldownUntil=Date.now()+COOLDOWN_MS;saveState();await notify(`⛔ EVENT BOT DAILY LOSS LOCK\nPnL ${state.realizedPnl.toFixed(4)}U`);return;}let candidates;try{candidates=await scanCandidates();}catch(e){console.error('[SCAN ERROR]',e.message);return;}console.log(`[SCAN RESULT] candidates=${candidates.length}`);if(!candidates.length){console.log('[SCAN] no candidates passed all filters');return;}const c=candidates[0];markEventUsed(c.inst.instId);console.log('[EVENT LOCK]',c.inst.instId);try{const order=await placeEventOrder(c,equity);const fillSz=Number(order?.accFillSz||order?.fillSz||0);const avgPx=Number(order?.avgPx||order?.fillPx||0);if(!(fillSz>0&&avgPx>0)){console.log('[EVENT NO FILL]',JSON.stringify({instId:c.inst.instId,state:order?.state||'unknown',accFillSz:fillSz}));return;}const stake=Number((avgPx*fillSz).toFixed(4));state.position={inst:c.inst,seriesId:c.seriesId,coin:c.coin,side:c.side,sz:fillSz,entryPx:avgPx,stake,score:c.score,edge:c.edge,modelProb:c.modelProb,marketProb:c.marketProb,underlyingPrice:c.underlyingPrice,openedAt:Date.now()};state.lastTradeAt=Date.now();saveState();await notify(`🟡 EVENT ENTRY\n${c.inst.instId}\n${c.side.toUpperCase()}\nEntry ${avgPx.toFixed(4)}\nContracts ${fillSz}\nActual ${stake.toFixed(4)}U\nScore ${c.score}\nModel ${(c.modelProb*100).toFixed(1)}%\nEdge ${(c.edge*100).toFixed(1)}%\n${LIVE_TRADING?'LIVE':'PAPER'}`);}catch(e){console.error('[EVENT ORDER ERROR]',e.message);}}
 
+function stats(){syncAccounting();const trades=Array.isArray(state.trades)?state.trades:[];const wins=trades.filter(t=>Number(t.pnl)>0).length;const losses=trades.filter(t=>Number(t.pnl)<0).length;const pnl=trades.reduce((s,t)=>s+Number(t.pnl||0),0);const grossWin=trades.filter(t=>Number(t.pnl)>0).reduce((s,t)=>s+Number(t.pnl),0);const grossLoss=trades.filter(t=>Number(t.pnl)<0).reduce((s,t)=>s+Number(t.pnl),0);return{tradeCount:trades.length,wins,losses,winRate:trades.length?wins/trades.length*100:0,pnl:Number(pnl.toFixed(4)),startCapital:START_CAPITAL,paperEquity:Number(state.paperEquity||START_CAPITAL),grossWin:Number(grossWin.toFixed(4)),grossLoss:Number(grossLoss.toFixed(4)),avgWin:wins?Number((grossWin/wins).toFixed(4)):0,avgLoss:losses?Number((grossLoss/losses).toFixed(4)):0,consecutiveLosses:Number(state.consecutiveLosses||0),halted:Boolean(state.halted),cooldownUntil:Number(state.cooldownUntil||0),position:Boolean(state.position)};}
+app.get('/stats',(req,res)=>{try{res.json({ok:true,mode:'PAPER',...stats()});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 app.get('/',(req,res)=>res.json({ok:true,bot:'OKX Event Contract Bot (1U)',live:LIVE_TRADING,position:state.position,usedEvents:state.usedEvents.length}));
 app.get('/health',(req,res)=>res.json({ok:true,live:LIVE_TRADING,time:new Date().toISOString(),position:!!state.position}));
+
+if(bot){
+  const sendStats=async chatId=>{try{const s=stats();const nl=String.fromCharCode(10);const text=['📊 PAPER 統計','','交易筆數：'+s.tradeCount,'勝場：'+s.wins,'敗場：'+s.losses,'勝率：'+s.winRate.toFixed(1)+'%','累計 PnL：'+(s.pnl>=0?'+':'')+s.pnl.toFixed(4)+'U','起始資金：'+s.startCapital.toFixed(2)+'U','目前資金：'+s.paperEquity.toFixed(4)+'U','總獲利：+'+s.grossWin.toFixed(4)+'U','總虧損：'+s.grossLoss.toFixed(4)+'U','平均獲利：+'+s.avgWin.toFixed(4)+'U','平均虧損：'+s.avgLoss.toFixed(4)+'U','目前連敗：'+s.consecutiveLosses,'停機鎖定：'+(s.halted?'是':'否'),'持倉：'+(s.position?'有':'無'),'','模式：PAPER','','策略：1U / Score≥90 / Model≥75% / Edge≥15% / Entry 0.25-0.45'].join(nl);await bot.sendMessage(chatId,text);}catch(e){console.error('[Telegram stats]',e.message);}};
+  bot.onText(/^\/(stats|stat|統計)(?:@[^\s]+)?$/i,msg=>{const chatId=String(msg?.chat?.id||'').trim();if(chatId)sendStats(chatId);});
+}
+
+syncAccounting();saveState();
 let loopRunning=false;async function mainLoop(){if(loopRunning)return;loopRunning=true;try{resetDaily();await managePosition();if(!state.position)await maybeTrade();}catch(e){console.error('[EVENT MAIN LOOP]',e.message||e);}finally{loopRunning=false;}}
 app.listen(PORT,()=>console.log(`OKX EVENT CONTRACT BOT RUNNING ON PORT ${PORT}`));
 setInterval(mainLoop,CHECK_INTERVAL);setInterval(managePosition,POSITION_CHECK_INTERVAL);mainLoop().catch(e=>console.error('[EVENT INITIAL LOOP]',e));
