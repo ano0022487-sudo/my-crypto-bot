@@ -5,7 +5,7 @@
   - PAPER only
   - Telegram polling enabled once
   - Bayesian calibration loaded once
-  - Prevent duplicate 15s main-loop timers inside one Node process
+  - Prevent duplicate main-loop execution inside one Node process
   - No fragile formula-marker replacement
 */
 const fs = require('fs');
@@ -62,13 +62,13 @@ try {
   code = code.replace(/const\s+LIVE_TRADING\s*=\s*[^;]+;/, 'const LIVE_TRADING = false;');
   code = code.replace(/polling\s*:\s*(true|false)/g, 'polling: true');
 
-  /* Keep the configured risk/selection gates deterministic. */
+  /* Selection policy: EV is the primary gate. Score is diagnostic only. */
   code = code.replace(/const\s+TARGET_STAKE\s*=\s*[^;]+;/, 'const TARGET_STAKE=1;');
   code = code.replace(/const\s+MIN_ENTRY_PRICE\s*=\s*[^;]+;/, 'const MIN_ENTRY_PRICE=0.25;');
   code = code.replace(/const\s+MAX_ENTRY_PRICE\s*=\s*[^;]+;/, 'const MAX_ENTRY_PRICE=0.40;');
-  code = code.replace(/const\s+MIN_SCORE\s*=\s*[^;]+;/, 'const MIN_SCORE=90;');
+  code = code.replace(/const\s+MIN_SCORE\s*=\s*[^;]+;/, 'const MIN_SCORE=0;');
   code = code.replace(/const\s+MIN_MODEL_PROB\s*=\s*[^;]+;/, 'const MIN_MODEL_PROB=0.75;');
-  code = code.replace(/const\s+MIN_EDGE\s*=\s*[^;]+;/, 'const MIN_EDGE=0.15;');
+  code = code.replace(/const\s+MIN_EDGE\s*=\s*[^;]+;/, 'const MIN_EDGE=0;');
   code = code.replace(/const\s+MAX_CONSECUTIVE_LOSSES\s*=\s*[^;]+;/, 'const MAX_CONSECUTIVE_LOSSES=3;');
 
   /* One Bayesian path only: final model probability is for the selected side. */
@@ -79,31 +79,39 @@ try {
   code = code.replace('const state=loadState();', 'const state=loadState();' + bayesInject);
 
   /*
-     The log showed two mainLoop starts at the same millisecond.
-     Deduplicate only the 15s scan timer. Keep the 5s position timer intact.
+     Runtime showed two mainLoop starts at the same millisecond.
+     A timer guard alone is insufficient because the source can invoke
+     mainLoop directly as well as through an interval. Guard the function
+     itself so overlapping/repeated invocations cannot scan twice.
   */
-  const realSetInterval = global.setInterval;
-  let scanTimerCreated = false;
-  global.setInterval = function guardedSetInterval(fn, delay, ...args) {
-    const ms = Number(delay);
-    if (ms === CHECK_MS) {
-      if (scanTimerCreated) {
-        console.error('[Runner] Duplicate scan timer blocked delay=' + ms + 'ms');
-        return { unref() {}, ref() {}, hasRef() { return false; } };
-      }
-      scanTimerCreated = true;
-      console.log('[Runner] Main scan timer registered once delay=' + ms + 'ms');
-    }
-    return realSetInterval(fn, delay, ...args);
-  };
+  const mainMarker = 'async function mainLoop() {';
+  if (!code.includes(mainMarker)) throw new Error('[Runner] mainLoop marker not found');
+  code = code.replace(mainMarker, `async function __mainLoopCore() {`);
+  const mainGuard = `
+let __mainLoopRunning=false;
+async function mainLoop(){
+  if(__mainLoopRunning){
+    console.error('[Runner] Duplicate mainLoop invocation blocked');
+    return;
+  }
+  __mainLoopRunning=true;
+  try{return await __mainLoopCore();}
+  finally{__mainLoopRunning=false;}
+}
+`;
+  const intervalMarker = /\n\s*mainLoop\(\);/;
+  const intervalMatch = code.match(intervalMarker);
+  if (!intervalMatch) throw new Error('[Runner] mainLoop startup marker not found');
+  code = code.replace(intervalMarker, mainGuard + '\n  mainLoop();');
 
   console.log('[Runner] PAPER ONLY');
-  console.log('[Runner] Strategy source: event-bot.js');
+  console.log('[Runner] Strategy: EV = P / Entry - 1; Score diagnostic only');
+  console.log('[Runner] Gates: Model>=75% / EV>0 / Entry 0.25-0.40 / expiry RR>=2');
   console.log('[Runner] Bayesian: technical evidence + empirical prior + market calibration');
-  console.log('[Runner] Risk: 1U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.40');
-  console.log('[Runner] Trend: 4H+15m main trend / 5m confirmation when supplied by launcher');
+  console.log('[Runner] Risk: 1U / 3 consecutive losses -> 30 minute cooldown');
+  console.log('[Runner] Trend: 4H+15m main trend / 5m confirmation');
   console.log('[Runner] Telegram: POLLING / singleton protected');
-  console.log('[Runner] Timer guard: duplicate 15s scan loops blocked');
+  console.log('[Runner] MainLoop guard: duplicate invocations blocked');
 
   const m = new Module(source, module);
   m.filename = source;
