@@ -126,9 +126,15 @@ function modelProbability(price,strike,c5,c15){
   const resistance=nearestAbove([...p5.resistance,...p15.resistance],price);
   if(resistance&&price>=resistance*0.999){if(up>=down){up+=8;upReasons.push('SNR resistance test');}else{down+=8;downReasons.push('SNR resistance test');}}
   if(strike&&a&&a>0){const dist=(price-strike)/a;if(dist>=0.75){up+=17;upReasons.push('strike distance');signals.push(`strike +${dist.toFixed(2)} ATR`);}else if(dist<=-0.75){down+=17;downReasons.push('strike distance');signals.push(`strike ${dist.toFixed(2)} ATR`);}}
-  const direction=up>=down?'UP':'DOWN',best=direction==='UP'?up:down,opposing=direction==='UP'?down:up,confidenceGap=Math.max(0,best-opposing),score=Math.round(Math.min(100,50+best*0.95+Math.min(10,confidenceGap*0.10))),probUp=Math.min(0.94,Math.max(0.06,0.50+(up-down)*0.0065)),reasons=direction==='UP'?upReasons:downReasons,optionalMissing=[];
+  const direction=up>=down?'UP':'DOWN',best=direction==='UP'?up:down,opposing=direction==='UP'?down:up,confidenceGap=Math.max(0,best-opposing),score=Math.round(Math.min(100,50+best*0.95+Math.min(10,confidenceGap*0.10))),reasons=direction==='UP'?upReasons:downReasons,optionalMissing=[];
   if(r===null)optionalMissing.push('RSI');if(vr<1.15)optionalMissing.push('volume');if(!resistance)optionalMissing.push('SNR');
-  return{score,upProbability:probUp,downProbability:1-probUp,reasons,signals,direction,atr:a,volumeRatio:vr,confirmation:{score,bestWeight:best,confidenceGap,optionalMissing}};
+  const bayesLR={'5m trend':1.35,'15m trend':1.55,'RSI':1.20,'volume':1.15,'SNR resistance test':1.10,'strike distance':1.25};
+  let posteriorOdds=1;
+  for(const reason of reasons)posteriorOdds*=Number(bayesLR[reason]||1);
+  const bayesianProbability=Math.min(0.94,Math.max(0.06,posteriorOdds/(1+posteriorOdds)));
+  const probUp=direction==='UP'?bayesianProbability:1-bayesianProbability;
+  signals.push(`Bayes posterior ${(bayesianProbability*100).toFixed(1)}%`);
+  return{score,upProbability:probUp,downProbability:1-probUp,reasons,signals,direction,atr:a,volumeRatio:vr,bayesianProbability,confirmation:{score,bestWeight:best,confidenceGap,optionalMissing}};
 }
 
 async function getEquity(){if(!LIVE_TRADING)return Math.max(0,Number(state.paperEquity||START_CAPITAL));const rows=await privateRequest('GET','/api/v5/account/balance?ccy=USDT');const d=rows?.[0]?.details?.find(x=>x.ccy==='USDT');const eq=Number(d?.eq),av=Number(d?.availBal);if(Number.isFinite(eq)&&eq>0)return eq;if(Number.isFinite(av)&&av>0)return av;throw new Error('Unable to read USDT equity');}
@@ -144,14 +150,14 @@ async function scanCandidates(){
     const {c5,c15}=cache[coin];if(!c5.length||!c15.length)continue;
     const t=await getTicker(inst.instId,'EVENTS'),yesAsk=Number(t?.askPx||t?.last),yesBid=Number(t?.bidPx||t?.last);if(!(yesAsk>0&&yesBid>0&&yesAsk<1&&yesBid>0))continue;
     const price=Number(c5.at(-1)?.[4]);if(!Number.isFinite(price))continue;
-    const strike=getStrike(inst),model=modelProbability(price,strike,c5,c15),yesEntry=yesAsk,noEntry=1-yesBid;
+    const strike=getStrike(inst),marketYesProb=Math.min(0.99,Math.max(0.01,yesAsk)),marketNoProb=Math.min(0.99,Math.max(0.01,1-yesBid)),model=modelProbability(price,strike,c5,c15),yesEntry=yesAsk,noEntry=1-yesBid;
     const yesValid=validPrice(yesEntry),noValid=validPrice(noEntry),yesEdge=yesValid?model.upProbability-yesEntry:-Infinity,noEdge=noValid?model.downProbability-noEntry:-Infinity;
     if(!Number.isFinite(yesEdge)&&!Number.isFinite(noEdge))continue;
-    const side=yesEdge>=noEdge?'yes':'no',entryPx=side==='yes'?yesEntry:noEntry,modelProb=side==='yes'?model.upProbability:model.downProbability,edge=side==='yes'?yesEdge:noEdge,mins=minutesToExpiry(inst);
-    let reject=null;if(model.score<MIN_SCORE)reject=`score ${model.score}<${MIN_SCORE}`;else if(modelProb<MIN_MODEL_PROB)reject=`model ${(modelProb*100).toFixed(1)}%<${MIN_MODEL_PROB*100}%`;else if(edge<MIN_EDGE)reject=`edge ${(edge*100).toFixed(1)}%<${MIN_EDGE*100}%`;
-    if(reject){console.log('[EVENT REJECT]',JSON.stringify({instId:inst.instId,reason:reject,side,score:model.score,model:Number((modelProb*100).toFixed(1)),market:Number((entryPx*100).toFixed(1)),edge:Number((edge*100).toFixed(1)),mins:Number(mins?.toFixed(1)),confirmation:model.confirmation,signals:model.signals}));continue;}
-    candidates.push({inst,seriesId:inst.seriesId,coin,underlying,side,entryPx,modelProb,marketProb:entryPx,edge,score:model.score,reasons:model.reasons,signals:model.signals,confirmation:model.confirmation,strikePx:strike,underlyingPrice:price,expiry:getExpiry(inst),minutesToExpiry:mins,atr:model.atr});
-    console.log('[EVENT PASS]',JSON.stringify({instId:inst.instId,side,entryPx,score:model.score,model:Number((modelProb*100).toFixed(1)),edge:Number((edge*100).toFixed(1)),reasons:model.reasons,signals:model.signals}));
+    const side=yesEdge>=noEdge?'yes':'no',entryPx=side==='yes'?yesEntry:noEntry,modelProb=side==='yes'?model.upProbability:model.downProbability,edge=side==='yes'?yesEdge:noEdge,marketProb=side==='yes'?marketYesProb:marketNoProb,mins=minutesToExpiry(inst);
+    let reject=null;if(model.score<MIN_SCORE)reject=`score ${model.score}<${MIN_SCORE}`;else if(modelProb<MIN_MODEL_PROB)reject=`bayes ${(modelProb*100).toFixed(1)}%<${MIN_MODEL_PROB*100}%`;else if(edge<MIN_EDGE)reject=`bayes edge ${(edge*100).toFixed(1)}%<${MIN_EDGE*100}%`;
+    if(reject){console.log('[EVENT REJECT]',JSON.stringify({instId:inst.instId,reason:reject,side,score:model.score,model:Number((modelProb*100).toFixed(1)),market:Number((marketProb*100).toFixed(1)),edge:Number((edge*100).toFixed(1)),mins:Number(mins?.toFixed(1)),confirmation:model.confirmation,signals:model.signals}));continue;}
+    candidates.push({inst,seriesId:inst.seriesId,coin,underlying,side,entryPx,modelProb,marketProb,edge,score:model.score,reasons:model.reasons,signals:model.signals,confirmation:model.confirmation,strikePx:strike,underlyingPrice:price,expiry:getExpiry(inst),minutesToExpiry:mins,atr:model.atr});
+    console.log('[EVENT PASS]',JSON.stringify({instId:inst.instId,side,entryPx,score:model.score,model:Number((modelProb*100).toFixed(1)),market:Number((marketProb*100).toFixed(1)),bayesEdge:Number((edge*100).toFixed(1)),reasons:model.reasons,signals:model.signals}));
   }catch(e){console.error(`[EVENT CANDIDATE ERROR] ${inst.instId}:`,e.message);}}
   console.log(`[SCAN DIAGNOSTICS] filtered=${filtered.length} passed=${candidates.length}`);
   return candidates.sort((a,b)=>entryPriority(b.entryPx)-entryPriority(a.entryPx)||b.edge-a.edge||b.score-a.score);
