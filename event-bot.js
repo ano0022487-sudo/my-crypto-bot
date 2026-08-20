@@ -1,127 +1,19 @@
-// PURE-1H-BAYESIAN + HALF-KELLY VERSION
-// Strategy: 1H conditional probability + Bayes theorem + EV + half-Kelly sizing.
-// Technical indicators removed: RSI, MACD, EMA, Bollinger, SNR, volume and multi-timeframe gates.
-// Existing discovery/execution infrastructure must remain intact; only scoring/sizing is replaced.
-
 'use strict';
-
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
-const TelegramBot = require('node-telegram-bot-api');
-
-const PORT = Number(process.env.PORT || 10000);
-const MODE = String(process.env.TRADING_MODE || 'PAPER').toUpperCase();
-const TIMEFRAME = '1H';
-const MIN_PROB = 0.75;
-const MIN_ENTRY = 0.25;
-const MAX_ENTRY = 0.40;
-const MIN_EV = 0;
-const HALF_KELLY = 0.5;
-const MIN_STAKE = 0.01;
-const COOLDOWN_MS = 30 * 60 * 1000;
-const STATE_FILE = path.join(__dirname, 'bot-state.json');
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '';
-
-let state = loadState();
-let loopRunning = false;
-let cooldownUntil = 0;
-
-function loadState() {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
-  catch (_) { return { trades: [], usedEvents: [], balance: 20, wins: 0, losses: 0, pnl: 0, consecutiveLosses: 0 }; }
-}
-function saveState() { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
-function log(msg, obj) { console.log(obj === undefined ? msg : `${msg} ${JSON.stringify(obj)}`); }
-
-// Bayes: P(UP|X)=P(X|UP)P(UP)/[P(X|UP)P(UP)+P(X|DOWN)P(DOWN)]
-// EV = P(win)/Entry - 1
-function mean(xs) { return xs.length ? xs.reduce((a,b)=>a+b,0)/xs.length : 0; }
-function stdev(xs,m) { if(xs.length<2)return 1e-8; return Math.max(Math.sqrt(xs.reduce((a,x)=>a+(x-m)**2,0)/xs.length),1e-8); }
-function normalPdf(x,m,s) { const sd=Math.max(s,1e-8); const z=(x-m)/sd; return Math.exp(-0.5*z*z)/(sd*Math.sqrt(2*Math.PI)); }
-function bayesProbability(returns) {
-  const r=(returns||[]).filter(Number.isFinite); if(r.length<20)return {probability:0.5,prior:0.5};
-  const up=r.filter(x=>x>0), down=r.filter(x=>x<=0);
-  const priorUp=(up.length+1)/(r.length+2), priorDown=1-priorUp;
-  const muUp=mean(up), muDown=mean(down), sdUp=stdev(up,muUp), sdDown=stdev(down,muDown), x=r[r.length-1];
-  const lu=normalPdf(x,muUp,sdUp), ld=normalPdf(x,muDown,sdDown), den=lu*priorUp+ld*priorDown;
-  return { probability:den>0?(lu*priorUp)/den:priorUp, prior:priorUp, likelihoodUp:lu, likelihoodDown:ld, evidence:x };
-}
-
-// Standard Kelly for binary contract with entry price c:
-// b=(1-c)/c, q=1-p, fKelly=(b*p-q)/b = (p-c)/(1-c).
-// Half-Kelly fraction = 0.5*fKelly.
-function halfKellyFraction(probability, entry) {
-  const p=Number(probability), c=Number(entry);
-  if(!Number.isFinite(p)||!Number.isFinite(c)||c<=0||c>=1||p<=c) return 0;
-  const b=(1-c)/c;
-  const q=1-p;
-  const fullKelly=(b*p-q)/b;
-  return Math.max(0, HALF_KELLY*fullKelly);
-}
-
-function calculateStake(bankroll, probability, entry) {
-  const balance=Math.max(0, Number(bankroll)||0);
-  const fraction=halfKellyFraction(probability,entry);
-  const rawStake=balance*fraction;
-  const stake=Math.max(0, Math.min(balance, Math.floor(rawStake*100)/100));
-  return { bankroll:balance, fraction, rawStake, stake };
-}
-
-// The model expects each 1H candidate to expose returns1h, yesPrice and noPrice.
-// targetStake is the mathematical stake for the existing execution layer to consume.
-function score1hBayesian(ev) {
-  if(!ev || ev.timeframe !== TIMEFRAME) return null;
-  const b=bayesProbability(ev.returns1h);
-  const yes=Number(ev.yesPrice), no=Number(ev.noPrice);
-  const side=b.probability>=0.5?'yes':'no';
-  const p=side==='yes'?b.probability:1-b.probability;
-  const entry=side==='yes'?yes:no;
-  if(!(entry>=MIN_ENTRY&&entry<=MAX_ENTRY)||p<MIN_PROB)return null;
-  const EV=p/entry-1;
-  if(!(EV>MIN_EV))return null;
-
-  const bankroll=Number.isFinite(Number(ev.bankroll)) ? Number(ev.bankroll) : Number(state.balance || 20);
-  const sizing=calculateStake(bankroll,p,entry);
-  if(sizing.stake < MIN_STAKE) return null;
-
-  return {
-    ...ev,
-    side,
-    entryPx:entry,
-    modelProb:p,
-    ev:EV,
-    bayes:b,
-    score:EV,
-    bankroll:sizing.bankroll,
-    kellyFraction:sizing.fraction*2,
-    halfKellyFraction:sizing.fraction,
-    targetStake:sizing.stake
-  };
-}
-
-function statsText(){
- const t=Array.isArray(state.trades)?state.trades:[];
- const w=t.filter(x=>String(x.result).toUpperCase()==='WIN').length;
- const l=t.filter(x=>String(x.result).toUpperCase()==='LOSS').length;
- const pnl=t.reduce((s,x)=>s+Number(x.pnl||0),0);
- const balance=Number(state.balance||20);
- return `📊 PAPER 統計\n\n交易筆數：${t.length}\n勝場：${w}\n敗場：${l}\n勝率：${t.length?(w/t.length*100).toFixed(2):'0.00'}%\n累計 PnL：${pnl.toFixed(4)}U\n目前資金：${balance.toFixed(4)}U\n策略：純 1H Bayesian + Half-Kelly\nP(UP|X)=P(X|UP)P(UP)/P(X)\nEV=P/Entry-1\nStake=Bankroll×Half-Kelly`;
-}
-
-const app=express();
-app.get('/',(_,res)=>res.json({ok:true,mode:MODE,strategy:'PURE-1H-BAYESIAN-HALF-KELLY',trades:state.trades.length,balance:Number(state.balance||20)}));
-app.listen(PORT,()=>log(`[HTTP] listening on ${PORT}`));
-
-if(TOKEN){
- const bot=new TelegramBot(TOKEN,{polling:true});
- bot.onText(/^\/start$/,m=>bot.sendMessage(m.chat.id,'✅ OKX Event Contract Bot\n模式：PAPER\n策略：純 1H Bayesian + Half-Kelly\n資金配置：Half-Kelly'));
- bot.onText(/^\/stats$/,m=>bot.sendMessage(m.chat.id,statsText()));
- bot.onText(/^\/status$/,m=>bot.sendMessage(m.chat.id,`🟢 RUNNING\nMode: ${MODE}\nStrategy: PURE-1H-BAYESIAN-HALF-KELLY\nTrades: ${state.trades.length}\nBankroll: ${Number(state.balance||20).toFixed(4)}U\nCooldown: ${Date.now()<cooldownUntil?'YES':'NO'}`));
- bot.onText(/^\/trades$/,m=>{const a=state.trades.slice(-10).reverse();bot.sendMessage(m.chat.id,a.length?a.map((x,i)=>`${i+1}. ${x.instId||x.symbol||'-'} ${x.result||'-'} PnL=${Number(x.pnl||0).toFixed(4)}U`).join('\n'):'目前沒有交易資料。');});
- bot.onText(/^\/help$/,m=>bot.sendMessage(m.chat.id,'/start\n/stats\n/status\n/trades\n/help'));
- bot.on('polling_error',e=>console.error('[TELEGRAM ERROR]',e.message));
- log('[TELEGRAM] polling enabled');
-} else log('[TELEGRAM] token missing; notifications disabled');
-
-module.exports={score1hBayesian,bayesProbability,halfKellyFraction,calculateStake,statsText,saveState,loadState};
+const express=require('express');const axios=require('axios');const crypto=require('crypto');const fs=require('fs');const path=require('path');const TelegramBot=require('node-telegram-bot-api');
+const app=express();const PORT=Number(process.env.PORT||10000);const LIVE=String(process.env.LIVE_TRADING||'false').toLowerCase()==='true';const BASE_URL=String(process.env.OKX_BASE_URL||'https://www.okx.com').replace(/\/$/,'');const API_KEY=String(process.env.OK_ACCESS_KEY||'').trim();const API_SECRET=String(process.env.OK_ACCESS_SECRET||'').trim();const PASSPHRASE=String(process.env.OKX_PASSPHRASE||'').trim();const TG_TOKEN=String(process.env.TELEGRAM_BOT_TOKEN||'').trim().replace(/[\"']/g,'');const TG_CHAT_ID=String(process.env.TELEGRAM_CHAT_ID||'').trim();
+const LOOP_MS=Math.max(10000,Number(process.env.CHECK_INTERVAL||15000));const POSITION_MS=Math.max(3000,Number(process.env.POSITION_CHECK_INTERVAL||5000));const START_CAPITAL=20,MIN_PROB=.75,MIN_PRICE=.25,MAX_PRICE=.40,HALF_KELLY=.5,MIN_STAKE=.01,MAX_LOSSES=3,COOLDOWN_MS=1800000,DAILY_LOSS_LIMIT=.10,TAKE_PROFIT=Number(process.env.EARLY_TP_PCT||.30),STOP_LOSS=Number(process.env.EARLY_SL_PCT||.25);const STATE_FILE=process.env.BOT_STATE_FILE||path.join(__dirname,'bot-state.json');const ASSETS=['BTC','ETH','SOL'];const UNDERLYING={BTC:'BTC-USDT-SWAP',ETH:'ETH-USDT-SWAP',SOL:'SOL-USDT-SWAP'};const telegram=TG_TOKEN?new TelegramBot(TG_TOKEN,{polling:false}):null;
+const log=(t,v)=>console.log(v===undefined?t:t+' '+(typeof v==='string'?v:JSON.stringify(v)));const sleep=ms=>new Promise(r=>setTimeout(r,ms));const q=p=>Object.entries(p).filter(([,v])=>v!==undefined&&v!==null&&v!=='').map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+async function http(c,retries=3){let last;for(let i=0;i<retries;i++){try{return await axios({timeout:15000,...c});}catch(e){last=e;if(i<retries-1)await sleep(400*(i+1));}}throw last;}async function publicGet(ep,params={}){const qs=q(params),r=await http({method:'GET',url:`${BASE_URL}${ep}${qs?'?'+qs:''}`});if(!r.data||String(r.data.code)!=='0')throw new Error(`OKX public ${r.status}: ${JSON.stringify(r.data)}`);return Array.isArray(r.data.data)?r.data.data:[];}function sign(ts,m,rp,b){return crypto.createHmac('sha256',API_SECRET).update(ts+m.toUpperCase()+rp+b).digest('base64');}async function privateRequest(m,rp,obj=null){if(!API_KEY||!API_SECRET||!PASSPHRASE)throw new Error('OKX credentials missing');const ts=new Date().toISOString(),b=obj?JSON.stringify(obj):'',h={'OK-ACCESS-KEY':API_KEY,'OK-ACCESS-SIGN':sign(ts,m,rp,b),'OK-ACCESS-TIMESTAMP':ts,'OK-ACCESS-PASSPHRASE':PASSPHRASE,'Content-Type':'application/json'},r=await http({method:m,url:BASE_URL+rp,data:b||undefined,headers:h});if(!r.data||String(r.data.code)!=='0')throw new Error(`OKX private ${r.status}: ${JSON.stringify(r.data)}`);return Array.isArray(r.data.data)?r.data.data:[];}
+function freshState(){return{day:new Date().toISOString().slice(0,10),paperEquity:START_CAPITAL,realizedPnl:0,consecutiveLosses:0,cooldownUntil:0,halted:false,position:null,usedEvents:[],trades:[]};}function loadState(){try{if(!fs.existsSync(STATE_FILE))return freshState();const s=JSON.parse(fs.readFileSync(STATE_FILE,'utf8'));return{...freshState(),...s,usedEvents:Array.isArray(s.usedEvents)?s.usedEvents:[],trades:Array.isArray(s.trades)?s.trades:[]};}catch(e){return freshState();}}const state=loadState();function saveState(){try{const t=STATE_FILE+'.tmp';fs.writeFileSync(t,JSON.stringify(state,null,2));fs.renameSync(t,STATE_FILE);}catch(e){console.error('[STATE SAVE]',e.message);}}function recalc(){let pnl=0,l=0;for(const t of state.trades)pnl+=Number(t.pnl||0);for(let i=state.trades.length-1;i>=0;i--){const p=Number(state.trades[i].pnl||0);if(p<0)l++;else if(p>0)break;}state.realizedPnl=Number(pnl.toFixed(4));state.consecutiveLosses=l;if(!LIVE)state.paperEquity=Number(Math.max(0,START_CAPITAL+pnl).toFixed(4));}function riskBlocked(){recalc();const n=Date.now();if(state.cooldownUntil){if(n<state.cooldownUntil){state.halted=true;return true;}state.cooldownUntil=0;state.halted=false;state.consecutiveLosses=0;}if(state.consecutiveLosses>=MAX_LOSSES){state.cooldownUntil=n+COOLDOWN_MS;state.halted=true;saveState();return true;}if(state.realizedPnl<=-(START_CAPITAL*DAILY_LOSS_LIMIT)){state.halted=true;saveState();return true;}state.halted=false;return false;}function used(id){return state.usedEvents.includes(id);}function mark(id){if(!used(id)){state.usedEvents.push(id);if(state.usedEvents.length>2000)state.usedEvents=state.usedEvents.slice(-2000);saveState();}}
+function confirmed(a){return a.slice().sort((x,y)=>Number(x[0])-Number(y[0])).filter(x=>String(x[8])==='1');}async function candles(id,bar,limit=100){return confirmed(await publicGet('/api/v5/market/candles',{instId:id,bar,limit}));}async function ticker(id){const a=await publicGet('/api/v5/market/ticker',{instId:id,instType:'EVENTS'});return a[0]||null;}function mean(a){return a.length?a.reduce((s,x)=>s+x,0)/a.length:0;}function sd(a,m){return a.length<2?1e-8:Math.max(Math.sqrt(a.reduce((s,x)=>s+(x-m)**2,0)/a.length),1e-8);}function pdf(x,m,s){const d=Math.max(s,1e-8),z=(x-m)/d;return Math.exp(-.5*z*z)/(d*Math.sqrt(2*Math.PI));}
+function bayes1H(rows){const p=rows.map(x=>Number(x[4])).filter(Number.isFinite);if(p.length<25)return null;const r=[];for(let i=1;i<p.length;i++)if(p[i]>0&&p[i-1]>0)r.push(Math.log(p[i]/p[i-1]));if(r.length<20)return null;const up=r.filter(x=>x>0),down=r.filter(x=>x<=0),prior=(up.length+1)/(r.length+2),x=r[r.length-1],lu=pdf(x,mean(up),sd(up,mean(up))),ld=pdf(x,mean(down),sd(down,mean(down))),den=lu*prior+ld*(1-prior),pu=den>0?lu*prior/den:prior,dir=pu>=.5?'UP':'DOWN';return{direction:dir,pUp:pu,probability:dir==='UP'?pu:1-pu,priorUp:prior,likelihoodUp:lu,likelihoodDown:ld};}
+function asset(i){const s=`${i.instId||''} ${i.seriesId||''} ${i.baseCcy||''}`.toUpperCase();return ASSETS.find(a=>s.includes(a))||null;}function updown(i){return`${i.instId||''} ${i.seriesId||''}`.toUpperCase().includes('UPDOWN');}function duration(i){const s=`${i.instId||''} ${i.seriesId||''}`.toUpperCase();return s.includes('5MIN')?5:s.includes('15MIN')?15:null;}function expiry(i){for(const k of ['expTime','expiryTime','endTime']){const n=Number(i[k]);if(Number.isFinite(n)&&n>0)return n;}const m=String(i.instId||'').match(/-(\d{6})-(\d{4})-(\d{4})$/);return m?Date.UTC(2000+Number(m[1].slice(0,2)),Number(m[1].slice(2,4))-1,Number(m[1].slice(4,6)),Number(m[3].slice(0,2)),Number(m[3].slice(2,4))):NaN;}function mins(i){const e=expiry(i);return Number.isFinite(e)?(e-Date.now())/60000:NaN;}function priceOK(x){return Number.isFinite(x)&&x>=MIN_PRICE&&x<=MAX_PRICE;}function roundPx(x,t){t=Number(t);if(!(t>0))return Number(x.toFixed(6));const d=Math.max(0,(String(t).split('.')[1]||'').length);return Number((Math.round(x/t)*t).toFixed(d));}
+function halfKelly(p,c){if(!(p>c&&c>0&&c<1))return 0;const b=(1-c)/c,q=1-p;return Math.max(0,HALF_KELLY*((b*p-q)/b));}function sizing(bank,p,c){const f=halfKelly(p,c),raw=Math.max(0,Number(bank)||0)*f;return{bankroll:Number(bank)||0,halfKelly:f,rawStake:raw,stake:Math.max(0,Math.min(Number(bank)||0,Math.floor(raw*100)/100))};}function orderSize(stake,price,i){const lot=Math.max(Number(i.lotSz||.1),.1),min=Math.max(Number(i.minSz||lot),lot);let z=Math.floor(stake/price/lot)*lot;if(z<min)z=min;return Number(z.toFixed(8));}
+function series(){const x=String(process.env.EVENT_SERIES||'').split(',').map(s=>s.trim()).filter(Boolean);return x.length?x:ASSETS.flatMap(a=>[`${a}-UPDOWN-5MIN`,`${a}-UPDOWN-15MIN`]);}async function discover(){const out=[];for(const s of series()){try{for(const i of await publicGet('/api/v5/public/instruments',{instType:'EVENTS',seriesId:s}))out.push({...i,seriesId:i.seriesId||s});}catch(e){console.error('[DISCOVERY]',s,e.message);}}return out;}
+async function scan(){const all=await discover(),f=all.filter(i=>asset(i)&&updown(i)&&[5,15].includes(duration(i))&&(!i.state||String(i.state).toLowerCase()==='live')&&!used(i.instId)&&mins(i)>=2&&mins(i)<=20);log('[SCAN]',{instruments:all.length,filtered:f.length});const cache={},out=[];for(const i of f){try{const a=asset(i);if(!cache[a])cache[a]=await candles(UNDERLYING[a],'1H',100);const m=bayes1H(cache[a]);if(!m||m.probability<MIN_PROB)continue;const t=await ticker(i.instId),ask=Number(t?.askPx||t?.last),bid=Number(t?.bidPx||t?.last);if(!(ask>0&&ask<1&&bid>0&&bid<1))continue;const side=m.direction==='UP'?'yes':'no',entry=side==='yes'?ask:1-bid;if(!priceOK(entry))continue;const ev=m.probability/entry-1;if(!(ev>0))continue;const sz=sizing(state.paperEquity,m.probability,entry);if(sz.stake<MIN_STAKE)continue;out.push({inst:i,asset:a,duration:duration(i),side,entry,ev,model:m,sizing:sz,mins:mins(i)});log('[EVENT PASS]',{instId:i.instId,duration:duration(i),side,entryPx:Number(entry.toFixed(4)),prob:Number((m.probability*100).toFixed(1)),EV:Number((ev*100).toFixed(1)),halfKelly:Number((sz.halfKelly*100).toFixed(2)),stake:sz.stake});}catch(e){console.error('[CANDIDATE]',i.instId,e.message);}}return out.sort((a,b)=>b.ev-a.ev||b.model.probability-a.model.probability);}
+async function getOrder(id,oid){const a=await privateRequest('GET',`/api/v5/trade/order?${q({instId:id,ordId:oid})}`);return a[0]||null;}async function place(c){const i=c.inst,px=roundPx(c.entry,Number(i.tickSz||.001)),sz=orderSize(c.sizing.stake,px,i),actual=Number((px*sz).toFixed(6));log('[ORDER SIZE]',{bankroll:c.sizing.bankroll,probability:c.model.probability,entryPx:px,halfKelly:c.sizing.halfKelly,targetStake:c.sizing.stake,contracts:sz,actualStake:actual});if(!LIVE)return{avgPx:px,accFillSz:sz,ordId:`PAPER-${Date.now()}`};const body={instId:i.instId,tdMode:'isolated',side:'buy',ordType:'ioc',px:px.toFixed(6),sz:String(sz),outcome:c.side,ccy:'USDT',clOrdId:`evt${Date.now().toString(36)}`.slice(0,32)},r=(await privateRequest('POST','/api/v5/trade/order',body))[0];if(!r||String(r.sCode)!=='0'||!r.ordId)throw new Error(`Order rejected: ${JSON.stringify(r)}`);await sleep(500);return{...r,...(await getOrder(i.instId,r.ordId))};}
+function calcPnl(side,entry,exit,size){return Number(((side==='yes'?exit-entry:entry-exit)*size).toFixed(4));}async function closePos(p,exit,reason){const i=p.inst,px=roundPx(exit,Number(i.tickSz||.001));let r;if(!LIVE)r={avgPx:px};else{const body={instId:i.instId,tdMode:'isolated',side:'sell',ordType:'ioc',px:px.toFixed(6),sz:String(p.size),outcome:p.side,ccy:'USDT',clOrdId:`exit${Date.now().toString(36)}`.slice(0,32)};r=(await privateRequest('POST','/api/v5/trade/order',body))[0];if(!r||String(r.sCode)!=='0')throw new Error(`Exit rejected: ${JSON.stringify(r)}`);}const ex=Number(r.avgPx||r.fillPx||px),profit=calcPnl(p.side,p.entryPx,ex,p.size);state.trades.push({at:new Date().toISOString(),instId:i.instId,side:p.side,entryPx:p.entryPx,exitPx:ex,size:p.size,pnl:profit,reason,probability:p.probability,ev:p.ev,stake:p.stake,halfKelly:p.halfKelly,duration:p.duration});state.position=null;recalc();if(state.consecutiveLosses>=MAX_LOSSES)state.cooldownUntil=Date.now()+COOLDOWN_MS;saveState();await notify(`${profit>=0?'🟢':'🔴'} EVENT EXIT\n${i.instId}\n${p.side.toUpperCase()}\nEntry ${p.entryPx.toFixed(4)}\nExit ${ex.toFixed(4)}\nStake ${p.stake.toFixed(2)}U\nPnL ${profit>=0?'+':''}${profit.toFixed(4)}U\n${reason}\n${LIVE?'LIVE':'PAPER'}`);}
+async function manage(){const p=state.position;if(!p)return;try{const t=await ticker(p.inst.instId),bid=Number(t?.bidPx||t?.last),ask=Number(t?.askPx||t?.last);if(!(bid>0&&bid<1))return;const cur=p.side==='yes'?bid:1-(ask>0?ask:bid),chg=(cur-p.entryPx)/p.entryPx;if(chg>=TAKE_PROFIT)return closePos(p,cur,'TP');if(chg<=-STOP_LOSS)return closePos(p,cur,'SL');}catch(e){console.error('[POSITION]',e.message);}}
+function notify(text){if(!telegram||!TG_CHAT_ID)return Promise.resolve();return telegram.sendMessage(TG_CHAT_ID,text).catch(e=>console.error('[TELEGRAM]',e.message));}function entryMsg(c,fill,size){return['🟡 EVENT ENTRY',c.inst.instId,c.side.toUpperCase(),`Duration ${c.duration}M`,`Entry ${fill.toFixed(4)}`,`Contracts ${size}`,`Stake ${c.sizing.stake.toFixed(2)}U`,`1H Direction ${c.model.direction}`,`Bayesian ${(c.model.probability*100).toFixed(1)}%`,`EV ${(c.ev*100).toFixed(1)}%`,`Half-Kelly ${(c.sizing.halfKelly*100).toFixed(2)}%`,`Expiry ${c.mins.toFixed(1)}m`,LIVE?'LIVE':'PAPER'].join('\n');}async function trade(c){if(riskBlocked()||state.position)return;mark(c.inst.instId);const r=await place(c),fill=Number(r.avgPx||r.fillPx||c.entry),size=Number(r.accFillSz||r.fillSz||orderSize(c.sizing.stake,fill,c.inst));if(!(size>0))throw new Error('zero fill');state.position={inst:c.inst,side:c.side,entryPx:fill,size,openedAt:Date.now(),probability:c.model.probability,ev:c.ev,stake:c.sizing.stake,halfKelly:c.sizing.halfKelly,duration:c.duration};saveState();await notify(entryMsg(c,fill,size));}
+let busy=false,started=false,loopTimer=null,posTimer=null;async function mainLoop(){if(busy){log('[LOOP]','duplicate invocation blocked');return;}busy=true;try{log('[HEARTBEAT]',new Date().toISOString());if(riskBlocked()||state.position)return;const c=await scan();log('[SCAN RESULT]',`candidates=${c.length}`);if(c.length)await trade(c[0]);}catch(e){console.error('[MAIN LOOP]',e.stack||e.message||e);}finally{busy=false;}}
+function stats(){recalc();const w=state.trades.filter(t=>Number(t.pnl)>0).length,l=state.trades.filter(t=>Number(t.pnl)<0).length;return`📊 PAPER 統計\n\n交易筆數：${state.trades.length}\n勝場：${w}\n敗場：${l}\n勝率：${state.trades.length?(w/state.trades.length*100).toFixed(1):'0.0'}%\n累計 PnL：${state.realizedPnl>=0?'+':''}${state.realizedPnl.toFixed(4)}U\n目前資金：${state.paperEquity.toFixed(4)}U\n連敗：${state.consecutiveLosses}\n策略：1H Bayesian → 5M/15M Event\n資金：Half-Kelly`;}function start(){if(started)return;started=true;log('[START]',`mode=${LIVE?'LIVE':'PAPER'} strategy=1H-BAYESIAN-DIRECTION events=5M/15M sizing=HALF-KELLY`);log('[SAFETY]',`P>=${MIN_PROB*100}% EV>0 Entry=${MIN_PRICE}-${MAX_PRICE} 3-loss-cooldown=30m`);app.get('/',(_,r)=>r.json({ok:true,mode:LIVE?'LIVE':'PAPER',strategy:'1H-BAYESIAN-DIRECTION',events:['5M','15M'],sizing:'HALF-KELLY',trades:state.trades.length,balance:state.paperEquity}));app.get('/health',(_,r)=>r.json({ok:true,mode:LIVE?'LIVE':'PAPER',strategy:'1H-BAYESIAN-DIRECTION',events:['5M','15M'],position:Boolean(state.position),trades:state.trades.length,balance:state.paperEquity}));app.listen(PORT,()=>log('[HTTP]',`listening on ${PORT}`));void mainLoop();loopTimer=setInterval(()=>void mainLoop(),LOOP_MS);posTimer=setInterval(()=>void manage(),POSITION_MS);}process.on('SIGTERM',()=>{if(loopTimer)clearInterval(loopTimer);if(posTimer)clearInterval(posTimer);process.exit(0);});process.on('SIGINT',()=>{if(loopTimer)clearInterval(loopTimer);if(posTimer)clearInterval(posTimer);process.exit(0);});start();
