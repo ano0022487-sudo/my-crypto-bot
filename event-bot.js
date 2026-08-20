@@ -1,11 +1,12 @@
 'use strict';
 
 /*
- * OKX Event Contract Bot — clean rebuild
+ * OKX Event Contract Bot — pure 1H mathematical strategy
  *
- * One process, one start(), one main loop.
- * Strategy: 1H mathematical trend model.
- * Default: PAPER / 1U / BTC ETH SOL / 5m + 15m UPDOWN events.
+ * Signal source: ONLY confirmed 1H candles of the underlying asset.
+ * No RSI / MACD / EMA / Bollinger / SNR / volume / multi-timeframe indicators.
+ * Event contracts may be 5m or 15m; their entry direction comes only from the 1H model.
+ * Default: PAPER / 1U / BTC ETH SOL.
  */
 
 const express = require('express');
@@ -31,9 +32,8 @@ const LOOP_MS = Math.max(10000, Number(process.env.CHECK_INTERVAL || 15000));
 const POSITION_MS = Math.max(3000, Number(process.env.POSITION_CHECK_INTERVAL || 5000));
 const STAKE = 1;
 const START_CAPITAL = 20;
-const MIN_SCORE = 90;
 const MIN_PROB = 0.75;
-const MIN_EDGE = 0.15;
+const MIN_EV = 0;
 const MIN_PRICE = 0.25;
 const MAX_PRICE = 0.40;
 const MIN_EXPIRY_MIN = 2;
@@ -245,38 +245,48 @@ function closePrices(rows) {
   return rows.map(r => Number(r[4])).filter(Number.isFinite);
 }
 
-/* Weighted 1H log-return model. Probability is deliberately bounded. */
+/*
+ * Pure 1H mathematical model:
+ * r_t = ln(P_t / P_{t-1})
+ * mu_w = sum(w_t * r_t) / sum(w_t)
+ * sigma = sample standard deviation of r_t
+ * z = mu_w / sigma
+ * P(UP) = 0.5 + 0.5 * tanh(1.35 * z)
+ * EV = P / Entry - 1
+ */
 function mathModel(rows) {
   const prices = closePrices(rows);
-  if (prices.length < 12) return null;
+  if (prices.length < 20) return null;
+
   const returns = [];
   for (let i = 1; i < prices.length; i++) {
-    if (prices[i] > 0 && prices[i - 1] > 0) returns.push(Math.log(prices[i] / prices[i - 1]));
+    if (prices[i] > 0 && prices[i - 1] > 0) {
+      returns.push(Math.log(prices[i] / prices[i - 1]));
+    }
   }
-  if (returns.length < 10) return null;
+  if (returns.length < 19) return null;
+
   const sample = returns.slice(-48);
   let weightSum = 0;
-  let weighted = 0;
+  let weightedReturn = 0;
   for (let i = 0; i < sample.length; i++) {
     const w = i + 1;
     weightSum += w;
-    weighted += sample[i] * w;
+    weightedReturn += sample[i] * w;
   }
+
+  const mu = weightedReturn / weightSum;
   const mean = sample.reduce((a, b) => a + b, 0) / sample.length;
-  const variance = sample.reduce((s, x) => s + (x - mean) ** 2, 0) / Math.max(1, sample.length - 1);
+  const variance = sample.reduce((sum, x) => sum + (x - mean) ** 2, 0) / Math.max(1, sample.length - 1);
   const sigma = Math.sqrt(variance);
   if (!(sigma > 0)) return null;
-  const z = (weighted / weightSum) / sigma;
+
+  const z = mu / sigma;
   const pUp = 0.5 + 0.5 * Math.tanh(1.35 * z);
   const direction = pUp >= 0.5 ? 'UP' : 'DOWN';
   const probability = direction === 'UP' ? pUp : 1 - pUp;
-  return {
-    direction,
-    probability,
-    score: Math.round(probability * 100),
-    z,
-    sigma
-  };
+
+  return { direction, probability, z, sigma, mu };
 }
 
 function assetFrom(inst) {
@@ -350,10 +360,10 @@ async function scan() {
     const asset = assetFrom(inst);
     return asset && isUpDown(inst) && (!inst.state || String(inst.state).toLowerCase() === 'live') && validExpiry(inst) && !eventUsed(inst.instId);
   });
-  log('[SCAN]', { instruments: instruments.length, filtered: filtered.length });
+  log('[SCAN]', { instruments: instruments.length, filtered: filtered.length, timeframe: '1H' });
+
   const cache = {};
   const candidates = [];
-
   for (const inst of filtered) {
     try {
       const asset = assetFrom(inst);
@@ -368,27 +378,22 @@ async function scan() {
 
       const side = model.direction === 'UP' ? 'yes' : 'no';
       const entry = side === 'yes' ? ask : 1 - bid;
-      const edge = model.probability - entry;
       if (!priceValid(entry)) continue;
-      if (model.score < MIN_SCORE || model.probability < MIN_PROB || edge < MIN_EDGE) continue;
+
+      const ev = model.probability / entry - 1;
+      if (model.probability < MIN_PROB || ev <= MIN_EV) continue;
 
       const mins = minutesToExpiry(inst);
-      candidates.push({
-        inst,
-        asset,
-        side,
-        entry,
-        edge,
-        model,
-        mins
-      });
-      log('[EVENT PASS]', {
+      candidates.push({ inst, asset, side, entry, ev, model, mins });
+      log('[MATH PASS]', {
         instId: inst.instId,
         side,
         entryPx: Number(entry.toFixed(4)),
-        score: model.score,
-        model: Number((model.probability * 100).toFixed(1)),
-        edge: Number((edge * 100).toFixed(1)),
+        probability: Number((model.probability * 100).toFixed(1)),
+        z: Number(model.z.toFixed(4)),
+        sigma: Number(model.sigma.toFixed(6)),
+        ev: Number((ev * 100).toFixed(1)),
+        timeframe: '1H',
         minutesToExpiry: Number(mins.toFixed(1))
       });
     } catch (e) {
@@ -396,7 +401,7 @@ async function scan() {
     }
   }
 
-  return candidates.sort((a, b) => b.edge - a.edge || b.model.score - a.model.score);
+  return candidates.sort((a, b) => b.ev - a.ev);
 }
 
 async function getOrder(instId, ordId) {
@@ -404,17 +409,20 @@ async function getOrder(instId, ordId) {
   return rows[0] || null;
 }
 
+function orderSizeForEntry(price, inst) {
+  return orderSize(price, inst);
+}
+
 async function place(candidate) {
   const inst = candidate.inst;
   const px = roundPrice(candidate.entry, Number(inst.tickSz || 0.001));
-  const sz = orderSize(px, inst);
+  const sz = orderSizeForEntry(px, inst);
   const actualStake = Number((px * sz).toFixed(6));
   log('[ORDER SIZE]', { targetStake: STAKE, entryPx: px, contracts: sz, actualStake });
 
   if (!LIVE) {
     return { simulated: true, state: 'filled', avgPx: px, accFillSz: sz, ordId: `PAPER-${Date.now()}` };
   }
-
   if (!API_KEY || !API_SECRET || !PASSPHRASE) throw new Error('LIVE_TRADING=true but OKX credentials are missing');
 
   const body = {
@@ -444,7 +452,6 @@ async function closePosition(position, exitPx, reason) {
   const inst = position.inst;
   const px = roundPrice(exitPx, Number(inst.tickSz || 0.001));
   let result;
-
   if (!LIVE) {
     result = { simulated: true, state: 'filled', avgPx: px, accFillSz: position.size };
   } else {
@@ -480,7 +487,6 @@ async function closePosition(position, exitPx, reason) {
     pnl: profit,
     reason
   });
-  if (state.trades.length > 500) state.trades = state.trades.slice(-500);
   state.position = null;
   recalcStats();
   if (state.consecutiveLosses >= MAX_LOSSES) state.cooldownUntil = Date.now() + COOLDOWN_MS;
@@ -512,10 +518,11 @@ function entryMessage(c, fillPx, size) {
     `Entry ${fillPx.toFixed(4)}`,
     `Contracts ${size}`,
     `Stake ${STAKE}U`,
-    `1H Direction ${c.model.direction}`,
-    `Model ${(c.model.probability * 100).toFixed(1)}%`,
-    `Score ${c.model.score}`,
-    `Edge ${(c.edge * 100).toFixed(1)}%`,
+    'Timeframe 1H',
+    `Direction ${c.model.direction}`,
+    `Probability ${(c.model.probability * 100).toFixed(1)}%`,
+    `Z ${c.model.z.toFixed(4)}`,
+    `EV ${(c.ev * 100).toFixed(1)}%`,
     `Expiry ${c.mins.toFixed(1)}m`,
     LIVE ? 'LIVE' : 'PAPER'
   ].join('\n');
@@ -526,7 +533,7 @@ async function tradeTopCandidate(candidate) {
   markEventUsed(candidate.inst.instId);
   const result = await place(candidate);
   const fillPx = Number(result.avgPx || result.fillPx || candidate.entry);
-  const size = Number(result.accFillSz || result.fillSz || orderSize(fillPx, candidate.inst));
+  const size = Number(result.accFillSz || result.fillSz || orderSizeForEntry(fillPx, candidate.inst));
   if (!(size > 0)) throw new Error('Order returned zero filled size');
   state.position = {
     inst: candidate.inst,
@@ -534,9 +541,9 @@ async function tradeTopCandidate(candidate) {
     entryPx: fillPx,
     size,
     openedAt: Date.now(),
-    score: candidate.model.score,
     probability: candidate.model.probability,
-    edge: candidate.edge
+    z: candidate.model.z,
+    ev: candidate.ev
   };
   saveState();
   await notify(entryMessage(candidate, fillPx, size));
@@ -572,14 +579,16 @@ function start() {
     return;
   }
   started = true;
-  log('[START]', `mode=${LIVE ? 'LIVE' : 'PAPER'} stake=${STAKE}U strategy=1H-MATH`);
-  log('[SAFETY]', `Score>=${MIN_SCORE} Model>=${MIN_PROB * 100}% Edge>=${MIN_EDGE * 100}% Entry=${MIN_PRICE}-${MAX_PRICE} 3-loss-cooldown=30m`);
+  log('[START]', `mode=${LIVE ? 'LIVE' : 'PAPER'} stake=${STAKE}U strategy=PURE-1H-MATH`);
+  log('[FORMULA]', 'r=ln(Pt/Pt-1), mu_w=sum(w*r)/sum(w), sigma=std(r), z=mu_w/sigma, P=0.5+0.5*tanh(1.35*z), EV=P/Entry-1');
+  log('[SAFETY]', `P>=${MIN_PROB * 100}% EV>0 Entry=${MIN_PRICE}-${MAX_PRICE} 3-loss-cooldown=30m`);
 
   app.get('/', (_req, res) => res.status(200).send('OKX EVENT CONTRACT BOT RUNNING'));
   app.get('/health', (_req, res) => res.json({
     ok: true,
     mode: LIVE ? 'LIVE' : 'PAPER',
-    strategy: '1H mathematical trend',
+    strategy: 'PURE-1H-MATH',
+    timeframe: '1H',
     loopBusy,
     position: Boolean(state.position),
     cooldownUntil: state.cooldownUntil || 0,
@@ -599,7 +608,6 @@ function start() {
     });
   }
 
-  // Exactly one repeating loop. No recursive timer and no second launcher.
   void mainLoop();
   loopTimer = setInterval(() => void mainLoop(), LOOP_MS);
   positionTimer = setInterval(() => void managePosition(), POSITION_MS);
