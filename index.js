@@ -38,18 +38,18 @@ fs.readFileSync=function(file,encoding,...rest){
   const entry5=e9_5&&e20_5?(e9_5>e20_5?'UP':'DOWN'):null;
   if(!main4h||!trend15||!entry5)return{score:0,upProbability:.5,downProbability:.5,reasons:[],signals:['insufficient multi-timeframe data'],direction:null,atr:a,volumeRatio:1,confirmation:{score:0,bestWeight:0,confidenceGap:0,optionalMissing:['4H/15m/5m data']}};
   /* 4H + 15m are the hard trend gate. 5m is not a hard gate. */
-  if(main4h!==trend15)return{score:0,upProbability:.5,downProbability:.5,reasons:[],signals:[`4H/15m conflict: 4H=${main4h},15m=${trend15},5m=${entry5}`],direction:null,atr:a,volumeRatio:1,confirmation:{score:0,bestWeight:0,confidenceGap:0,optionalMissing:['4H/15m direction conflict']}};
+  if(main4h!==trend15)return{score:0,upProbability:.5,downProbability:.5,reasons:[],signals:['4H/15m conflict: 4H='+main4h+',15m='+trend15+',5m='+entry5],direction:null,atr:a,volumeRatio:1,confirmation:{score:0,bestWeight:0,confidenceGap:0,optionalMissing:['4H/15m direction conflict']}};
   const direction=main4h;
   let score=60;
-  const reasons=[`4H ${main4h}`,`15m ${trend15}`];
-  const signals=[`4H=${main4h}`,`15m=${trend15}`,`5m=${entry5}`];
+  const reasons=['4H '+main4h,'15m '+trend15];
+  const signals=['4H='+main4h,'15m='+trend15,'5m='+entry5];
   if(entry5===direction){score+=15;reasons.push('5m entry confirmation');}
   else {score-=5;reasons.push('5m counter-trend caution');}
-  if(r!==null){if((direction==='UP'&&r>=55&&r<=72)||(direction==='DOWN'&&r<=45&&r>=28)){score+=8;reasons.push('RSI confirmation');signals.push(`RSI ${r.toFixed(1)}`);}else if((direction==='UP'&&r<45)||(direction==='DOWN'&&r>55)){score-=6;reasons.push('RSI conflict');}}
+  if(r!==null){if((direction==='UP'&&r>=55&&r<=72)||(direction==='DOWN'&&r<=45&&r>=28)){score+=8;reasons.push('RSI confirmation');signals.push('RSI '+r.toFixed(1));}else if((direction==='UP'&&r<45)||(direction==='DOWN'&&r>55)){score-=6;reasons.push('RSI conflict');}}
   const avgVol=vol.length?vol.slice(-20).reduce((x,y)=>x+y,0)/Math.min(20,vol.length):0;
   const vr=avgVol>0?(vol.at(-1)||0)/avgVol:1;
-  if(vr>=1.15){score+=7;reasons.push('volume confirmation');signals.push(`volume ${vr.toFixed(2)}x`);}
-  if(strike&&a&&a>0){const dist=(price-strike)/a;if((direction==='UP'&&dist>=0.75)||(direction==='DOWN'&&dist<=-0.75)){score+=10;reasons.push('strike distance confirmation');signals.push(`strike ${dist.toFixed(2)} ATR`);}}
+  if(vr>=1.15){score+=7;reasons.push('volume confirmation');signals.push('volume '+vr.toFixed(2)+'x');}
+  if(strike&&a&&a>0){const dist=(price-strike)/a;if((direction==='UP'&&dist>=0.75)||(direction==='DOWN'&&dist<=-0.75)){score+=10;reasons.push('strike distance confirmation');signals.push('strike '+dist.toFixed(2)+' ATR');}}
   score=Math.round(Math.max(0,Math.min(100,score)));
   const probability=Math.min(.84,Math.max(.60,.60+(score-60)*.006));
   return{score,upProbability:direction==='UP'?probability:1-probability,downProbability:direction==='DOWN'?probability:1-probability,reasons,signals,direction,atr:a,volumeRatio:vr,confirmation:{score,bestWeight:score,confidenceGap:Math.max(0,score-60),optionalMissing:entry5===direction?[]:['5m counter-trend caution']}};
