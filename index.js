@@ -6,42 +6,35 @@
 
 require('./runtime-diagnostics.js');
 const fs=require('fs');
+const Module=require('module');
+const path=require('path');
+const source=path.join(__dirname,'event-bot.js');
 const originalReadFileSync=fs.readFileSync;
 
 fs.readFileSync=function(file,encoding,...rest){
   const result=originalReadFileSync.call(fs,file,encoding,...rest);
-
   if(typeof file==='string'&&/event-bot-runner\.js$/.test(file)&&typeof result==='string'){
-    return result.replace(
-      "code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: true');",
-      "code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: false');"
-    );
+    return result.replace("code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: true');","code = code.replace(/polling\\s*:\\s*(true|false)/g, 'polling: false');");
   }
-
   if(typeof file==='string'&&/event-bot\.js$/.test(file)&&typeof result==='string'){
     let code=result;
 
-    code=code.replace(
-      "function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}",
-      "function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}"
-    );
+    code=code.replace("function getConfiguredSeries(){return EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);}","function getConfiguredSeries(){const configured=EVENT_SERIES.split(',').map(x=>x.trim()).filter(Boolean);return [...new Set([...configured,...ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`])])];}");
+    code=code.replace(/function generatedSeries\(\)\{return ASSETS\.map\(c=>`\$\{c\}-UPDOWN-15MIN`\);\}/,"function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}");
 
-    code=code.replace(
-      /function generatedSeries\(\)\{return ASSETS\.map\(c=>`\$\{c\}-UPDOWN-15MIN`\);\}/,
-      "function generatedSeries(){return ASSETS.flatMap(c=>[`${c}-UPDOWN-5MIN`,`${c}-UPDOWN-15MIN`]);}"
-    );
-
+    /* Keep a real 4H cache for the same underlying symbol. The previous patch
+       incorrectly tried to locate a candle-array object by comparing array
+       identity, which made every model call report missing 4H data. */
     code=code.replace(
       "async function getCandles(instId,bar,limit=100){return confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));}",
-      "const __TF4H={}; async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));if(bar==='4H')__TF4H[instId]=rows;if(bar==='15m'){try{__TF4H[instId]=confirmed(await publicGet('/api/v5/market/candles',{instId,bar:'4H',limit:100}));}catch(e){console.error('[4H context]',e.message);}}return rows;}"
+      "let __LAST4H=[]; async function getCandles(instId,bar,limit=100){const rows=confirmed(await publicGet('/api/v5/market/candles',{instId,bar,limit}));if(bar==='15m'){try{__LAST4H=confirmed(await publicGet('/api/v5/market/candles',{instId,bar:'4H',limit:100}));}catch(e){__LAST4H=[];console.error('[4H context]',e.message);}}return rows;}"
     );
 
     const start=code.indexOf('function modelProbability(');
     const end=code.indexOf('\nasync function getEquity(',start);
     if(start>=0&&end>start){
       const replacement=`function modelProbability(price,strike,c5,c15){
-  const cl5=closes(c5),cl15=closes(c15),key=Object.keys(__TF4H).find(k=>__TF4H[k]===c15),c4=key?__TF4H[key]:null,cl4=c4?closes(c4):[];
-  const e20_4=ema(cl4,20),e50_4=ema(cl4,50),e20_15=ema(cl15,20),e50_15=ema(cl15,50),e9_5=ema(cl5,9),e20_5=ema(cl5,20),r=rsi(cl5),a=atr(c5);
+  const cl5=closes(c5),cl15=closes(c15),cl4=closes(__LAST4H),e20_4=ema(cl4,20),e50_4=ema(cl4,50),e20_15=ema(cl15,20),e50_15=ema(cl15,50),e9_5=ema(cl5,9),e20_5=ema(cl5,20),r=rsi(cl5),a=atr(c5);
   const main4h=e20_4&&e50_4?(e20_4>e50_4?'UP':'DOWN'):null;
   const trend15=e20_15&&e50_15?(e20_15>e50_15?'UP':'DOWN'):null;
   const entry5=e9_5&&e20_5?(e9_5>e20_5?'UP':'DOWN'):null;
@@ -52,24 +45,17 @@ fs.readFileSync=function(file,encoding,...rest){
   if(trend15==='UP'){up+=25;ur.push('15m trend confirmation');signals.push('15m UP');}else{down+=25;dr.push('15m trend confirmation');signals.push('15m DOWN');}
   if(entry5==='UP'){up+=20;ur.push('5m entry signal');signals.push('5m ENTRY UP');}else{down+=20;dr.push('5m entry signal');signals.push('5m ENTRY DOWN');}
   if(r!==null){if(r>=55&&r<=68){up+=8;ur.push('5m RSI');signals.push('5m RSI bullish');}else if(r<=45&&r>=32){down+=8;dr.push('5m RSI');signals.push('5m RSI bearish');}}
-  const direction=up>=down?'UP':'DOWN',best=direction==='UP'?up:down,opp=direction==='UP'?down:up,gap=Math.max(0,best-opp);
-  const probability=Math.min(.84,Math.max(.60,.60+Math.min(.24,gap*.006)));
-  const score=Math.round(Math.min(100,60+gap*.8+(best>=80?8:0)));
+  const direction=up>=down?'UP':'DOWN',best=direction==='UP'?up:down,opp=direction==='UP'?down:up,gap=Math.max(0,best-opp),probability=Math.min(.84,Math.max(.60,.60+Math.min(.24,gap*.006))),score=Math.round(Math.min(100,60+gap*.8+(best>=80?8:0)));
   return{score,upProbability:direction==='UP'?probability:1-probability,downProbability:direction==='DOWN'?probability:1-probability,reasons:direction==='UP'?ur:dr,signals,direction,atr:a,volumeRatio:1,confirmation:{score,bestWeight:best,confidenceGap:gap,optionalMissing:[]}};
 }
 `;
       code=code.slice(0,start)+replacement+code.slice(end);
+    } else {
+      throw new Error('[SAFETY PATCH] modelProbability boundary not found');
     }
 
-    code=code.replace(
-      "function validPrice(p){return Number.isFinite(p)&&p>=MIN_ENTRY_PRICE&&p<=MAX_ENTRY_PRICE;}",
-      "const PREFERRED_ENTRY_MIN=.25,PREFERRED_ENTRY_MAX=.35,MAX_ENTRY_FOR_SELECTION=.40,MIN_EXPIRY_RR=2;function expiryRewardRisk(p){return Number.isFinite(p)&&p>0&&p<1?(1-p)/p:0;}function validPrice(p){return Number.isFinite(p)&&p>=PREFERRED_ENTRY_MIN&&p<=MAX_ENTRY_FOR_SELECTION&&expiryRewardRisk(p)>=MIN_EXPIRY_RR;}"
-    );
-
-    code=code.replace(
-      "return candidates.sort((a,b)=>b.edge-a.edge||b.score-a.score);",
-      "return candidates.sort((a,b)=>Number(b.entryPx>=PREFERRED_ENTRY_MIN&&b.entryPx<=PREFERRED_ENTRY_MAX)-Number(a.entryPx>=PREFERRED_ENTRY_MIN&&a.entryPx<=PREFERRED_ENTRY_MAX)||expiryRewardRisk(b.entryPx)-expiryRewardRisk(a.entryPx)||b.edge-a.edge||b.score-a.score);"
-    );
+    code=code.replace("function validPrice(p){return Number.isFinite(p)&&p>=MIN_ENTRY_PRICE&&p<=MAX_ENTRY_PRICE;}","const PREFERRED_ENTRY_MIN=.25,PREFERRED_ENTRY_MAX=.35,MAX_ENTRY_FOR_SELECTION=.40,MIN_EXPIRY_RR=2;function expiryRewardRisk(p){return Number.isFinite(p)&&p>0&&p<1?(1-p)/p:0;}function validPrice(p){return Number.isFinite(p)&&p>=PREFERRED_ENTRY_MIN&&p<=MAX_ENTRY_FOR_SELECTION&&expiryRewardRisk(p)>=MIN_EXPIRY_RR;}");
+    code=code.replace("return candidates.sort((a,b)=>b.edge-a.edge||b.score-a.score);","return candidates.sort((a,b)=>Number(b.entryPx>=PREFERRED_ENTRY_MIN&&b.entryPx<=PREFERRED_ENTRY_MAX)-Number(a.entryPx>=PREFERRED_ENTRY_MIN&&a.entryPx<=PREFERRED_ENTRY_MAX)||expiryRewardRisk(b.entryPx)-expiryRewardRisk(a.entryPx)||b.edge-a.edge||b.score-a.score);");
 
     const cooldownPatch=`function riskBlocked(){
   resetDaily();
@@ -79,14 +65,16 @@ fs.readFileSync=function(file,encoding,...rest){
   if(Number(state.consecutiveLosses)>=MAX_CONSECUTIVE_LOSSES){state.halted=true;state.cooldownUntil=Date.now()+30*60*1000;saveState();console.log('[RISK] 3 consecutive losses; cooldown 30 minutes');return true;}
   return false;
 }`;
-    code=code.replace(
-      /function riskBlocked\(\)\{resetDaily\(\);return state\.halted\|\|state\.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES;\}/,
-      cooldownPatch
-    );
-
+    code=code.replace(/function riskBlocked\(\)\{resetDaily\(\);return state\.halted\|\|state\.consecutiveLosses>=MAX_CONSECUTIVE_LOSSES;\}/,cooldownPatch);
     return code;
   }
   return result;
 };
+
+if(!fs.existsSync(source))throw new Error('找不到 event-bot.js: '+source);
+console.log('[SAFETY] PAPER launcher loaded');
+console.log('[SAFETY] 4H/15m/5m agreement required');
+console.log('[SAFETY] 1U / Score>=90 / Model>=75% / Edge>=15% / Entry 0.25-0.40 / expiry RR>=2');
+console.log('[SAFETY] 3 consecutive losses -> 30 minute cooldown');
 
 require('./event-bot-runner.js');
