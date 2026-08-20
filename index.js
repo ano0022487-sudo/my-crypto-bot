@@ -1,5 +1,6 @@
 'use strict';
 
-/* Canonical Render entrypoint. */
-console.log('[DEPLOY ENTRY] MATH-1H-RR-2.1');
-require('./event-bot-runner.js');
+/* Canonical Render entrypoint: start the bot directly. */
+console.log('[DEPLOY ENTRY] MATH-1H-RR-2.2');
+if (process.env.LIVE_TRADING === undefined) process.env.LIVE_TRADING = 'false';
+require('./event-bot.js');
