@@ -6,6 +6,48 @@ const path = require('path');
 const Module = require('module');
 
 const source = path.join(__dirname, 'event-bot.js');
+const SINGLETON_LOCK = path.join('/tmp', 'okx-event-bot.singleton.lock');
+let singletonFd = null;
+
+function acquireSingleton() {
+  try {
+    singletonFd = fs.openSync(SINGLETON_LOCK, 'wx');
+    fs.writeFileSync(singletonFd, String(process.pid), 'utf8');
+    const release = () => {
+      try { if (singletonFd !== null) fs.closeSync(singletonFd); } catch (_) {}
+      try { if (fs.existsSync(SINGLETON_LOCK)) fs.unlinkSync(SINGLETON_LOCK); } catch (_) {}
+    };
+    process.once('exit', release);
+    process.once('SIGTERM', () => { release(); process.exit(0); });
+    process.once('SIGINT', () => { release(); process.exit(0); });
+    console.log(`[Runner] Singleton lock acquired pid=${process.pid}`);
+    return true;
+  } catch (e) {
+    try {
+      const oldPid = Number(fs.readFileSync(SINGLETON_LOCK, 'utf8').trim());
+      if (Number.isInteger(oldPid) && oldPid > 0) {
+        try {
+          process.kill(oldPid, 0);
+          console.error(`[Runner] Another bot process is already running pid=${oldPid}; refusing duplicate startup.`);
+          return false;
+        } catch (_) {
+          try { fs.unlinkSync(SINGLETON_LOCK); } catch (_) {}
+          return acquireSingleton();
+        }
+      }
+      try { fs.unlinkSync(SINGLETON_LOCK); } catch (_) {}
+      return acquireSingleton();
+    } catch (_) {
+      console.error('[Runner] Singleton lock exists; refusing duplicate startup.');
+      return false;
+    }
+  }
+}
+
+if (!acquireSingleton()) {
+  process.exitCode = 0;
+  return;
+}
 
 try {
   if (!fs.existsSync(source)) throw new Error('找不到 event-bot.js: ' + source);
@@ -136,6 +178,7 @@ if (bot) {
   console.log('[Runner] FINAL PRE-ORDER GATE: score/model/edge/entry checked immediately before placeEventOrder');
   console.log('[Runner] Telegram command handlers installed: /stats /stat /統計 /start /help');
   console.log('[Runner] /stats HTTP endpoint installed');
+  console.log('[Runner] Singleton protection enabled; only one bot process may run per container.');
 
   if(!code.includes('const LIVE_TRADING = false;')) throw new Error('[Runner] PAPER guard failed');
 
