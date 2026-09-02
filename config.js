@@ -16,6 +16,10 @@ module.exports = {
   },
   RETRIES: Number(process.env.OKX_RETRIES || 3),
   BACKOFF_MS: Number(process.env.OKX_BACKOFF_MS || 300),
+  MAX_REQUESTS_PER_2S: 18,
   MAX_ORDER_BOOK_LEVELS: 20,
-  BARS: ['5m', '15m', '1H', '4H']
+  BARS: ['5m', '15m', '1H', '4H'],
+  WS_RECONNECT_BASE_MS: 1000,
+  WS_RECONNECT_MAX_MS: 30000,
+  WS_HEARTBEAT_MS: 25000
 };
