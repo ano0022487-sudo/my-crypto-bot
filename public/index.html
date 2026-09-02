@@ -1,1 +1,18 @@
-<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OKX 全市場掃描器</title><link rel="stylesheet" href="/style.css"></head><body><main><h1>OKX 全市場掃描器</h1><p>資料來源：OKX Public Market Data</p><section class="status"><span id="count">市場數量：--</span><span id="updated">最後更新：--</span></section><table><thead><tr><th>交易對</th><th>價格</th><th>24H</th><th>Volume</th><th>OI</th><th>OI 5M</th><th>OI 15M</th><th>OI 1H</th><th>Funding</th></tr></thead><tbody id="markets"></tbody></table><p class="note">OI 變化只使用本網站啟動後實際採樣的 OKX 公開 OI；尚未累積足夠時間時顯示「【資料不足，無法確認】」。Order Book、Trades 與 Funding 可透過市場資料 API 查詢。</p></main><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OKX 全市場掃描器</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<main>
+  <h1>OKX 全市場掃描器</h1>
+  <p>資料來源：OKX Public Market Data</p>
+  <section class="toolbar">
+    <input id="search" type="search" placeholder="搜尋交易對，例如 BTC-USDT-SWAP" aria-label="搜尋交易對">
+    <select id="sort" aria-label="排序"><option value="symbol">交易對</option><option value="change24h">24H 漲跌</option><option value="volume">Volume</option><option value="oi">OI</option><option value="funding">Funding</option></select>
+  </section>
+  <section class="status"><span id="count">市場數量：--</span><span id="updated">最後更新：--</span><span id="ws">WebSocket：--</span></section>
+  <table><thead><tr><th>交易對</th><th>價格</th><th>24H 漲跌</th><th>Volume（幣）</th><th>OI（USD）</th><th>OI 5M</th><th>OI 15M</th><th>OI 1H</th><th>Funding</th><th>資料時間</th></tr></thead><tbody id="markets"></tbody></table>
+  <p class="note">OI 5M / 15M / 1H 只使用伺服器啟動後實際採樣的 OKX 公開 OI；未累積指定時間顯示「【資料不足，無法確認】」。Order Book 為掛單資料，不代表實際成交。Liquidation Orders 為近期強平訂單流，不代表 OKX 全市場完整爆倉總量。</p>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
