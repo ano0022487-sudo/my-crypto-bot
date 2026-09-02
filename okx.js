@@ -3,18 +3,26 @@
 const axios = require('axios');
 const config = require('./config');
 const logger = require('./logger');
+const { RequestLimiter } = require('./rateLimiter');
 
-const client = axios.create({ baseURL: config.OKX_REST_BASE_URL, timeout: config.REQUEST_TIMEOUT_MS, headers: { Accept: 'application/json' } });
+const client = axios.create({
+  baseURL: config.OKX_REST_BASE_URL,
+  timeout: config.REQUEST_TIMEOUT_MS,
+  headers: { Accept: 'application/json' }
+});
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const limiter = new RequestLimiter({ intervalMs: 2000, maxRequests: config.MAX_REQUESTS_PER_2S });
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function get(path, params = {}, attempts = config.RETRIES) {
   let lastError;
-  for (let attempt = 0; attempt <= attempts; attempt++) {
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
     try {
-      const response = await client.get(path, { params });
+      const response = await limiter.schedule(() => client.get(path, { params }));
       const body = response.data;
-      if (!body || body.code !== '0') throw new Error(`OKX ${path}: ${body?.code || 'unknown'} ${body?.msg || 'invalid response'}`);
+      if (!body || body.code !== '0' || !Array.isArray(body.data)) {
+        throw new Error(`OKX ${path}: ${body?.code || 'unknown'} ${body?.msg || 'invalid response'}`);
+      }
       return body.data;
     } catch (error) {
       lastError = error;
@@ -27,7 +35,7 @@ async function get(path, params = {}, attempts = config.RETRIES) {
     }
   }
   logger.error('OKX request failed', { path, error: lastError?.message });
-  throw lastError;
+  throw lastError || new Error(`OKX ${path}: request failed`);
 }
 
 module.exports = {
