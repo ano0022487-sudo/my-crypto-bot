@@ -1,6 +1,7 @@
 'use strict';
 const test=require('node:test');
 const assert=require('node:assert/strict');
+const config=require('../config');
 const {OKXPublicWS}=require('../ws');
 
 test('websocket starts with one multiplexed connection state',()=>{
@@ -14,7 +15,7 @@ test('websocket starts with one multiplexed connection state',()=>{
 
 test('reconnect delay stays within configured bounds',()=>{
  const ws=new OKXPublicWS();
- for(let attempt=0;attempt<8;attempt+=1){ws.reconnectAttempt=attempt;const delay=ws.nextReconnectDelay();assert.ok(delay>=1000);assert.ok(delay<=30000);}
+ for(let attempt=0;attempt<8;attempt+=1){ws.reconnectAttempt=attempt;const delay=ws.nextReconnectDelay();assert.ok(delay>=config.WS_RECONNECT_BASE_MS);assert.ok(delay<=config.WS_RECONNECT_MAX_MS);}
 });
 
 test('reconnect scheduling is single-flight',()=>{
