@@ -1,0 +1,59 @@
+'use strict';
+const WebSocket=require('ws');
+const config=require('./config');
+const logger=require('./logger');
+const okx=require('./okx');
+
+const isLiveUsdtSwap=i=>i?.instType==='SWAP'&&i?.state==='live'&&(i?.quoteCcy==='USDT'||i?.settleCcy==='USDT');
+
+class OKXCandleWS{
+ constructor(onEvent=()=>{}){
+  this.ws=null;this.timer=null;this.pingTimer=null;this.instIds=[];this.reconnectAttempt=0;this.reconnectScheduled=false;this.connected=false;this.stopping=false;this.subscriptions=new Set();this.subscribedArgs=new Set();this.subscribedInstruments=new Set();this.socketGeneration=0;this.connectionCount=0;this.reconnectCount=0;this.lastMessageAt=null;this.lastSuccessfulMessageAt=null;this.lastCandleAt=null;this.timeoutCount=0;this.lastErrorLogAt=0;this.onEvent=onEvent;
+ }
+ async start(instIds){
+  this.stopping=false;
+  const requested=[...new Set(instIds)];
+  try{
+   const live=(await okx.getInstruments()).filter(isLiveUsdtSwap).map(x=>x.instId);
+   const allowed=new Set(live);
+   this.instIds=requested.filter(id=>allowed.has(id));
+  }catch(e){
+   this.instIds=requested;
+   logger.warn('OKX candle WebSocket instrument preflight failed; using requested list',{error:e.message,instruments:requested.length});
+  }
+  this.reconnectAttempt=0;this.clearReconnectTimer();this.connect();
+ }
+ stop(){this.stopping=true;this.clearReconnectTimer();this.stopHeartbeat();const ws=this.ws;this.ws=null;this.connected=false;this.cleanupSocket(ws);this.subscriptions.clear();this.subscribedArgs.clear();this.subscribedInstruments.clear();}
+ clearReconnectTimer(){if(this.timer){clearTimeout(this.timer);this.timer=null;}this.reconnectScheduled=false;}
+ cleanupSocket(ws){if(!ws)return;try{ws.removeAllListeners();if(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING)ws.close();if(ws.readyState!==WebSocket.CLOSED)ws.terminate();}catch{} }
+ nextReconnectDelay(){const base=Math.min(config.WS_RECONNECT_MAX_MS,config.WS_RECONNECT_BASE_MS*(2**this.reconnectAttempt));return Math.min(config.WS_RECONNECT_MAX_MS,base+Math.floor(Math.random()*(config.WS_RECONNECT_JITTER_MS+1)));}
+ scheduleReconnect(reason){if(this.stopping||this.reconnectScheduled)return;this.reconnectScheduled=true;const delay=this.nextReconnectDelay();this.reconnectAttempt+=1;this.reconnectCount+=1;this.timer=setTimeout(()=>{this.timer=null;this.reconnectScheduled=false;if(!this.stopping)this.connect();},delay);logger.warn('OKX candle WebSocket reconnect scheduled',{reason,attempt:this.reconnectAttempt,delay});}
+ connect(){
+  if(this.stopping)return;if(this.ws&&(this.ws.readyState===WebSocket.OPEN||this.ws.readyState===WebSocket.CONNECTING))return;
+  this.clearReconnectTimer();const generation=++this.socketGeneration;const ws=new WebSocket(config.OKX_BUSINESS_WS_URL,{handshakeTimeout:config.REQUEST_TIMEOUT_MS});
+  this.ws=ws;this.connectionCount+=1;this.subscriptions.clear();this.subscribedArgs.clear();this.subscribedInstruments.clear();
+  ws.on('open',()=>{if(generation!==this.socketGeneration)return;this.connected=true;this.reconnectAttempt=0;this.reconnectScheduled=false;this.lastSuccessfulMessageAt=Date.now();logger.info('OKX business WebSocket connected',{connections:this.connectionCount,instruments:this.instIds.length});this.subscribe(ws,generation);this.startHeartbeat(ws,generation);});
+  ws.on('message',raw=>{if(generation===this.socketGeneration)this.onMessage(raw);});
+  ws.on('error',e=>{if(generation!==this.socketGeneration)return;this.rateLimitedError('OKX candle WebSocket error',{error:e.message});});
+  ws.on('close',(code,reason)=>{if(generation!==this.socketGeneration)return;this.connected=false;this.stopHeartbeat();this.subscriptions.clear();this.subscribedArgs.clear();this.subscribedInstruments.clear();this.ws=null;this.scheduleReconnect(`close:${code}${reason?.toString()?`:${reason.toString().slice(0,80)}`:''}`);});
+ }
+ startHeartbeat(ws,generation){this.stopHeartbeat();this.pingTimer=setInterval(()=>{if(generation!==this.socketGeneration||ws!==this.ws||ws.readyState!==WebSocket.OPEN)return;const age=Date.now()-(this.lastMessageAt||Date.now());if(age<config.WS_HEARTBEAT_MS)return;if(ws._okxPongDeadline&&Date.now()>ws._okxPongDeadline){this.timeoutCount+=1;this.rateLimitedError('OKX candle WebSocket heartbeat timeout',{timeoutCount:this.timeoutCount});this.cleanupSocket(ws);this.ws=null;this.connected=false;this.stopHeartbeat();this.scheduleReconnect('heartbeat-timeout');return;}ws._okxPongDeadline=Date.now()+config.WS_HEARTBEAT_MS;try{ws.send('ping');}catch(error){this.rateLimitedError('OKX candle WebSocket ping failed',{error:error.message});this.cleanupSocket(ws);this.ws=null;this.connected=false;this.stopHeartbeat();this.scheduleReconnect('ping-failed');}},5000);}
+ stopHeartbeat(){if(this.pingTimer){clearInterval(this.pingTimer);this.pingTimer=null;}}
+ async subscribe(ws,generation){
+  const args=this.instIds.map(instId=>({channel:'candle5m',instId}));const size=Math.max(1,config.WS_SUBSCRIBE_BATCH_SIZE);
+  try{for(let i=0;i<args.length;i+=size){if(generation!==this.socketGeneration||ws!==this.ws||ws.readyState!==WebSocket.OPEN)break;const batch=args.slice(i,i+size);const key=JSON.stringify(batch);if(this.subscriptions.has(key))continue;ws.send(JSON.stringify({op:'subscribe',args:batch}));this.subscriptions.add(key);if(i+size<args.length)await new Promise(resolve=>setTimeout(resolve,config.WS_SUBSCRIBE_BATCH_DELAY_MS));}}
+  catch(error){this.rateLimitedError('OKX candle WebSocket subscribe failed',{error:error.message});this.cleanupSocket(ws);this.ws=null;this.connected=false;this.scheduleReconnect('subscribe-failed');}
+ }
+ rateLimitedError(message,data){const now=Date.now();if(now-this.lastErrorLogAt<5000)return;this.lastErrorLogAt=now;logger.error(message,data);}
+ onMessage(raw){
+  const text=raw.toString();this.lastMessageAt=Date.now();this.lastSuccessfulMessageAt=this.lastMessageAt;
+  if(text==='ping'){if(this.ws?.readyState===WebSocket.OPEN)this.ws.send('pong');return;}if(text==='pong'){if(this.ws)this.ws._okxPongDeadline=null;return;}
+  let msg;try{msg=JSON.parse(text);}catch{return;}
+  if(msg.event==='subscribe'){if(msg.arg?.instId)this.subscribedInstruments.add(msg.arg.instId);return;}
+  if(msg.event==='error'){this.rateLimitedError('OKX candle WebSocket subscription rejected',{code:msg.code,message:msg.msg||'',channel:msg.arg?.channel||null,instId:msg.arg?.instId||null});return;}
+  if(msg.arg?.channel!=='candle5m'||!Array.isArray(msg.data))return;
+  for(const d of msg.data){this.lastCandleAt=Number(d[0])||Date.now();this.onEvent('candle5m',{instId:msg.arg.instId,...d});}
+ }
+ snapshot(){return {connected:this.connected,connectionCount:this.connectionCount,activeSockets:this.ws?1:0,subscriptionRequests:this.subscriptions.size,subscribedInstruments:this.subscribedInstruments.size,reconnectCount:this.reconnectCount,timeoutCount:this.timeoutCount,lastCandleTimestamp:this.lastCandleAt,lastSuccessfulMessageTimestamp:this.lastSuccessfulMessageAt};}
+}
+module.exports={OKXCandleWS};
