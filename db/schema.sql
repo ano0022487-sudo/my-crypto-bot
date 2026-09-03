@@ -1,3 +1,15 @@
+-- Emergency cleanup of storage-heavy retention indexes created by an earlier deployment.
+-- Keep this before table/index creation so an already-full database can reclaim index pages first.
+DROP INDEX IF EXISTS ticker_snapshots_ts_idx;
+DROP INDEX IF EXISTS candles_retention_ts_idx;
+DROP INDEX IF EXISTS trades_ts_idx;
+DROP INDEX IF EXISTS orderbook_ts_idx;
+DROP INDEX IF EXISTS oi_ts_idx;
+DROP INDEX IF EXISTS funding_ts_idx;
+DROP INDEX IF EXISTS funding_history_time_idx;
+DROP INDEX IF EXISTS liquidation_ts_idx;
+DROP INDEX IF EXISTS anomalies_ts_idx;
+
 CREATE TABLE IF NOT EXISTS instruments (
   inst_id TEXT PRIMARY KEY,
   inst_type TEXT NOT NULL,
