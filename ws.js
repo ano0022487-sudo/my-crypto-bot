@@ -46,17 +46,18 @@ class OKXPublicWS{
  stopHeartbeat(){if(this.pingTimer){clearInterval(this.pingTimer);this.pingTimer=null;}}
  async subscribe(ws,generation){
   if(this.subscribing||!ws||ws.readyState!==WebSocket.OPEN)return;this.subscribing=true;const args=[];
-  for(const id of this.instIds){if(this.invalidInstruments.has(id))continue;for(const channel of ['tickers','trades','candle5m','open-interest','funding-rate']){if(!this.unsupported.has(`${channel}:${id}`))args.push({channel,instId:id});}}args.push({channel:'liquidation-orders',instType:'SWAP'});const size=Math.max(1,config.WS_SUBSCRIBE_BATCH_SIZE);
+  for(const id of this.instIds){if(this.invalidInstruments.has(id))continue;for(const channel of ['tickers','trades','open-interest','funding-rate']){if(!this.unsupported.has(`${channel}:${id}`))args.push({channel,instId:id});}}args.push({channel:'liquidation-orders',instType:'SWAP'});const size=Math.max(1,config.WS_SUBSCRIBE_BATCH_SIZE);
   try{for(let i=0;i<args.length;i+=size){if(generation!==this.socketGeneration||ws!==this.ws||ws.readyState!==WebSocket.OPEN)break;const batch=args.slice(i,i+size);const key=JSON.stringify(batch);if(this.subscriptions.has(key))continue;ws.send(JSON.stringify({op:'subscribe',args:batch}));this.subscriptions.add(key);if(i+size<args.length)await new Promise(resolve=>setTimeout(resolve,config.WS_SUBSCRIBE_BATCH_DELAY_MS));}}
   catch(error){this.rateLimitedError('OKX public WebSocket subscribe failed',{error:error.message});this.cleanupSocket(ws);this.ws=null;this.connected=false;this.scheduleReconnect('subscribe-failed');}
   finally{if(generation===this.socketGeneration)this.subscribing=false;}
  }
  markUnsupported(channel,instId,detail){
   const key=`${channel}:${instId}`;if(this.unsupported.has(key))return false;this.unsupported.add(key);
-  const instrumentDoesNotExist=/doesn't exist|does not exist/i.test(String(detail||''));
-  if(instrumentDoesNotExist){
+  const text=String(detail||'');
+  const channelSpecific=/channel:[^,\s]+,instId:[^\s]+\s+(?:doesn't|does not) exist/i.test(text);
+  if(!channelSpecific&&/(?:instrument|instId)[^\n]*(?:doesn't|does not) exist/i.test(text)){
    this.invalidInstruments.add(instId);
-   for(const ch of ['tickers','trades','candle5m','open-interest','funding-rate'])this.unsupported.add(`${ch}:${instId}`);
+   for(const ch of ['tickers','trades','open-interest','funding-rate'])this.unsupported.add(`${ch}:${instId}`);
    logger.warn('OKX WebSocket instrument disabled',{instId,channel,reason:detail,invalidInstrumentCount:this.invalidInstruments.size});
   }else{
    logger.warn('OKX WebSocket channel disabled for instrument',{channel,instId,reason:detail,unsupportedCount:this.unsupported.size});
@@ -82,7 +83,6 @@ class OKXPublicWS{
   else if(ch==='open-interest'){for(const d of msg.data){this.latest.openInterest.set(d.instId,d);this.emit('open-interest',d);}}
   else if(ch==='funding-rate'){for(const d of msg.data){this.latest.funding.set(d.instId,d);this.emit('funding-rate',d);}}
   else if(ch==='trades'){for(const d of msg.data){const ts=Number(d.ts)||Date.now();this.lastTradeAt=ts;this.lastTradeByInstrument.set(d.instId,ts);this.emit('trade',d);}}
-  else if(ch==='candle5m'){for(const d of msg.data)this.emit('candle5m',d);}
   else if(ch==='liquidation-orders'){for(const group of msg.data||[]){for(const detail of group.details||[]){const e={symbol:group.instId,side:detail.side,price:Number(detail.bkPx),size:Number(detail.sz),timestamp:Number(detail.ts),raw:detail};this.latest.liquidations=[e,...this.latest.liquidations].slice(0,500);this.emit('liquidation',e);}}}
  }
  staleSubscriptions(){const now=Date.now();let count=0;for(const id of this.instIds){if(this.invalidInstruments.has(id)||this.unsupported.has(`tickers:${id}`))continue;const ticker=this.lastTickerByInstrument.get(id)||0;if(!ticker||now-ticker>config.COLLECTOR_STALE_MS)count+=1;}return count;}
