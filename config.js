@@ -3,6 +3,7 @@ module.exports={
  PORT:Number(process.env.PORT||10000),
  OKX_REST_BASE_URL:process.env.OKX_REST_BASE_URL||'https://www.okx.com',
  OKX_PUBLIC_WS_URL:process.env.OKX_PUBLIC_WS_URL||'wss://ws.okx.com:8443/ws/v5/public',
+ OKX_BUSINESS_WS_URL:process.env.OKX_BUSINESS_WS_URL||'wss://ws.okx.com:8443/ws/v5/business',
  REQUEST_TIMEOUT_MS:Number(process.env.REQUEST_TIMEOUT_MS||10000),
  CACHE_TTL_MS:{instruments:5*60*1000,tickers:1500,candles:5000,openInterest:5000,funding:30000,trades:1500,orderBook:1000},
  RETRIES:Number(process.env.OKX_RETRIES||3),BACKOFF_MS:Number(process.env.OKX_BACKOFF_MS||500),MAX_REQUESTS_PER_2S:Number(process.env.MAX_REQUESTS_PER_2S||18),MAX_ORDER_BOOK_LEVELS:Number(process.env.MAX_ORDER_BOOK_LEVELS||20),
