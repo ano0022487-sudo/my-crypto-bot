@@ -7,7 +7,7 @@ const logger = require('./logger');
 
 let pool = null;
 let ready = false;
-const metrics = { connectionErrors: 0, queryErrors: 0, batchWrites: 0, batchRows: 0, deadlockRetries: 0 };
+const metrics = { connectionErrors: 0, queryErrors: 0, batchWrites: 0, batchRows: 0, deadlockRetries: 0, cleanupDeletedRows: 0 };
 function enabled() { return Boolean(process.env.DATABASE_URL); }
 function getPool() {
   if (!enabled()) return null;
@@ -42,7 +42,7 @@ async function migrate() {
 }
 async function ping() { if(!enabled()) return false; await query('SELECT 1'); return true; }
 function isReady(){ return ready; }
-function stats(){ const p=getPool(); return { connectionErrors:metrics.connectionErrors, queryErrors:metrics.queryErrors, batchWrites:metrics.batchWrites, batchRows:metrics.batchRows, deadlockRetries:metrics.deadlockRetries, totalConnections:p?.totalCount||0, idleConnections:p?.idleCount||0, waitingRequests:p?.waitingCount||0 }; }
+function stats(){ const p=getPool(); return { connectionErrors:metrics.connectionErrors, queryErrors:metrics.queryErrors, batchWrites:metrics.batchWrites, batchRows:metrics.batchRows, deadlockRetries:metrics.deadlockRetries, cleanupDeletedRows:metrics.cleanupDeletedRows, totalConnections:p?.totalCount||0, idleConnections:p?.idleCount||0, waitingRequests:p?.waitingCount||0 }; }
 async function close(){ if(pool) await pool.end(); pool=null; ready=false; }
 
 async function upsertInstruments(rows){ if(!ready) return; for(const x of rows){ await query(`INSERT INTO instruments(inst_id,inst_type,quote_ccy,settle_ccy,state,raw,updated_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,now()) ON CONFLICT(inst_id) DO UPDATE SET inst_type=EXCLUDED.inst_type,quote_ccy=EXCLUDED.quote_ccy,settle_ccy=EXCLUDED.settle_ccy,state=EXCLUDED.state,raw=EXCLUDED.raw,updated_at=now()`,[x.instId,x.instType,x.quoteCcy||null,x.settleCcy||null,x.state||'unknown',JSON.stringify(x)]); } }
@@ -55,10 +55,37 @@ async function insertTradesBatch(rows){ if(!ready||!rows.length)return; const va
 async function insertOI(x){ if(!ready||x.timestamp==null)return; await query(`INSERT INTO open_interest_snapshots(inst_id,ts,oi,oi_ccy,oi_usd,raw) VALUES($1,to_timestamp($2/1000.0),$3,$4,$5,$6::jsonb) ON CONFLICT(inst_id,ts) DO UPDATE SET oi=EXCLUDED.oi,oi_ccy=EXCLUDED.oi_ccy,oi_usd=EXCLUDED.oi_usd,raw=EXCLUDED.raw`,[x.symbol,x.timestamp,x.oi,x.oiCcy,x.oiUsd,JSON.stringify(x)]); }
 async function insertOIBatch(rows){ if(!ready||!rows.length)return; const unique=new Map(); for(const x of rows){if(x?.symbol&&x.timestamp!=null)unique.set(`${x.symbol}|${x.timestamp}`,x);} const deduped=[...unique.values()]; if(!deduped.length)return; const values=[]; const params=[]; deduped.forEach((x,i)=>{const b=i*6;values.push(`($${b+1},to_timestamp($${b+2}/1000.0),$${b+3},$${b+4},$${b+5},$${b+6}::jsonb)`);params.push(x.symbol,x.timestamp,x.oi,x.oiCcy,x.oiUsd,JSON.stringify(x));}); await query(`INSERT INTO open_interest_snapshots(inst_id,ts,oi,oi_ccy,oi_usd,raw) VALUES ${values.join(',')} ON CONFLICT(inst_id,ts) DO UPDATE SET oi=EXCLUDED.oi,oi_ccy=EXCLUDED.oi_ccy,oi_usd=EXCLUDED.oi_usd,raw=EXCLUDED.raw`,params); metrics.batchWrites+=1; metrics.batchRows+=deduped.length; }
 async function insertFunding(x){ if(!ready||x.timestamp==null)return; await query(`INSERT INTO funding_snapshots(inst_id,ts,funding_rate,funding_time,next_funding_time,raw) VALUES($1,to_timestamp($2/1000.0),$3,to_timestamp($4/1000.0),to_timestamp($5/1000.0),$6::jsonb) ON CONFLICT(inst_id,ts) DO UPDATE SET funding_rate=EXCLUDED.funding_rate,funding_time=EXCLUDED.funding_time,next_funding_time=EXCLUDED.next_funding_time,raw=EXCLUDED.raw`,[x.symbol,x.timestamp,x.fundingRate,x.fundingTime,x.nextFundingTime,JSON.stringify(x)]); }
-async function insertFundingBatch(rows){ if(!ready||!rows.length)return; const unique=new Map(); for(const x of rows){if(x?.symbol&&x.timestamp!=null)unique.set(`${x.symbol}|${x.timestamp}`,x);} const deduped=[...unique.values()]; if(!deduped.length)return; const values=[]; const params=[]; deduped.forEach((x,i)=>{const b=i*6;values.push(`($${b+1},to_timestamp($${b+2}/1000.0),$${b+3},to_timestamp($${b+4}/1000.0),to_timestamp($${b+5}/1000.0),$${b+6}::jsonb)`);params.push(x.symbol,x.timestamp,x.fundingRate,x.fundingTime,x.nextFundingTime,JSON.stringify(x));}); await query(`INSERT INTO funding_snapshots(inst_id,ts,funding_rate,funding_time,next_funding_time,raw) VALUES ${values.join(',')} ON CONFLICT(inst_id,ts) DO UPDATE SET funding_rate=EXCLUDED.funding_rate,funding_time=EXCLUDED.funding_time,next_funding_time=EXCLUDED.next_funding_time,raw=EXCLUDED.raw`,params); metrics.batchWrites+=1; metrics.batchRows+=deduped.length; }
+async function insertFundingBatch(rows){ if(!ready||!rows.length)return; const unique=new Map(); for(const x of rows){if(x?.symbol&&x.timestamp!=null)unique.set(`${x.symbol}|${x.timestamp}`,x);} const deduped=[...unique.values()]; if(!deduped.length)return; const values=[]; const params=[]; deduped.forEach((x,i)=>{const b=i*6;values.push(`($${b+1},to_timestamp($${b+2}/1000.0),$${b+3},to_timestamp($${b+4}/1000.0),to_timestamp($${b+5}/1000.0),$${b+6}::jsonb)`);params.push(x.symbol,x.timestamp,x.fundingRate,x.fundingTime,x.nextFundingTime,JSON.stringify(x)]);}); await query(`INSERT INTO funding_snapshots(inst_id,ts,funding_rate,funding_time,next_funding_time,raw) VALUES ${values.join(',')} ON CONFLICT(inst_id,ts) DO UPDATE SET funding_rate=EXCLUDED.funding_rate,funding_time=EXCLUDED.funding_time,next_funding_time=EXCLUDED.next_funding_time,raw=EXCLUDED.raw`,params); metrics.batchWrites+=1; metrics.batchRows+=deduped.length; }
 async function insertFundingHistory(instId,x){ if(!ready||x.fundingTime==null)return; await query(`INSERT INTO funding_history(inst_id,funding_time,funding_rate,realized_rate,raw) VALUES($1,to_timestamp($2/1000.0),$3,$4,$5::jsonb) ON CONFLICT(inst_id,funding_time) DO NOTHING`,[instId,x.fundingTime,x.fundingRate,x.realizedRate,JSON.stringify(x.raw||x)]); }
 async function insertOrderBook(x){ if(!ready||x.timestamp==null)return; await query(`INSERT INTO orderbook_snapshots(inst_id,ts,best_bid,best_ask,spread,bid_volume,ask_volume,bid_ask_ratio,depth_imbalance,bids,asks) VALUES($1,to_timestamp($2/1000.0),$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)`,[x.symbol,x.timestamp,x.bestBid,x.bestAsk,x.spread,x.bidVolume,x.askVolume,x.bidAskRatio,x.depthImbalance,JSON.stringify(x.bids||[]),JSON.stringify(x.asks||[])]); }
 async function insertLiquidation(x){ if(!ready||x.timestamp==null)return; await query(`INSERT INTO liquidation_events(inst_id,ts,side,bk_px,size,raw) VALUES($1,to_timestamp($2/1000.0),$3,$4,$5,$6::jsonb)`,[x.symbol,x.timestamp,x.side,x.price,x.size,JSON.stringify(x.raw||x)]); }
 async function insertAnomaly(x){ if(!ready)return null; const r=await query(`INSERT INTO market_anomalies(inst_id,ts,anomaly_type,severity,measured_value,baseline,metadata) VALUES($1,to_timestamp($2/1000.0),$3,$4,$5,$6::jsonb,$7::jsonb) RETURNING id`,[x.symbol,x.timestamp,x.anomalyType,x.severity,x.measuredValue,JSON.stringify(x.baseline||{}),JSON.stringify(x.metadata||{})]); return r.rows[0]?.id||null; }
-async function cleanup(){ if(!ready)return; const days=config.DATA_RETENTION_DAYS; const sqls=[`DELETE FROM ticker_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM candles WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM trades WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM orderbook_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM open_interest_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM funding_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM funding_history WHERE funding_time < now() - ($1 || ' days')::interval`,`DELETE FROM liquidation_events WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM market_anomalies WHERE ts < now() - ($1 || ' days')::interval`]; for(const s of sqls)await query(s,[days]); }
+async function deleteOldRows(table,column,days){
+ if(!ready)return 0;
+ const batch=Math.max(100,Number(config.CLEANUP_BATCH_SIZE||5000));
+ let total=0;
+ for(;;){
+  const r=await query(`WITH doomed AS (SELECT ctid FROM ${table} WHERE ${column} < now() - ($1 || ' days')::interval LIMIT $2) DELETE FROM ${table} t USING doomed d WHERE t.ctid=d.ctid RETURNING 1`,[days,batch]);
+  const n=r.rowCount||0; total+=n; metrics.cleanupDeletedRows+=n;
+  if(n<batch)break;
+  await sleep(25);
+ }
+ return total;
+}
+async function cleanup(){
+ if(!ready)return;
+ const jobs=[
+  ['ticker_snapshots','ts',config.TICKER_RETENTION_DAYS],
+  ['trades','ts',config.TRADE_RETENTION_DAYS],
+  ['orderbook_snapshots','ts',config.ORDERBOOK_RETENTION_DAYS],
+  ['open_interest_snapshots','ts',config.OI_RETENTION_DAYS],
+  ['funding_snapshots','ts',config.FUNDING_RETENTION_DAYS],
+  ['funding_history','funding_time',config.FUNDING_HISTORY_RETENTION_DAYS],
+  ['liquidation_events','ts',config.LIQUIDATION_RETENTION_DAYS],
+  ['candles','ts',config.CANDLE_RETENTION_DAYS],
+  ['market_anomalies','ts',config.ANOMALY_RETENTION_DAYS]
+ ];
+ for(const [table,column,days] of jobs)await deleteOldRows(table,column,days);
+ logger.info('PostgreSQL retention cleanup completed',{retentionDays:{ticker:config.TICKER_RETENTION_DAYS,trades:config.TRADE_RETENTION_DAYS,orderbook:config.ORDERBOOK_RETENTION_DAYS,openInterest:config.OI_RETENTION_DAYS,funding:config.FUNDING_RETENTION_DAYS,fundingHistory:config.FUNDING_HISTORY_RETENTION_DAYS,liquidations:config.LIQUIDATION_RETENTION_DAYS,candles:config.CANDLE_RETENTION_DAYS,anomalies:config.ANOMALY_RETENTION_DAYS},deletedRows:metrics.cleanupDeletedRows});
+}
 module.exports={enabled,getPool,query,migrate,ping,isReady,stats,close,upsertInstruments,insertTicker,insertTickersBatch,upsertCandle,upsertCandlesBatch,insertTrade,insertTradesBatch,insertOI,insertOIBatch,insertFunding,insertFundingBatch,insertFundingHistory,insertOrderBook,insertLiquidation,insertAnomaly,cleanup};
