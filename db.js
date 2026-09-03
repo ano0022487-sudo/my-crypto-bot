@@ -7,7 +7,7 @@ const logger = require('./logger');
 
 let pool = null;
 let ready = false;
-const metrics = { connectionErrors: 0, queryErrors: 0, batchWrites: 0, batchRows: 0 };
+const metrics = { connectionErrors: 0, queryErrors: 0, batchWrites: 0, batchRows: 0, deadlockRetries: 0 };
 function enabled() { return Boolean(process.env.DATABASE_URL); }
 function getPool() {
   if (!enabled()) return null;
@@ -17,11 +17,22 @@ function getPool() {
   }
   return pool;
 }
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function query(text, params=[]) {
   const p=getPool();
   if(!p) throw new Error('DATABASE_URL is not configured');
-  try { return await p.query(text, params); }
-  catch(error) { metrics.queryErrors += 1; throw error; }
+  const maxRetries = Number(process.env.PG_DEADLOCK_RETRIES || 4);
+  for(let attempt=0;;attempt++) {
+    try { return await p.query(text, params); }
+    catch(error) {
+      metrics.queryErrors += 1;
+      if(error?.code !== '40P01' || attempt >= maxRetries) throw error;
+      metrics.deadlockRetries += 1;
+      const delay = Math.min(2000, 100 * (2 ** attempt) + Math.floor(Math.random() * 100));
+      logger.warn('PostgreSQL deadlock retry', { attempt: attempt + 1, maxRetries, delayMs: delay });
+      await sleep(delay);
+    }
+  }
 }
 async function migrate() {
   if (!enabled()) { logger.warn('PostgreSQL disabled: DATABASE_URL is not configured'); return false; }
@@ -31,7 +42,7 @@ async function migrate() {
 }
 async function ping() { if(!enabled()) return false; await query('SELECT 1'); return true; }
 function isReady(){ return ready; }
-function stats(){ const p=getPool(); return { connectionErrors:metrics.connectionErrors, queryErrors:metrics.queryErrors, batchWrites:metrics.batchWrites, batchRows:metrics.batchRows, totalConnections:p?.totalCount||0, idleConnections:p?.idleCount||0, waitingRequests:p?.waitingCount||0 }; }
+function stats(){ const p=getPool(); return { connectionErrors:metrics.connectionErrors, queryErrors:metrics.queryErrors, batchWrites:metrics.batchWrites, batchRows:metrics.batchRows, deadlockRetries:metrics.deadlockRetries, totalConnections:p?.totalCount||0, idleConnections:p?.idleCount||0, waitingRequests:p?.waitingCount||0 }; }
 async function close(){ if(pool) await pool.end(); pool=null; ready=false; }
 
 async function upsertInstruments(rows){ if(!ready) return; for(const x of rows){ await query(`INSERT INTO instruments(inst_id,inst_type,quote_ccy,settle_ccy,state,raw,updated_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,now()) ON CONFLICT(inst_id) DO UPDATE SET inst_type=EXCLUDED.inst_type,quote_ccy=EXCLUDED.quote_ccy,settle_ccy=EXCLUDED.settle_ccy,state=EXCLUDED.state,raw=EXCLUDED.raw,updated_at=now()`,[x.instId,x.instType,x.quoteCcy||null,x.settleCcy||null,x.state||'unknown',JSON.stringify(x)]); } }
@@ -50,5 +61,4 @@ async function insertOrderBook(x){ if(!ready||x.timestamp==null)return; await qu
 async function insertLiquidation(x){ if(!ready||x.timestamp==null)return; await query(`INSERT INTO liquidation_events(inst_id,ts,side,bk_px,size,raw) VALUES($1,to_timestamp($2/1000.0),$3,$4,$5,$6::jsonb)`,[x.symbol,x.timestamp,x.side,x.price,x.size,JSON.stringify(x.raw||x)]); }
 async function insertAnomaly(x){ if(!ready)return null; const r=await query(`INSERT INTO market_anomalies(inst_id,ts,anomaly_type,severity,measured_value,baseline,metadata) VALUES($1,to_timestamp($2/1000.0),$3,$4,$5,$6::jsonb,$7::jsonb) RETURNING id`,[x.symbol,x.timestamp,x.anomalyType,x.severity,x.measuredValue,JSON.stringify(x.baseline||{}),JSON.stringify(x.metadata||{})]); return r.rows[0]?.id||null; }
 async function cleanup(){ if(!ready)return; const days=config.DATA_RETENTION_DAYS; const sqls=[`DELETE FROM ticker_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM candles WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM trades WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM orderbook_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM open_interest_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM funding_snapshots WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM funding_history WHERE funding_time < now() - ($1 || ' days')::interval`,`DELETE FROM liquidation_events WHERE ts < now() - ($1 || ' days')::interval`,`DELETE FROM market_anomalies WHERE ts < now() - ($1 || ' days')::interval`]; for(const s of sqls)await query(s,[days]); }
-
 module.exports={enabled,getPool,query,migrate,ping,isReady,stats,close,upsertInstruments,insertTicker,insertTickersBatch,upsertCandle,upsertCandlesBatch,insertTrade,insertTradesBatch,insertOI,insertOIBatch,insertFunding,insertFundingBatch,insertFundingHistory,insertOrderBook,insertLiquidation,insertAnomaly,cleanup};
