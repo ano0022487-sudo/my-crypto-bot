@@ -46,10 +46,17 @@ async function insertTickersBatch(rows){
 async function upsertCandle(x,bar){ if(!ready||x.timestamp==null) return; await query(`INSERT INTO candles(inst_id,bar,ts,open,high,low,close,volume,volume_currency,volume_quote,confirmed,raw) VALUES($1,$2,to_timestamp($3/1000.0),$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb) ON CONFLICT(inst_id,bar,ts) DO UPDATE SET open=EXCLUDED.open,high=EXCLUDED.high,low=EXCLUDED.low,close=EXCLUDED.close,volume=EXCLUDED.volume,volume_currency=EXCLUDED.volume_currency,volume_quote=EXCLUDED.volume_quote,confirmed=EXCLUDED.confirmed,raw=EXCLUDED.raw`,[x.symbol,bar,x.timestamp,x.open,x.high,x.low,x.close,x.volume,x.volumeCurrency,x.volumeQuote,x.confirmed,JSON.stringify(x)]); }
 async function upsertCandlesBatch(rows,bar='5m'){
   if(!ready||!rows.length)return;
+  const unique=new Map();
+  for(const x of rows){
+    if(!x?.symbol||x.timestamp==null)continue;
+    unique.set(`${x.symbol}|${bar}|${x.timestamp}`,x);
+  }
+  const deduped=[...unique.values()];
+  if(!deduped.length)return;
   const values=[]; const params=[];
-  rows.forEach((x,i)=>{const b=i*12;values.push(`($${b+1},$${b+2},to_timestamp($${b+3}/1000.0),$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11},$${b+12}::jsonb)`);params.push(x.symbol,bar,x.timestamp,x.open,x.high,x.low,x.close,x.volume,x.volumeCurrency,x.volumeQuote,x.confirmed,JSON.stringify(x));});
+  deduped.forEach((x,i)=>{const b=i*12;values.push(`($${b+1},$${b+2},to_timestamp($${b+3}/1000.0),$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11},$${b+12}::jsonb)`);params.push(x.symbol,bar,x.timestamp,x.open,x.high,x.low,x.close,x.volume,x.volumeCurrency,x.volumeQuote,x.confirmed,JSON.stringify(x));});
   await query(`INSERT INTO candles(inst_id,bar,ts,open,high,low,close,volume,volume_currency,volume_quote,confirmed,raw) VALUES ${values.join(',')} ON CONFLICT(inst_id,bar,ts) DO UPDATE SET open=EXCLUDED.open,high=EXCLUDED.high,low=EXCLUDED.low,close=EXCLUDED.close,volume=EXCLUDED.volume,volume_currency=EXCLUDED.volume_currency,volume_quote=EXCLUDED.volume_quote,confirmed=EXCLUDED.confirmed,raw=EXCLUDED.raw`,params);
-  metrics.batchWrites+=1; metrics.batchRows+=rows.length;
+  metrics.batchWrites+=1; metrics.batchRows+=deduped.length;
 }
 async function insertTrade(x,instId){ if(!ready||x.tradeId==null||x.timestamp==null) return; await query(`INSERT INTO trades(trade_id,inst_id,ts,price,size,side,source,raw) VALUES($1,$2,to_timestamp($3/1000.0),$4,$5,$6,$7,$8::jsonb) ON CONFLICT(inst_id,trade_id) DO NOTHING`,[String(x.tradeId),instId,x.timestamp,x.price,x.size,x.side||null,x.source||null,JSON.stringify(x)]); }
 async function insertTradesBatch(rows){
