@@ -7,7 +7,7 @@ const logger=require('./logger');
 class Collector{
  constructor(ws){
   this.ws=ws;this.ids=[];this.orderbookTimer=null;this.analyticsTimer=null;this.fundingTimer=null;this.cleanupTimer=null;this.flushTimer=null;this.healthTimer=null;this.lastPersist=new Map();
-  this.tradeQueue=[];this.tickerQueue=[];this.candleQueue=[];this.oiQueue=[];this.oiLatest=new Map();this.flushInProgress=false;this.flushBlockedUntil=0;this.flushFailures=0;this.lastFlushAt=null;this.lastDbErrorAt=null;this.droppedTrades=0;this.droppedTickers=0;this.droppedCandles=0;this.droppedOI=0;this.eventsReceived=0;
+  this.tradeQueue=[];this.tickerQueue=[];this.candleQueue=[];this.oiQueue=[];this.oiLatest=new Map();this.flushInProgress=false;this.flushBlockedUntil=0;this.flushFailures=0;this.lastFlushAt=null;this.lastDbErrorAt=null;this.droppedTrades=0;this.droppedTickers=0;this.droppedCandles=0;this.droppedOI=0;this.eventsReceived=0;this.lastDbErrorLogAt=0;
   this.lastEventAt={trade:null,ticker:null};this.staleMarkets=new Set();this.lastHealthLogAt=0;
  }
  isUnsupported(instId){return Boolean(this.ws?.unsupported&&[...this.ws.unsupported].some(x=>x.endsWith(`:${instId}`)));}
@@ -42,27 +42,23 @@ class Collector{
    }else if(type==='open-interest'){
     const x=normalizeOI(data);
     if(x?.symbol&&x.timestamp!=null){
-      // OI is high-frequency across hundreds of instruments. Keep only the newest
-      // sample per instrument in memory and persist it with the normal batch flush.
       this.oiLatest.set(x.symbol,x);
-      if(this.oiLatest.size>Math.max(1000,this.activeIds().length*4)){
-        const oldest=this.oiLatest.keys().next().value;
-        if(oldest){this.oiLatest.delete(oldest);this.droppedOI+=1;}
-      }
+      if(this.oiLatest.size>config.COLLECTOR_MAX_OI_QUEUE){const oldest=this.oiLatest.keys().next().value;if(oldest){this.oiLatest.delete(oldest);this.droppedOI+=1;}}
     }
    }else if(type==='funding-rate')await db.insertFunding(normalizeFunding(data,data.instId));
    else if(type==='liquidation')await db.insertLiquidation(data);
   }catch(e){this.lastDbErrorAt=Date.now();this.rateLimitedDbError(type,e);}
  }
- rateLimitedDbError(type,e){const now=Date.now();if(now-this.lastHealthLogAt<5000)return;logger.error('Collector persistence error',{type,error:e.message});}
- recordFlushFailure(e){this.flushFailures+=1;this.lastDbErrorAt=Date.now();this.flushBlockedUntil=Date.now()+Math.min(30000,1000*(2**Math.min(this.flushFailures,5)));const now=Date.now();if(now-this.lastHealthLogAt>=5000){this.lastHealthLogAt=now;logger.error('Collector batch flush failed',{error:e.message,flushFailures:this.flushFailures,backoffMs:this.flushBlockedUntil-now});}}
+ rateLimitedDbError(type,e){const now=Date.now();if(now-this.lastDbErrorLogAt<5000)return;this.lastDbErrorLogAt=now;logger.error('Collector persistence error',{type,error:e.message});}
+ recordFlushFailure(e){this.flushFailures+=1;this.lastDbErrorAt=Date.now();this.flushBlockedUntil=Date.now()+Math.min(30000,1000*(2**Math.min(this.flushFailures,5)));const now=Date.now();if(now-this.lastDbErrorLogAt>=5000){this.lastDbErrorLogAt=now;logger.error('Collector batch flush failed',{error:e.message,flushFailures:this.flushFailures,backoffMs:this.flushBlockedUntil-now});}}
  async flushQueues(){
   if(this.flushInProgress||Date.now()<this.flushBlockedUntil||!db.isReady())return;
   for(const [symbol,x] of this.oiLatest){this.oiQueue.push(x);this.oiLatest.delete(symbol);}
+  if(this.oiQueue.length>config.COLLECTOR_MAX_OI_QUEUE)this.oiQueue.splice(0,this.oiQueue.length-config.COLLECTOR_MAX_OI_QUEUE);
   if(!this.tradeQueue.length&&!this.tickerQueue.length&&!this.candleQueue.length&&!this.oiQueue.length)return;
   this.flushInProgress=true;let trades=[];let tickers=[];let candles=[];let openInterest=[];
   try{
-   trades=this.tradeQueue.splice(0,config.COLLECTOR_TRADE_BATCH_SIZE);tickers=this.tickerQueue.splice(0,config.COLLECTOR_TICKER_BATCH_SIZE);candles=this.candleQueue.splice(0,Math.max(100,config.WS_SUBSCRIBE_BATCH_SIZE*2));openInterest=this.oiQueue.splice(0,Math.max(100,config.COLLECTOR_TICKER_BATCH_SIZE));
+   trades=this.tradeQueue.splice(0,config.COLLECTOR_TRADE_BATCH_SIZE);tickers=this.tickerQueue.splice(0,config.COLLECTOR_TICKER_BATCH_SIZE);candles=this.candleQueue.splice(0,Math.max(100,config.WS_SUBSCRIBE_BATCH_SIZE*2));openInterest=this.oiQueue.splice(0,config.COLLECTOR_OI_BATCH_SIZE);
    if(trades.length)await db.insertTradesBatch(trades);
    if(tickers.length)await db.insertTickersBatch(tickers);
    if(candles.length)await db.upsertCandlesBatch(candles,'5m');
@@ -82,7 +78,7 @@ class Collector{
   const tickers=this.ws.lastTickerByInstrument||new Map();this.staleMarkets.clear();
   for(const id of this.activeIds()){const ts=tickers.get(id.instId)||0;if(!ts||now-ts>config.COLLECTOR_STALE_MS)this.staleMarkets.add(id.instId);}
  }
- health(){this.updateStale();const ws=this.ws?.snapshot?.()||{};const database=db.stats();return {timestamp:Date.now(),websocket:{connections:ws.connectionCount||0,activeSockets:ws.activeSockets||0,subscriptionRequests:ws.subscriptionRequests||0,subscribedChannels:ws.subscribedChannels||0,subscribedInstruments:ws.subscribedInstruments||this.activeIds().length,reconnectCount:ws.reconnectCount||0,timeoutCount:ws.timeoutCount||0,lastTradeTimestamp:ws.lastTradeTimestamp||this.lastEventAt.trade,lastTickerTimestamp:ws.lastTickerTimestamp||this.lastEventAt.ticker,lastSuccessfulMessageTimestamp:ws.lastSuccessfulMessageTimestamp||null,staleSubscriptionCount:this.staleMarkets.size,unsupportedSubscriptions:ws.unsupportedSubscriptions||0},queues:{trade:this.tradeQueue.length,ticker:this.tickerQueue.length,candle5m:this.candleQueue.length,openInterest:this.oiQueue.length+this.oiLatest.size,maxTrade:config.COLLECTOR_MAX_TRADE_QUEUE,maxTicker:config.COLLECTOR_MAX_TICKER_QUEUE,maxCandle5m:Math.max(1000,this.activeIds().length*4),droppedTrades:this.droppedTrades,droppedTickers:this.droppedTickers,droppedCandles:this.droppedCandles,droppedOI:this.droppedOI},database:{...database,lastDbErrorTimestamp:this.lastDbErrorAt},lastFlushTimestamp:this.lastFlushAt};}
+ health(){this.updateStale();const ws=this.ws?.snapshot?.()||{};const database=db.stats();return {timestamp:Date.now(),websocket:{connections:ws.connectionCount||0,activeSockets:ws.activeSockets||0,subscriptionRequests:ws.subscriptionRequests||0,subscribedChannels:ws.subscribedChannels||0,subscribedInstruments:ws.subscribedInstruments||this.activeIds().length,reconnectCount:ws.reconnectCount||0,timeoutCount:ws.timeoutCount||0,lastTradeTimestamp:ws.lastTradeTimestamp||this.lastEventAt.trade,lastTickerTimestamp:ws.lastTickerTimestamp||this.lastEventAt.ticker,lastSuccessfulMessageTimestamp:ws.lastSuccessfulMessageTimestamp||null,staleSubscriptionCount:this.staleMarkets.size,unsupportedSubscriptions:ws.unsupportedSubscriptions||0},queues:{trade:this.tradeQueue.length,ticker:this.tickerQueue.length,candle5m:this.candleQueue.length,openInterest:this.oiQueue.length+this.oiLatest.size,maxTrade:config.COLLECTOR_MAX_TRADE_QUEUE,maxTicker:config.COLLECTOR_MAX_TICKER_QUEUE,maxOI:config.COLLECTOR_MAX_OI_QUEUE,maxCandle5m:Math.max(1000,this.activeIds().length*4),droppedTrades:this.droppedTrades,droppedTickers:this.droppedTickers,droppedCandles:this.droppedCandles,droppedOI:this.droppedOI},database:{...database,lastDbErrorTimestamp:this.lastDbErrorAt},lastFlushTimestamp:this.lastFlushAt};}
  logHealth(force=false){const now=Date.now();if(!force&&now-this.lastHealthLogAt<config.COLLECTOR_HEALTH_LOG_MS)return;this.lastHealthLogAt=now;logger.info('Collector health summary',this.health());}
  async pollFundingHistory(){for(const id of this.activeIds()){try{const rows=await okx.getFundingHistory(id.instId,100);for(const x of rows)await db.insertFundingHistory(id.instId,{fundingTime:numberOrNull(x.fundingTime),fundingRate:numberOrNull(x.fundingRate),realizedRate:numberOrNull(x.realizedRate),raw:x});}catch(e){logger.warn('Funding history unavailable',{symbol:id.instId,error:e.message});}}}
  async pollOrderBooks(){for(const id of this.activeIds()){try{const raw=(await okx.getOrderBook(id.instId,config.MAX_ORDER_BOOK_LEVELS))[0];if(!raw?.bids?.length||!raw?.asks?.length)continue;const bids=raw.bids.map(normalizeOrderBook),asks=raw.asks.map(normalizeOrderBook),bidVolume=bids.reduce((s,x)=>s+(x.volume||0),0),askVolume=asks.reduce((s,x)=>s+(x.volume||0),0),bestBid=bids[0]?.price??null,bestAsk=asks[0]?.price??null,total=bidVolume+askVolume;await db.insertOrderBook({symbol:id.instId,timestamp:numberOrNull(raw.ts),bestBid,bestAsk,spread:bestBid!=null&&bestAsk!=null?bestAsk-bestBid:null,bidVolume,askVolume,bidAskRatio:askVolume?bidVolume/askVolume:null,depthImbalance:total?(bidVolume-askVolume)/total:null,bids,asks});}catch(e){logger.warn('Orderbook snapshot unavailable',{symbol:id.instId,error:e.message});}}}
