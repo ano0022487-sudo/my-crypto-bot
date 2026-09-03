@@ -1,284 +1,200 @@
-# OKX 全市場市場掃描器 Phase 1
+# OKX 全市場市場研究與決策輔助平台
 
-私人使用的人工決策輔助系統。Phase 1 只建立 OKX 公開市場資料層，不執行任何交易。
+本專案是私人使用的人工決策輔助系統，只讀取 OKX 公開市場資料，進行資料保存、統計、異常研究與歷史事件研究。
 
-## 1. 安全邊界
+**本專案不執行任何交易。**
 
-- 只使用 OKX Public Market Data。
-- 不使用 OKX Private API。
-- 不使用 API Key、Secret Key、Passphrase。
-- 不登入、不會員、不付款、不 VIP、不廣告。
-- 不自動下單、不自動平倉、不執行任何交易。
-- 不建立 LONG / SHORT 訊號。
-- 不宣稱盈利能力、勝率或投資結果。
+## 安全邊界
+- 只使用 OKX Public Market Data REST / Public WebSocket。
+- 不使用 Private API、API Key、Secret Key、Passphrase 或登入。
+- 不包含下單、平倉、交易執行或帳戶操作。
+- 不產生 LONG / SHORT、買入 / 賣出指令。
+- 不保證獲利、勝率或未來結果。
+- Telegram 不具交易控制能力。
 
-## 2. 官方 API 定義
+## 官方資料來源
+OKX API 定義唯一依 OKX 官方 V5 文件：https://www.okx.com/docs-v5/en/
 
-API 規格唯一以 OKX 官方 API V5 文件為準：
-https://www.okx.com/docs-v5/en/
+目前使用的公開資料：
+- `GET /api/v5/public/instruments?instType=SWAP`
+- `GET /api/v5/market/tickers?instType=SWAP`
+- `GET /api/v5/market/candles`
+- `GET /api/v5/market/trades`
+- `GET /api/v5/market/books`
+- `GET /api/v5/public/open-interest`
+- `GET /api/v5/public/funding-rate`
+- `GET /api/v5/public/funding-rate-history`
+- Public WebSocket `tickers`
+- Public WebSocket `candle5m`
+- Public WebSocket `trades`
+- Public WebSocket `open-interest`
+- Public WebSocket `funding-rate`
+- Public WebSocket `liquidation-orders`
 
-OKX 官方文件將 Public Data REST API 定義為不需要 authentication。
+OKX 官方文件指出公開市場資料可透過 Public Data 取得；WebSocket public channel 用於市場資料。`liquidation-orders` 是公開強平訂單流，不代表 OKX 全市場完整強平總量。
 
-### REST API
-
-| 功能 | Endpoint | Phase 1 |
-|---|---|---|
-| Instruments | `GET /api/v5/public/instruments?instType=SWAP` | 已實作 |
-| Tickers | `GET /api/v5/market/tickers?instType=SWAP` | 已實作 |
-| Ticker | `GET /api/v5/market/ticker?instId=...` | 已實作 |
-| Candles | `GET /api/v5/market/candles` | 已實作 |
-| History Candles | `GET /api/v5/market/history-candles` | Client 已實作 |
-| Trades | `GET /api/v5/market/trades` | 已實作 |
-| History Trades | `GET /api/v5/market/history-trades` | Client 已實作 |
-| Open Interest | `GET /api/v5/public/open-interest` | 已實作 |
-| Funding Rate | `GET /api/v5/public/funding-rate` | 已實作 |
-| Funding History | `GET /api/v5/public/funding-rate-history` | 已實作 |
-| Order Book | `GET /api/v5/market/books` | 已實作 |
-
-### Public WebSocket
-
-- URL：`wss://ws.okx.com:8443/ws/v5/public`
-- `open-interest`
-- `funding-rate`
-- `liquidation-orders`
-
-`liquidation-orders` 官方定義為近期強平訂單，不代表 OKX 全部強平總量。資料的 `details` 內含 `side`、`bkPx`、`sz`、`ts`；本專案只保存官方欄位對應的 symbol、side、price、size、timestamp。
-
-## 3. 市場清單
-
-不寫死 BTC、ETH、SOL 等交易對。
-
-啟動時呼叫 Public Instruments：
-
-`instType=SWAP`
-
-只保留：
-
+## 市場篩選
+市場清單動態讀取 OKX Instruments，不硬編碼市場數量。只保留：
+- `instType=SWAP`
 - `state=live`
 - `quoteCcy=USDT` 或 `settleCcy=USDT`
 
-因此市場數量完全依 OKX 當時 Public Instruments API 回傳結果決定。
+## PostgreSQL
+Render 重啟不會依賴本地記憶體保存歷史資料。設定 `DATABASE_URL` 後，啟動時自動執行 `db/schema.sql`。
 
-## 4. K 線
+資料表：
+1. `instruments`
+2. `ticker_snapshots`
+3. `candles`
+4. `trades`
+5. `orderbook_snapshots`
+6. `open_interest_snapshots`
+7. `funding_snapshots`
+8. `funding_history`
+9. `liquidation_events`
+10. `market_anomalies`
+11. `research_events`
+12. `schema_meta`
 
-支援：
+資料庫時間使用 UTC；前端使用 `Asia/Taipei` 顯示。預設資料保留 7 天，可用 `DATA_RETENTION_DAYS` 調整。
 
-- 5m
-- 15m
-- 1H
-- 4H
+如果 `DATABASE_URL` 未設定，系統仍可提供公開 API 的即時資料，但歷史持久化、CVD 歷史、OI 歷史與事件研究會標示資料不足，不會用 0 或估算值補資料。
 
-標準化欄位：
+## OI 歷史
+OI 使用實際 OKX 公開 OI 採樣保存：
+- `oi`
+- `oiCcy`
+- `oiUsd`
+- `timestamp`
 
-```text
-timestamp
-open
-high
-low
-close
-volume
-volumeCurrency
-volumeQuote
-confirmed
-```
+變化週期：5m、15m、1h、4h、24h。比較點必須存在於資料庫；沒有足夠歷史資料即顯示 `【資料不足，無法確認】`。不從價格或 K 線推導 OI。
 
-OKX K 線原始資料為 `[ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]`。`vol` 對衍生品為合約數量；`volCcy` 對衍生品為基礎貨幣數量；`volCcyQuote` 為報價貨幣數量。`confirm=0` 代表未完成，`confirm=1` 代表完成。
+## CVD
+CVD 僅使用 OKX Public Trades 的官方 `side`、`sz` 與 `tradeId`。計算定義：`buy` size 加總、`sell` size 減去；其他未識別值不加入計算。
 
-後端以 Unix milliseconds 儲存；前端以 `Asia/Taipei` 顯示。
+這是依 OKX 公開成交資料建立的統計量，不把 side 延伸解釋為不存在官方依據的「真正買方 / 賣方資金流」。資料量不足時不估算。
 
-## 5. Ticker / Volume
+## Market Structure
+使用中性分類：
+- 上漲 / OI 增加
+- 上漲 / OI 減少
+- 下跌 / OI 增加
+- 下跌 / OI 減少
+- 持平 / OI 無變化
 
-Ticker 使用：
+這些分類只描述價格與 OI 的共同變化，不代表方向預測。
 
-- `last` → price
-- `open24h` → 24H 漲跌計算基準
-- `volCcy24h` → Volume，對 SWAP 為 base currency
-- `vol24h` → contract volume
-- `ts` → timestamp
+## Volume / OI / Funding Anomaly
+異常基準來自實際歷史資料。Volume anomaly 使用近 24 小時資料計算 mean、median、標準差與 z-score。預設 z-score 閾值集中於 `config.js`，可由環境變數調整；閾值不是經過市場獲利驗證的門檻。
 
-Dashboard 將 Volume 標示為「幣」，避免把 contract volume 誤稱為 USDT volume。若需要 USDT 報價成交量，使用 K 線的 `volCcyQuote`，不是 Ticker 的 `volCcy24h`。
+Funding 提供 current funding、funding history、fundingTime、nextFundingTime，以及後續可計算的歷史分布。平台不預測下一次 funding，也不把 funding 直接包裝成方向訊號。
 
-## 6. Open Interest
+## Order Book
+保存 best bid、best ask、spread、bid volume、ask volume、bid/ask ratio、depth imbalance 與前 N 檔資料。
 
-OKX Public Open Interest 欄位：
+**Order Book 是未成交掛單，不代表實際成交流向。**
 
-- `oi`：合約數量
-- `oiCcy`：幣的數量
-- `oiUsd`：USD 數量
+## Liquidation
+使用 OKX Public WebSocket `liquidation-orders` 保存：
+- instId
+- side
+- bkPx
+- sz
+- ts
 
-Dashboard 主 OI 使用 `oiUsd`，單位明確標示 USD。
+可以統計最近 5m / 15m / 1h 事件數與排行，但不稱為「OKX 全市場總清算量」。
 
-5M / 15M / 1H 不使用虛構歷史資料。伺服器只比較啟動後實際採樣的 `oiUsd`：
+## Historical Event Research
+異常事件以 T0 記錄。事件資料會等待未來實際 K 線資料到達，再計算：
+- T+5m
+- T+15m
+- T+1h
+- T+4h
+- T+24h
+- absolute / percentage return
+- MFE
+- MAE
+- sample size
+- average return
+- median return
+- positive outcome %
+- negative outcome %
 
-- 尚未累積指定時間 → `【資料不足，無法確認】`
-- 不從 K 線推導 OI
-- 不從其他交易所補 OI
-- 不把目前 OI 重複當成歷史 OI
+統計結果只描述歷史樣本，不代表未來勝率或獲利保證。樣本不足時顯示 `【資料不足，無法確認】`。
 
-## 7. Funding
-
-支援：
-
-- Current Funding Rate
-- Funding Time
-- Next Funding Time
-- Funding History
-
-OKX 官方 Funding History 可回傳最多三個月資料。本專案不自行推算 Funding。
-
-## 8. Trades
-
-標準化：
-
-```text
-timestamp
-price
-size
-side
-tradeId
-source
-```
-
-`side` 保留 OKX 官方欄位值，不自行重新解釋成買單或賣單。
-
-## 9. Order Book
-
-標準化：
-
-- bids
-- asks
-- Bid Volume
-- Ask Volume
-- Bid/Ask Ratio
-- Spread
-
-OKX Public Order Book 的衍生品 quantity 為 contracts。Order Book 是掛單資料，不代表實際成交或真實資金流。
-
-## 10. Cache / Rate Limit / Error Handling
-
-所有 REST 公開資料經中央 request limiter，並搭配 TTL cache、timeout、retry、exponential backoff。
-
-主要 OKX 官方 REST 限速（文件目前版本）：
-
-- Instruments：20 requests / 2 seconds
-- Tickers：20 requests / 2 seconds
-- Candles：40 requests / 2 seconds
-- History Candles：20 requests / 2 seconds
-- Trades：100 requests / 2 seconds
-- History Trades：20 requests / 2 seconds
-- Open Interest：20 requests / 2 seconds
-- Order Book：40 requests / 2 seconds
-
-本專案中央 limiter 使用保守的 18 requests / 2 seconds，避免前端大量刷新造成突發 request。
-
-錯誤處理：
-
-- 429：retry + exponential backoff
-- 5xx：retry + exponential backoff
-- 網路錯誤：有限次 retry
-- timeout：有限次 retry
-- malformed OKX response：視為失敗
-- 最終失敗：`{ok:false,error:"資料暫時無法取得"}`
-- 不以 `0` 或 `null → 0` 偽造資料
-
-## 11. WebSocket 穩定性
-
-- 只使用 Public WebSocket。
-- reconnect 使用 exponential backoff。
-- 最大 reconnect delay：30 秒。
-- 斷線不讓 Server 崩潰。
-- reconnect 後重新建立 subscriptions。
-- subscription batch 去重。
-- 支援 `ping` / `pong` heartbeat。
-- `liquidation-orders` 解析官方 `details` 結構。
-
-## 12. Dashboard
-
-首頁 `/` 為繁體中文，顯示：
-
-- 市場數量
-- 最後更新
-- WebSocket 狀態
-- 交易對
-- 價格
-- 24H 漲跌
-- Volume（幣）
-- OI（USD）
-- OI 5M / 15M / 1H
-- Funding
-- 資料時間
-
-提供：
-
-- 搜尋交易對
-- 依 24H 漲跌排序
-- 依 Volume 排序
-- 依 OI 排序
-- 依 Funding 排序
-
-Phase 1 不提供任何交易訊號。
-
-## 13. API Routes
-
+## API
 - `GET /api/health`
 - `GET /api/instruments`
 - `GET /api/markets`
-- `GET /api/oi/:instId`
-- `GET /api/realtime`
-- `GET /api/candles/:instId?bar=5m`
+- `GET /api/candles/:instId?bar=5m|15m|1H|4H`
 - `GET /api/trades/:instId?limit=100`
 - `GET /api/orderbook/:instId?sz=20`
 - `GET /api/funding/:instId`
 - `GET /api/funding-history/:instId?limit=100`
+- `GET /api/oi/:instId`
+- `GET /api/cvd/:instId`
+- `GET /api/anomalies`
+- `GET /api/anomalies/:instId`
+- `GET /api/liquidations/:instId`
+- `GET /api/structure/:instId`
+- `GET /api/research/:instId`
+- `GET /api/rankings`
+- `GET /api/realtime`
 
-## 14. Unit Test
+成功格式：`{ok:true,data:...}`。失敗格式：`{ok:false,error:"資料暫時無法取得"}`。
 
-目前測試覆蓋：
+## Rate Limit / Retry
+所有 REST 請求經中央 limiter，並使用 timeout、有限 retry、exponential backoff、429 / 5xx handling、malformed response handling。禁止 infinite retry。中央 limiter 預設 18 requests / 2 seconds，具體 OKX endpoint 限制仍以官方文件為準。
 
-1. Instruments 過濾
-2. K 線 normalization
-3. Ticker normalization
-4. OI normalization
-5. Funding normalization
-6. Trade normalization
-7. Order Book normalization
-8. Cache TTL
-9. Request limiter
+## WebSocket
+Public WebSocket 具備：
+- heartbeat
+- ping / pong
+- reconnect exponential backoff
+- subscription 去重
+- reconnect 後重新訂閱
+- ticker / candle / trades / OI / funding / liquidation
 
-Mock / unit test 只驗證程式邏輯，不代表 OKX Live API 成功。
+## Render 設定
+1. 建立 Render PostgreSQL。
+2. 將 Render PostgreSQL 的連線字串設定為 Web Service 的 `DATABASE_URL`。
+3. 保持 `OKX_REST_BASE_URL=https://www.okx.com`，除非 OKX 官方文件或部署區域要求不同。
+4. `OKX_PUBLIC_WS_URL=wss://ws.okx.com:8443/ws/v5/public`。
+5. Deploy 後檢查 `/api/health` 的 `database` 與 `websocket` 狀態。
 
-## 15. Live OKX API Test
+本專案不需要 API Key、Secret Key 或 Passphrase。
 
-執行環境若沒有網路或無法執行 Node.js，Live OKX API 測試結果必須標示：
-
-`Live OKX API 測試：【資料不足，無法確認】`
-
-禁止以 Unit Test 取代 Live API 測試。
-
-## 16. 執行
-
+## 測試
+Unit Test：
 ```bash
 npm install
 npm test
-npm start
 ```
 
-預設：`http://localhost:10000`
+Live OKX API Test 需要具備可連線的 Node.js 執行環境；若目前執行環境無法實際執行，結果必須標示：
 
-Node.js：`>=20`
+`【資料不足，無法確認】`
 
-## 17. Phase 1 不包含
+Unit Test 不等同 Live OKX API Test，也不等同 PostgreSQL connection test。
 
-- EMA
-- RSI
-- MACD
-- CVD
-- Whale Radar
-- LONG / SHORT
-- 訊號評分
-- 回測
-- 自動下單
-- 自動平倉
-- 任何交易執行
+## 檔案架構
+- `server.js`：HTTP API 與啟動流程
+- `config.js`：環境變數、cache、限速、異常閾值、保留期限
+- `okx.js`：OKX Public REST client
+- `market.js`：市場資料查詢與研究 API 資料組裝
+- `cache.js`：TTL cache
+- `logger.js`：結構化日誌
+- `normalize.js`：OKX 公開資料標準化
+- `rateLimiter.js`：中央 REST limiter
+- `ws.js`：Public WebSocket、heartbeat、重連與訂閱
+- `db.js`：PostgreSQL 連線、migration 與持久化
+- `collector.js`：市場資料持續採集與研究資料更新
+- `analytics.js`：CVD、z-score、結構分類與統計函式
+- `db/schema.sql`：資料表與索引
+- `public/`：繁體中文 Dashboard
+- `test/`：Unit Tests
 
-Phase 1 唯一目標：建立正確、穩定、可驗證的 OKX 公開市場資料層。
+## 最終安全聲明
+**本專案不執行任何交易。**
+
+所有資料、異常與歷史統計均為研究用途。任何歷史統計都不能被解讀為未來結果保證。
