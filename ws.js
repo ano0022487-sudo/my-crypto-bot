@@ -34,7 +34,7 @@ class OKXPublicWS{
  connect(){
   if(this.stopping)return;if(this.ws&&(this.ws.readyState===WebSocket.OPEN||this.ws.readyState===WebSocket.CONNECTING))return;
   this.clearReconnectTimer();const generation=++this.socketGeneration;const ws=new WebSocket(config.OKX_PUBLIC_WS_URL,{handshakeTimeout:config.REQUEST_TIMEOUT_MS});
-  this.ws=ws;this.connectionCount+=1;this.subscriptions.clear();this.subscribedArgs.clear();this.subscribedChannelsSet.clear();this.subscribedInstruments.clear();this.subscribing=false;
+  this.ws=ws;this.connectionCount+=1;this.subscriptions.clear();this.subscribedArgs.clear();this.subscribedChannelsSet.clear();this.subscribedInstruments.clear();this.subscribing=false;ws._okxPongDeadline=null;ws._okxLastPingAt=null;
   ws.on('open',()=>{if(generation!==this.socketGeneration)return;this.connected=true;this.reconnectAttempt=0;this.reconnectScheduled=false;this.lastSuccessfulMessageAt=Date.now();logger.info('OKX public WebSocket connected',{connections:this.connectionCount,instruments:this.instIds.length,invalidInstruments:this.invalidInstruments.size,unsupported:this.unsupported.size});this.subscribe(ws,generation);this.startHeartbeat(ws,generation);});
   ws.on('message',raw=>{if(generation===this.socketGeneration)this.onMessage(raw);});
   ws.on('error',e=>{if(generation!==this.socketGeneration)return;this.rateLimitedError('OKX public WebSocket error',{error:e.message});});
@@ -42,7 +42,22 @@ class OKXPublicWS{
  }
  nextReconnectDelay(){const base=Math.min(config.WS_RECONNECT_MAX_MS,config.WS_RECONNECT_BASE_MS*(2**this.reconnectAttempt));return Math.min(config.WS_RECONNECT_MAX_MS,base+Math.floor(Math.random()*(config.WS_RECONNECT_JITTER_MS+1)));}
  scheduleReconnect(reason){if(this.stopping||this.reconnectScheduled)return;this.reconnectScheduled=true;const delay=this.nextReconnectDelay();this.reconnectAttempt+=1;this.reconnectCount+=1;this.lastReconnectLogAt=Date.now();this.timer=setTimeout(()=>{this.timer=null;this.reconnectScheduled=false;if(!this.stopping)this.connect();},delay);logger.warn('OKX WebSocket reconnect scheduled',{reason,attempt:this.reconnectAttempt,delay});}
- startHeartbeat(ws,generation){this.stopHeartbeat();this.pingTimer=setInterval(()=>{if(generation!==this.socketGeneration||ws!==this.ws||ws.readyState!==WebSocket.OPEN)return;const age=Date.now()-(this.lastMessageAt||Date.now());if(age<config.WS_HEARTBEAT_MS)return;if(ws._okxPongDeadline&&Date.now()>ws._okxPongDeadline){this.timeoutCount+=1;this.rateLimitedError('OKX public WebSocket heartbeat timeout',{timeoutCount:this.timeoutCount});this.cleanupSocket(ws);this.ws=null;this.connected=false;this.stopHeartbeat();this.scheduleReconnect('heartbeat-timeout');return;}ws._okxPongDeadline=Date.now()+config.WS_HEARTBEAT_MS;try{ws.send('ping');}catch(error){this.rateLimitedError('OKX public WebSocket ping failed',{error:error.message});this.cleanupSocket(ws);this.ws=null;this.connected=false;this.stopHeartbeat();this.scheduleReconnect('ping-failed');}},5000);}
+ startHeartbeat(ws,generation){
+  this.stopHeartbeat();
+  const interval=Math.max(5000,Math.min(config.WS_HEARTBEAT_INTERVAL_MS,20000));
+  const timeout=Math.max(3000,Math.min(config.WS_HEARTBEAT_TIMEOUT_MS,15000));
+  const sendPing=()=>{
+   if(generation!==this.socketGeneration||ws!==this.ws||ws.readyState!==WebSocket.OPEN)return;
+   if(ws._okxPongDeadline&&Date.now()>ws._okxPongDeadline){
+    this.timeoutCount+=1;this.rateLimitedError('OKX public WebSocket heartbeat timeout',{timeoutCount:this.timeoutCount,timeoutMs:timeout});
+    this.cleanupSocket(ws);this.ws=null;this.connected=false;this.stopHeartbeat();this.scheduleReconnect('heartbeat-timeout');return;
+   }
+   ws._okxPongDeadline=Date.now()+timeout;ws._okxLastPingAt=Date.now();
+   try{ws.send('ping');}catch(error){this.rateLimitedError('OKX public WebSocket ping failed',{error:error.message});this.cleanupSocket(ws);this.ws=null;this.connected=false;this.stopHeartbeat();this.scheduleReconnect('ping-failed');}
+  };
+  this.pingTimer=setInterval(sendPing,interval);
+  sendPing();
+ }
  stopHeartbeat(){if(this.pingTimer){clearInterval(this.pingTimer);this.pingTimer=null;}}
  async subscribe(ws,generation){
   if(this.subscribing||!ws||ws.readyState!==WebSocket.OPEN)return;this.subscribing=true;const args=[];
